@@ -1,0 +1,91 @@
+# --- Secrets / credentials -------------------------------------------------
+# Materials Project & Zenodo API tokens must never be committed.
+.env
+.env.*
+*.key
+secrets.*
+.mprc               # pymatgen/mp-api config, may hold PMG_MAPI_KEY
+.pmgrc.yaml         # pymatgen runtime config
+
+# --- Harvested & processed data --------------------------------------------
+# Datasets are large and live on the cluster / external storage, not in git.
+data/
+datasets/
+raw/
+processed/
+*.extxyz
+*.extxyz.gz
+*.xyz
+*.xyz.gz
+*.traj             # ASE trajectory files
+
+# Raw DFT output files (harvested VASP calculations)
+vasprun.xml
+vaspout.h5
+OUTCAR
+CHGCAR
+CHG
+WAVECAR
+DOSCAR
+EIGENVAL
+PROCAR
+LOCPOT
+AECCAR*
+vasp_output/
+*.tar
+*.tar.gz
+*.zip
+
+# --- MLIP training artifacts -----------------------------------------------
+checkpoints/
+*.model
+*.pt
+*.pth
+*.ckpt
+wandb/
+lightning_logs/
+runs/
+logs/
+
+# --- HPC / Slurm batch job output ------------------------------------------
+slurm-*.out
+*.o[0-9]*
+*.e[0-9]*
+*.job.log
+
+# --- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.installed.cfg
+*.egg
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Testing / linting / typing caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.tox/
+
+# --- Jupyter ---------------------------------------------------------------
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+# --- Editor / OS -----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
