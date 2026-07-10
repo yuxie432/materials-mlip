@@ -1,0 +1,8 @@
+# Stage 0-1 (discover + triage) need only requests.
+requests>=2.31
+
+# Stage 2-4 (fetch, parse, store) — uncomment as those land:
+# pymatgen>=2026.5.18   # Vasprun/Outcar parsing, converged_electronic, run_type
+# ase>=3.25             # extxyz(.gz) read/write
+# pyarrow>=15           # parquet metadata store
+# tqdm>=4.66            # progress bars for long harvests

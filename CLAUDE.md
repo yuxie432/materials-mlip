@@ -16,9 +16,34 @@ a machine learning interatomic potential (MLIP) using openly accessible DFT data
 3. **Train** — train an MLIP (e.g. MACE architecture) on the assembled dataset, then use it for
    ML-accelerated MD.
 
-The codebase does not yet exist (repo currently only contains this file and a README); this document
-describes the intended architecture and domain conventions agreed with the project mentor so far.
-Update the sections below (commands, structure) as real code lands.
+This document describes the intended architecture and domain conventions agreed with the project
+mentor. Stages 0–1 (discover + triage) now exist as the `zenodo_harvest` package; stages 2–4
+(fetch, parse, store) are still to be built. See `docs/DESIGN.md` for the full data/storage design.
+
+## Code layout & commands
+
+- `zenodo_harvest/` — importable package, runnable without install from the repo root:
+  - `client.py` — throttled, retrying Zenodo REST client. Key facts baked in: `q` searches
+    metadata only (not file contents), page size caps at 25, the search window caps at 10k
+    (bypassed by recursive `created`-date bisection in `iter_records`), and file downloads honour
+    HTTP Range despite no `Accept-Ranges` header.
+  - `models.py` — `Candidate` dataclass (JSONL-serialisable) + `classify_files` VASP file-signal
+    classifier (`vasp_direct` / `archive` / `processed_atomistic` / `unlikely`).
+  - `discover.py` — stage 0: keyword search → deduplicated candidate manifest (dedup by
+    `conceptrecid`, newest version wins).
+  - `triage.py` — stage 1: filter candidates; optional `--peek` reads a remote `.zip` central
+    directory over HTTP Range to confirm `vasprun.xml`/`OUTCAR` without downloading the archive.
+  - `cli.py` — `python -m zenodo_harvest.cli {discover,triage} ...`.
+- Manifests are JSONL under `data/manifests/` (gitignored). Example trial run:
+  ```
+  python -m zenodo_harvest.cli discover --query VASP --query OUTCAR --max-records 200 \
+      --out data/manifests/candidates.jsonl
+  python -m zenodo_harvest.cli triage --in data/manifests/candidates.jsonl \
+      --out data/manifests/keep.jsonl --min-rank 3 --peek
+  ```
+  Full cluster harvest: add `--exhaustive` to `discover` (recursive date-partitioning past 10k).
+- `ZENODO_TOKEN` env var (optional) raises the anonymous ~30 req/min rate limit; needed for a full
+  harvest. Stage 0–1 depend only on `requests`; pymatgen/ase are deferred to stages 2–4.
 
 ## Scope and starting point
 
@@ -63,4 +88,16 @@ Update the sections below (commands, structure) as real code lands.
 - Most work is Python + terminal based. Core libraries: `pymatgen`, `ase`, `mp-api`, and (for training)
   MACE or similar MLIP architectures.
 - No build/lint/test tooling exists yet. When a Python package structure, dependency manager (e.g. `uv`/
-  `poetry`/`conda`), and test suite are added, update this section with the actual commands.
+  `poetry`/`conda`), and test suite are added, update this section with the actual commands. The
+  `.gitignore` already anticipates the toolchain — **ruff** (lint), **mypy** (types), and **pytest**
+  (tests) — so prefer those when wiring up the project unless there's reason to deviate.
+
+## Credentials
+
+- API tokens must never be committed. `.gitignore` already excludes `.env`/`.env.*`, `*.key`, `secrets.*`,
+  and the pymatgen/mp-api config files `.mprc` and `.pmgrc.yaml`.
+- The Materials Project API key is read from the `PMG_MAPI_KEY` environment variable (or `.pmgrc.yaml`) by
+  `mp-api`/`pymatgen`. Load secrets from the environment or an untracked `.env`, never hard-coded.
+- Large artifacts stay out of git: harvested DFT outputs (`vasprun.xml`, `OUTCAR`, `CHGCAR`, …), the
+  `data/`/`datasets/`/`raw/`/`processed/` trees, `*.extxyz(.gz)` datasets, and MLIP checkpoints
+  (`*.model`, `*.pt`, `checkpoints/`) are all gitignored — they live on the cluster / external storage.
