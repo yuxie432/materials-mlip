@@ -1,14 +1,15 @@
-"""zenodo_harvest — discover and triage DFT (VASP) datasets on Zenodo.
+"""zenodo_harvest — harvest DFT (VASP) datasets from Zenodo for MLIP training.
 
-Pipeline stages (see docs/DESIGN.md):
+Pipeline stages (see docs/DESIGN.md); all five run end-to-end via
+``python -m zenodo_harvest.cli {discover,triage,fetch,parse}``:
 
     stage 0  discover  keyword/date-partitioned search -> candidate manifest (JSONL)
     stage 1  triage    score candidates by their file listing (+ optional zip peek)
-    stage 2  fetch      download selected archives (checksum-verified)      [next step]
-    stage 3  parse      pymatgen Vasprun/Outcar -> per-ionic-step frames     [next step]
-    stage 4  store      sharded extxyz.gz + metadata store                   [next step]
+    stage 2  fetch     download selected archives (checksum-verified) + extract VASP
+    stage 3  parse     pymatgen Vasprun/Vaspout / ASE OUTCAR -> per-ionic-step frames
+    stage 4  store      sharded extxyz.gz + metadata JSONL store
 
-Only stages 0 and 1 are implemented here; they need nothing beyond `requests`.
+Stages 0-1 need only ``requests``; stages 2-4 add ``pymatgen`` + ``ase``.
 """
 
 from .client import ZenodoClient

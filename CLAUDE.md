@@ -17,33 +17,54 @@ a machine learning interatomic potential (MLIP) using openly accessible DFT data
    ML-accelerated MD.
 
 This document describes the intended architecture and domain conventions agreed with the project
-mentor. Stages 0–1 (discover + triage) now exist as the `zenodo_harvest` package; stages 2–4
-(fetch, parse, store) are still to be built. See `docs/DESIGN.md` for the full data/storage design.
+mentor. All five stages (discover → triage → fetch → parse → store) now exist as the
+`zenodo_harvest` package and run end-to-end. See `docs/DESIGN.md` for the full data/storage design.
 
 ## Code layout & commands
 
 - `zenodo_harvest/` — importable package, runnable without install from the repo root:
   - `client.py` — throttled, retrying Zenodo REST client. Key facts baked in: `q` searches
     metadata only (not file contents), page size caps at 25, the search window caps at 10k
-    (bypassed by recursive `created`-date bisection in `iter_records`), and file downloads honour
-    HTTP Range despite no `Accept-Ranges` header.
+    (bypassed by recursive `created`-date bisection in `iter_records`), file downloads honour
+    HTTP Range despite no `Accept-Ranges` header, and **the `/api/records` search endpoint is
+    30 req/min even with a token** (token helps other endpoints/quotas + restricted access).
+  - `config.py` — `.env` loader (no dependency) + data-dir layout (`data/{manifests,raw,dataset}`),
+    overridable via `ZENODO_HARVEST_DATA` (point at cluster scratch).
   - `models.py` — `Candidate` dataclass (JSONL-serialisable) + `classify_files` VASP file-signal
     classifier (`vasp_direct` / `archive` / `processed_atomistic` / `unlikely`).
+  - `manifest.py` — JSONL read/append helpers + `RejectionLogger` (auditable dropped-record log).
   - `discover.py` — stage 0: keyword search → deduplicated candidate manifest (dedup by
     `conceptrecid`, newest version wins).
   - `triage.py` — stage 1: filter candidates; optional `--peek` reads a remote `.zip` central
     directory over HTTP Range to confirm `vasprun.xml`/`OUTCAR` without downloading the archive.
-  - `cli.py` — `python -m zenodo_harvest.cli {discover,triage} ...`.
-- Manifests are JSONL under `data/manifests/` (gitignored). Example trial run:
+  - `fetch.py` — stage 2: download (checksum-verified, resumable, `--max-bytes` capped) and
+    **selectively extract only VASP files** from archives; records availability of heavy files
+    (CHGCAR/WAVECAR/DOSCAR/EIGENVAL/…) without extracting them; skips `.rar`/`.7z` (no portable
+    tooling) with a logged rejection. Emits `fetched.jsonl` (one calc-unit list per record).
+  - `parse.py` — stage 3: pymatgen `Vasprun` (primary) → per-ionic-step ASE frames; records
+    electronic convergence bool + magnitude (`scf_dE`), `run_type`, full INCAR/k-points/POTCAR,
+    availability flags. OUTCAR-only calcs fall back to ASE's `vasp-out` reader (read from an
+    isolated temp copy — ASE otherwise crashes on uploads with hash-annotated POTCAR species).
+  - `store.py` — stage 4: `ShardedExtxyzWriter` (rotating `shard-NNNNN.extxyz.gz`) +
+    `MetadataWriter` (one JSONL record per calc), joined by `calc_id`/`frame_id`.
+  - `cli.py` — `python -m zenodo_harvest.cli {discover,triage,fetch,parse} ...` (loads `.env`).
+- Manifests are JSONL under `data/manifests/`; the dataset (extxyz.gz shards + `metadata.jsonl`)
+  under `data/dataset/` (all gitignored). Full trial run:
   ```
   python -m zenodo_harvest.cli discover --query VASP --query OUTCAR --max-records 200 \
       --out data/manifests/candidates.jsonl
   python -m zenodo_harvest.cli triage --in data/manifests/candidates.jsonl \
       --out data/manifests/keep.jsonl --min-rank 3 --peek
+  python -m zenodo_harvest.cli fetch --in data/manifests/keep.jsonl --max-bytes 500000000
+  python -m zenodo_harvest.cli parse --in data/manifests/fetched.jsonl
   ```
   Full cluster harvest: add `--exhaustive` to `discover` (recursive date-partitioning past 10k).
-- `ZENODO_TOKEN` env var (optional) raises the anonymous ~30 req/min rate limit; needed for a full
-  harvest. Stage 0–1 depend only on `requests`; pymatgen/ase are deferred to stages 2–4.
+- `ZENODO_TOKEN` lives in `.env` (gitignored, loaded by `config.load_dotenv`). Stage 0–1 depend
+  only on `requests`; stages 2–4 need `pymatgen` + `ase` (`pip install -e .[parse]`).
+- **Frame properties**: energy (`e_0_energy`, i.e. σ→0) + forces are written to extxyz via an ASE
+  `SinglePointCalculator`. **Stress is parsed but kept in metadata only** (`stress_units: kBar`) —
+  VASP's kBar sign/scale convention must be confirmed before feeding stress to training. Per-atom
+  charges/spins come from OUTCAR (end-of-run) and are attached to the final frame only.
 
 ## Scope and starting point
 
@@ -87,10 +108,16 @@ mentor. Stages 0–1 (discover + triage) now exist as the `zenodo_harvest` packa
   training jobs are expected to run there via the batch scheduler, not interactively.
 - Most work is Python + terminal based. Core libraries: `pymatgen`, `ase`, `mp-api`, and (for training)
   MACE or similar MLIP architectures.
-- No build/lint/test tooling exists yet. When a Python package structure, dependency manager (e.g. `uv`/
-  `poetry`/`conda`), and test suite are added, update this section with the actual commands. The
-  `.gitignore` already anticipates the toolchain — **ruff** (lint), **mypy** (types), and **pytest**
-  (tests) — so prefer those when wiring up the project unless there's reason to deviate.
+- Toolchain (declared in `pyproject.toml` `[dev]`): **pytest** (tests), **mypy** (types), **ruff** (lint).
+  From the repo root:
+  ```
+  python -m pytest tests/ -q         # offline unit tests (no network / no pymatgen-ase)
+  python -m mypy zenodo_harvest/     # type-check (clean)
+  ruff check zenodo_harvest/         # lint (install ruff first; not in base env)
+  ```
+  `tests/test_harvest.py` covers the pure logic (file classifier, the triage/fetch VASP-name
+  matchers, the remote zip-peek parser, discover dedup) — fast and network-free; end-to-end runs
+  exercise the pymatgen/ase paths.
 
 ## Credentials
 

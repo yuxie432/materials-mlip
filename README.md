@@ -11,9 +11,9 @@ for domain conventions.
 ```
 stage 0  discover  keyword search          -> candidate manifest (JSONL)  [done]
 stage 1  triage    file-listing + zip-peek -> keep-list (JSONL)           [done]
-stage 2  fetch     download archives (checksum-verified)                  [next]
-stage 3  parse     pymatgen Vasprun/Outcar -> per-ionic-step frames       [next]
-stage 4  store     sharded extxyz.gz + Parquet metadata store             [next]
+stage 2  fetch     download archives (checksum-verified) + extract VASP   [done]
+stage 3  parse     pymatgen Vasprun/Vaspout / ASE OUTCAR -> frames        [done]
+stage 4  store     sharded extxyz.gz + JSONL metadata store               [done]
 ```
 
 ## Quick start (WSL trial)
@@ -28,6 +28,14 @@ python -m zenodo_harvest.cli discover \
 python -m zenodo_harvest.cli triage \
     --in data/manifests/candidates.jsonl \
     --out data/manifests/keep.jsonl --min-rank 3 --peek
+
+pip install -e .[parse]                  # stage 2-4 add pymatgen + ase
+
+python -m zenodo_harvest.cli fetch \
+    --in data/manifests/keep.jsonl --max-bytes 500000000
+
+python -m zenodo_harvest.cli parse \
+    --in data/manifests/fetched.jsonl    # -> data/dataset/{shard-*.extxyz.gz,metadata.jsonl}
 ```
 
 Set `ZENODO_TOKEN` to raise the rate limit. For a full harvest on the cluster,

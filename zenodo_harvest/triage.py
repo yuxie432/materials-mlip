@@ -17,24 +17,16 @@ import json
 import logging
 import struct
 from pathlib import Path
-from typing import Iterator
 
 import requests
 
+from .manifest import read_jsonl
 from .models import _VASP_RE, VASP_PRIMARY
 
 logger = logging.getLogger(__name__)
 
 EOCD_SIG = b"\x50\x4b\x05\x06"  # end of central directory
 CDH_SIG = 0x02014b50            # central directory file header
-
-
-def read_jsonl(path: str | Path) -> Iterator[dict]:
-    with Path(path).open() as fh:
-        for line in fh:
-            line = line.strip()
-            if line:
-                yield json.loads(line)
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +67,7 @@ def peek_zip_filenames(url: str, session: requests.Session | None = None, tail: 
         if cd_off == 0xFFFFFFFF or cd_size == 0xFFFFFFFF:
             return None  # ZIP64 — skip (rare for these archives); confirm via download
 
+        cd: bytes | None
         if cd_off >= blob_start:  # central directory already in the tail we fetched
             cd = blob[cd_off - blob_start: cd_off - blob_start + cd_size]
         else:

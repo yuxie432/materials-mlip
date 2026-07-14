@@ -3,6 +3,29 @@
 This note answers the design questions for the Zenodo → VASP → MLIP-dataset
 pipeline, grounded in the Zenodo REST API behaviour observed on 2026-07-09.
 
+## Implementation status (2026-07-13)
+
+All five stages run end-to-end (`zenodo_harvest` package). Decisions locked in
+after the first fetch+parse build, validated on Zenodo record 17930461 (63
+vasprun.xml → 4047 frames) + 17378016 (OUTCAR-only → 40 frames):
+
+- **Metadata store = JSONL** (`data/dataset/metadata.jsonl`), one record per
+  calculation: provenance (source/DOI/citation/license/url), full calc
+  parameters (run_type, INCAR, k-points, POTCAR spec, ENCUT/EDIFF/…), quality
+  (`electronic_converged` + `scf_dE` magnitude, ionic convergence, counts), and
+  availability flags. Compact to Parquet later if/when query speed needs it.
+- **Energy** stored per frame = `e_0_energy` (σ→0). **Forces** per frame. Both
+  via an ASE `SinglePointCalculator` so extxyz emits standard `energy`/`forces`.
+- **Stress is parsed but NOT written to extxyz** — kept in metadata (`stress_units:
+  kBar`, raw 3×3 in frame info as `stress_kbar`). VASP's kBar sign/scale
+  convention → confirm with mentor before shipping stress into training. *(open)*
+- **Per-atom charges/spins** exist only in OUTCAR (end-of-run), so they attach to
+  the final frame only, and only when an OUTCAR sits beside the vasprun.
+- **POTCAR** files are not parsed (copyright + often absent): we keep the `titel`
+  strings; `hash` is null.
+- Parser precedence: `pymatgen.Vasprun` (primary) → ASE `vasp-out` (OUTCAR-only
+  fallback, read from an isolated temp copy to dodge ASE's neighbour-file crash).
+
 ## TL;DR recommendations
 
 | Question | Recommendation |

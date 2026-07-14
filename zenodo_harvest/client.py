@@ -48,8 +48,11 @@ class ZenodoClient:
         needed to raise rate limits / reach restricted records; public search
         works anonymously.
     min_interval:
-        Minimum seconds between requests. Defaults to ~2.1 s anonymous
-        (≈28/min, under the 30/min guest cap) or ~1.05 s with a token.
+        Minimum seconds between requests. Defaults to ~2.1 s (≈28/min, under the
+        30/min cap). NB: the ``/api/records`` search endpoint is capped at 30/min
+        *even with a token* (verified 2026-07-13) — a token raises limits on other
+        endpoints and hourly quotas, and grants access to restricted records, but
+        does not speed up search. 429s are retried via ``Retry-After`` regardless.
     """
 
     def __init__(
@@ -61,9 +64,8 @@ class ZenodoClient:
     ) -> None:
         self.base = base.rstrip("/")
         self.token = token or os.environ.get("ZENODO_TOKEN")
-        if min_interval is None:
-            min_interval = 1.05 if self.token else 2.1
-        self.min_interval = min_interval
+        # Search is 30/min regardless of auth, so don't speed up when tokened.
+        self.min_interval = 2.1 if min_interval is None else min_interval
         self.session = session or requests.Session()
         self.session.headers.update({"User-Agent": "zenodo-harvest/0.1 (materials-mlip)"})
         if self.token:
@@ -124,12 +126,12 @@ class ZenodoClient:
         size: int = DEFAULT_PAGE_SIZE,
         sort: str = "newest",
         extra: dict[str, Any] | None = None,
-        max_records: int | None = None,
     ) -> Iterator[dict]:
         """Yield records for ``query`` up to the 10k search window.
 
         Warns (and stops) if the query has more than 10k hits — use
-        :meth:`iter_records` to exhaust those.
+        :meth:`iter_records` to exhaust those. Overall harvest caps
+        (``max_records``) are applied by the caller at the dedup level.
         """
         first = self.search_page(query, page=1, size=size, sort=sort, extra=extra)
         total = int(first["hits"]["total"])
@@ -146,7 +148,7 @@ class ZenodoClient:
             for rec in hits:
                 yield rec
                 yielded += 1
-                if (max_records and yielded >= max_records) or yielded >= MAX_SEARCH_WINDOW:
+                if yielded >= MAX_SEARCH_WINDOW:
                     return
             if page * size >= min(total, MAX_SEARCH_WINDOW):
                 return
