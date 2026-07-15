@@ -19,6 +19,15 @@ Full harvest on the cluster (recursive date partitioning past the 10k cap)::
 
     python -m zenodo_harvest.cli discover --exhaustive \
         --out data/manifests/candidates_full.jsonl
+
+Parallel parse via an array job (split -> N tasks -> merge -> verify -> purge)::
+
+    python -m zenodo_harvest.cli split --in data/manifests/fetched.jsonl \
+        --parts 16 --out-dir data/manifests/parts
+    # each array task: parse --in .../fetched.part-0i.jsonl --dataset-dir data/dataset/task-i
+    python -m zenodo_harvest.cli merge-datasets --into data/dataset data/dataset/task-*
+    python -m zenodo_harvest.cli verify --dataset-dir data/dataset
+    python -m zenodo_harvest.cli purge-raw --raw-dir data/raw --dataset-dir data/dataset
 """
 
 from __future__ import annotations
@@ -32,9 +41,11 @@ from pathlib import Path
 
 from . import config
 from .client import ZenodoClient
+from .dataset_ops import merge_datasets, purge_raw, split_manifest, verify_dataset
 from .discover import DEFAULT_QUERIES, DEFAULT_RESOURCE_TYPES, discover
 from .fetch import fetch
 from .parse import parse
+from .store import DatasetLockError
 from .triage import triage
 
 
@@ -91,6 +102,33 @@ def _add_parse(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--max-records", type=int, default=None)
 
 
+def _add_split(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("split", help="split a manifest into N parts for an array job")
+    p.add_argument("--in", dest="in_path", required=True, help="manifest JSONL to split")
+    p.add_argument("--parts", type=int, required=True, help="number of parts (array size)")
+    p.add_argument("--out-dir", required=True, help="dir for <stem>.part-NNN.jsonl files")
+
+
+def _add_merge(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("merge-datasets", help="fold per-task dataset dirs into one")
+    p.add_argument("--into", required=True, help="destination dataset dir")
+    p.add_argument("sources", nargs="+", help="per-task dataset dirs to merge in")
+
+
+def _add_verify(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("verify", help="check metadata<->shard integrity + report dataset stats")
+    p.add_argument("--dataset-dir", default=str(config.DATASET_DIR))
+
+
+def _add_purge_raw(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("purge-raw", help="delete raw extracted trees whose calcs are all parsed")
+    p.add_argument("--raw-dir", default=str(config.RAW_DIR))
+    p.add_argument("--dataset-dir", default=str(config.DATASET_DIR))
+    p.add_argument("--fetched", default=None,
+                   help="fetched manifest (default: <raw-dir>/../manifests/fetched.jsonl)")
+    p.add_argument("--dry-run", action="store_true", help="report only; delete nothing")
+
+
 def main(argv: list[str] | None = None) -> int:
     config.load_dotenv()  # pick up ZENODO_TOKEN from .env if present
     parser = argparse.ArgumentParser(prog="zenodo_harvest", description=__doc__,
@@ -101,6 +139,10 @@ def main(argv: list[str] | None = None) -> int:
     _add_triage(sub)
     _add_fetch(sub)
     _add_parse(sub)
+    _add_split(sub)
+    _add_merge(sub)
+    _add_verify(sub)
+    _add_purge_raw(sub)
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -134,16 +176,38 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.cmd == "parse":
         rejections = args.rejections or str(Path(args.dataset_dir).parent / "manifests" / "rejections.jsonl")
-        summary = parse(
-            args.in_path, dataset_dir=args.dataset_dir, rejections_path=rejections,
-            frames_per_shard=args.frames_per_shard, max_records=args.max_records,
-            raw_dir=args.raw_dir,
-        )
+        try:
+            summary = parse(
+                args.in_path, dataset_dir=args.dataset_dir, rejections_path=rejections,
+                frames_per_shard=args.frames_per_shard, max_records=args.max_records,
+                raw_dir=args.raw_dir,
+            )
+        except DatasetLockError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+    elif args.cmd == "split":
+        summary = split_manifest(args.in_path, args.parts, args.out_dir)
+    elif args.cmd == "merge-datasets":
+        try:
+            summary = merge_datasets(args.into, args.sources)
+        except DatasetLockError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+    elif args.cmd == "verify":
+        summary = verify_dataset(args.dataset_dir)
+    elif args.cmd == "purge-raw":
+        fetched = args.fetched or str(Path(args.raw_dir).parent / "manifests" / "fetched.jsonl")
+        try:
+            summary = purge_raw(args.raw_dir, args.dataset_dir, fetched=fetched,
+                                dry_run=args.dry_run)
+        except FileNotFoundError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
     else:  # pragma: no cover
         parser.error(f"unknown command {args.cmd}")
 
     print(json.dumps(summary, indent=2))
-    return 0
+    return 0 if summary.get("ok", True) else 1
 
 
 if __name__ == "__main__":

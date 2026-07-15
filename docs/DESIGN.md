@@ -268,9 +268,21 @@ resolves them against `--raw-dir` (legacy absolute paths still pass through).
 
 - Stages are independent CLI steps over JSONL manifests → trivially resumable and
   parallelisable (split the manifest, run N array-job tasks, each writing its own
-  shards).
+  shards). This is now wired end-to-end: `split` round-robins the fetched manifest
+  into `<stem>.part-NNN.jsonl`; each array task runs `parse` into its OWN
+  `--dataset-dir` (parse holds a `.parse.lock` so two tasks can never share one dir
+  — cross-node locks fail safe, never assumed stale); `merge-datasets` then folds the
+  per-task dirs into one by renaming+renumbering shards (opaque gzip blobs are never
+  recompressed) and rewriting each metadata record's `shards` list, moving shards
+  before appending metadata so a crash leaves only prunable orphans; `verify` asserts
+  the metadata↔shard `frame_id` bijection and reports coverage stats (frames by
+  parser/run_type/functional/license, per-element counts) as the curation instrument;
+  and `purge-raw` deletes each `<raw-dir>/<recid>/` tree whose every calc_id has
+  landed in the dataset, reclaiming scratch (units still awaiting a parse re-try are
+  kept).
 - Keep one `requests.Session`, honour `Retry-After`, use a token; harvest is
   I/O-bound so a modest array (or async) saturates the rate limit safely.
 - Parsing is CPU-bound and embarrassingly parallel (one task per archive).
 - Only the final `extxyz.gz` shards + Parquet metadata are kept long-term; raw
-  archives can be staged in scratch and deleted after parsing (all gitignored).
+  archives can be staged in scratch and deleted after parsing (all gitignored) —
+  `purge-raw` does exactly this, deleting only recids whose calcs are all parsed.

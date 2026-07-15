@@ -16,9 +16,12 @@ from __future__ import annotations
 
 import gzip
 import io
+import json
 import logging
 import os
+import socket
 import zlib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -135,6 +138,17 @@ class MetadataWriter:
 # already present in metadata. :func:`prune_uncommitted_frames` cleans up the
 # only remaining hazard — frames from a calc that a crashed run wrote to a shard
 # but never committed to metadata.
+#
+# dataset_ops.merge_datasets rides on this same recovery machinery: it moves a
+# source's shards into the destination (renamed) BEFORE appending that source's
+# metadata records, so an interruption mid-source leaves at worst orphan frames
+# (shards present, not yet referenced by any destination metadata record) at the
+# TOP of the destination's shard sequence — never metadata pointing at absent
+# frames. Those orphans are exactly what :func:`prune_uncommitted_frames` drops
+# on the next parse resume (it walks high->low, deleting wholly-orphan top shards
+# until it reaches an intact, fully-committed one), so merge needs no bespoke
+# rollback. See dataset_ops for the source-completion marker that stops a re-run
+# from double-appending an already-merged source.
 # ---------------------------------------------------------------------------
 
 def _shard_index_of(path: Path) -> int:
@@ -254,3 +268,154 @@ def prune_uncommitted_frames(
         stats["shards_rewritten"] += 1
         break  # boundary: this shard holds the crashed calc's start
     return stats
+
+
+# ---------------------------------------------------------------------------
+# Dataset-dir lock (guards against two writers corrupting one dataset dir).
+#
+# Two parse tasks pointed at the SAME --dataset-dir interleave shard writes and
+# metadata appends and corrupt both — the parallel model is one dataset dir PER
+# array task, merged afterwards (see dataset_ops.merge_datasets). This advisory
+# lockfile makes that mistake fail loudly rather than silently.
+#
+# Cross-node caveat: on an HPC cluster a lock written by another compute node
+# names a pid THIS node cannot check (os.kill only sees local pids), so a
+# different-hostname lock is NEVER assumed stale — we fail safe and make the user
+# remove it by hand. Only a same-host lock whose pid is provably dead is
+# reclaimed (a crashed prior run on this node).
+# ---------------------------------------------------------------------------
+
+LOCK_NAME = ".parse.lock"
+
+
+class DatasetLockError(RuntimeError):
+    """A dataset dir is already locked (or its lock is unsafe to reclaim)."""
+
+
+def _pid_alive(pid: Any) -> bool:
+    """Whether local process ``pid`` exists (signal 0 probes without delivering it)."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False  # a malformed / missing pid can't be proven alive
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False  # no such process -> dead
+    except PermissionError:
+        return True   # exists but owned by another user -> alive
+    except OSError:
+        return True   # unknown error -> be conservative, treat as alive
+    return True
+
+
+def _read_lock(path: Path) -> dict | None:
+    """Parse a lock file: ``None`` if absent, ``{}`` sentinel if present-but-corrupt."""
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return {}  # present but unreadable -> caller fails safe (won't reclaim)
+    try:
+        info = json.loads(text)
+    except ValueError:
+        return {}
+    return info if isinstance(info, dict) else {}
+
+
+def _lock_age_seconds(info: dict) -> float | None:
+    try:
+        started = datetime.fromisoformat(info["started"])
+        return (datetime.now(timezone.utc) - started).total_seconds()
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def dataset_lock_is_live(dataset_dir: str | Path) -> dict | None:
+    """Return the lock record if ``dataset_dir`` is held by a LIVE lock, else ``None``.
+
+    "Live" means: a DIFFERENT host (cross-node liveness is uncheckable, so fail
+    safe and treat it as held), an unreadable lock (ditto), or the SAME host with a
+    still-running pid. A same-host lock whose pid is dead is stale and reported as
+    ``None`` (not live). Used by merge-datasets to refuse a source dir a parse may
+    still be writing.
+    """
+    info = _read_lock(Path(dataset_dir) / LOCK_NAME)
+    if info is None:
+        return None
+    if not info:  # unreadable -> fail safe (treat as held)
+        return {"_unreadable": True}
+    if info.get("hostname") != socket.gethostname():
+        return info  # different host (or missing hostname) -> assume live
+    return info if _pid_alive(info.get("pid")) else None
+
+
+class DatasetLock:
+    """Advisory lock on a dataset dir, released (unlinked) on context exit / error.
+
+    Acquire creates ``<dataset_dir>/.parse.lock`` with ``O_CREAT|O_EXCL`` (atomic,
+    so two racing acquirers can't both win). If it already exists: a same-host lock
+    whose pid is dead is reclaimed with a warning; anything else — a same-host live
+    pid, a different host, or an unreadable lock — aborts with a clear message.
+    """
+
+    def __init__(self, dataset_dir: str | Path):
+        self.dataset_dir = Path(dataset_dir)
+        self.path = self.dataset_dir / LOCK_NAME
+        self._held = False
+
+    def _payload(self) -> bytes:
+        return json.dumps({
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "started": datetime.now(timezone.utc).isoformat(),
+        }).encode()
+
+    def acquire(self) -> "DatasetLock":
+        self.dataset_dir.mkdir(parents=True, exist_ok=True)
+        for attempt in range(2):  # attempt 0 may reclaim a stale lock, attempt 1 retries
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                info = _read_lock(self.path)
+                if info is None:
+                    continue  # vanished between open and read -> retry the create
+                stale = (bool(info) and info.get("hostname") == socket.gethostname()
+                         and not _pid_alive(info.get("pid")))
+                if stale and attempt == 0:
+                    logger.warning("reclaiming stale lock %s (dead pid %s, started %s)",
+                                   self.path, info.get("pid"), info.get("started"))
+                    self.path.unlink(missing_ok=True)
+                    continue  # retry the create now the stale lock is gone
+                raise DatasetLockError(self._refusal(info))
+            else:
+                os.write(fd, self._payload())
+                os.close(fd)
+                self._held = True
+                return self
+        raise DatasetLockError(
+            f"could not acquire {self.path}: another writer keeps re-creating it")
+
+    def _refusal(self, info: dict) -> str:
+        if not info:
+            return (f"{self.dataset_dir} holds an unreadable lock file {self.path}; "
+                    f"refusing to write. Remove it manually if no parse is running there.")
+        host, pid, started = info.get("hostname"), info.get("pid"), info.get("started")
+        age = _lock_age_seconds(info)
+        age_s = f", age {age:.0f}s" if age is not None else ""
+        if host == socket.gethostname():
+            return (f"{self.dataset_dir} is locked by a running parse (pid {pid} on {host}, "
+                    f"started {started}{age_s}). Wait for it to finish or kill that process.")
+        return (f"{self.dataset_dir} holds a lock from a DIFFERENT host ({host}, pid {pid}, "
+                f"started {started}{age_s}). Cross-node liveness cannot be checked; if you "
+                f"are certain no parse runs there, remove {self.path} manually.")
+
+    def release(self) -> None:
+        if self._held:
+            self.path.unlink(missing_ok=True)
+            self._held = False
+
+    def __enter__(self) -> "DatasetLock":
+        return self.acquire()
+
+    def __exit__(self, *exc: Any) -> None:
+        self.release()

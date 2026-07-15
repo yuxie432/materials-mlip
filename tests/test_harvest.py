@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 import json
+import tarfile
 import zipfile
 from datetime import date
 from hashlib import md5
@@ -26,8 +27,18 @@ from zenodo_harvest import discover as discover_mod
 from zenodo_harvest import fetch as fetch_mod
 from zenodo_harvest import triage as triage_mod
 from zenodo_harvest.client import ZenodoClient, _parse_retry_after
-from zenodo_harvest.fetch import _PARSE_RE, _find_calc_units, _unit_role, _unit_tag, download_file
-from zenodo_harvest.manifest import read_jsonl
+from zenodo_harvest.fetch import (
+    _PARSE_RE,
+    _archive_subdir,
+    _extract_tar,
+    _extract_zip,
+    _find_calc_units,
+    _unit_role,
+    _unit_tag,
+    download_file,
+    fetch_record,
+)
+from zenodo_harvest.manifest import RejectionLogger, read_jsonl
 from zenodo_harvest.models import (
     CATEGORY_RANK,
     VASP_PRIMARY,
@@ -687,3 +698,123 @@ def test_read_jsonl_raises_on_malformed_nonfinal_line(tmp_path):
     p.write_text('{"a": 1}\n{oops not json\n{"c": 3}\n')  # genuine mid-file corruption
     with pytest.raises(json.JSONDecodeError):
         list(read_jsonl(p))
+
+
+# --------------------------------------------------------------------------- #
+# Archive extractors — zip-slip guard, member cap, per-archive subdirs        #
+# (stdlib only; the pymatgen/ase parse of the extracted files is a later stage)#
+# --------------------------------------------------------------------------- #
+
+def _zip_bytes(items):
+    """Build an in-memory zip from ``[(name, content_bytes), ...]``."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, content in items:
+            zf.writestr(name, content)
+    return buf.getvalue()
+
+
+def _tar_bytes(items):
+    """Build an in-memory tar from ``[(name, content_bytes), ...]``."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for name, content in items:
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            tf.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+# members shared by the zip and tar extractor tests: a good OUTCAR, an oversized
+# member, and a zip-slip member that must never escape the destination dir.
+_GOOD = b"outcar content"
+_BIG = b"x" * 8192
+_EXTRACT_ITEMS = [
+    ("good/OUTCAR", _GOOD),           # small + VASP name -> extracted
+    ("toobig/vasprun.xml", _BIG),     # VASP name but over the member cap -> skipped
+    ("../evil_OUTCAR", b"pwned"),     # path traversal -> skipped, must not escape dest
+]
+_MEMBER_CAP = 4096
+
+
+def test_extract_zip_skips_slip_and_oversize_keeps_good(tmp_path):
+    arc = tmp_path / "a.zip"
+    arc.write_bytes(_zip_bytes(_EXTRACT_ITEMS))
+    dest = tmp_path / "extracted"
+    names, extracted = _extract_zip(arc, dest, _MEMBER_CAP)
+    assert extracted == ["good/OUTCAR"]                       # only the safe, in-cap file
+    assert (dest / "good" / "OUTCAR").read_bytes() == _GOOD
+    assert not (dest / "toobig" / "vasprun.xml").exists()     # oversized skipped
+    assert not (tmp_path / "evil_OUTCAR").exists()            # traversal target never written
+    assert not (dest.parent / "evil_OUTCAR").exists()
+
+
+def test_extract_tar_skips_slip_and_oversize_keeps_good(tmp_path):
+    arc = tmp_path / "a.tar"
+    arc.write_bytes(_tar_bytes(_EXTRACT_ITEMS))
+    dest = tmp_path / "extracted"
+    names, extracted = _extract_tar(arc, dest, _MEMBER_CAP)
+    assert extracted == ["good/OUTCAR"]
+    assert (dest / "good" / "OUTCAR").read_bytes() == _GOOD
+    assert not (dest / "toobig" / "vasprun.xml").exists()
+    assert not (tmp_path / "evil_OUTCAR").exists()
+    assert not (dest.parent / "evil_OUTCAR").exists()
+
+
+def test_archive_subdir_strips_suffix_and_sanitizes():
+    assert _archive_subdir("data.zip") == "data"
+    assert _archive_subdir("run.tar.gz") == "run"
+    assert _archive_subdir("archive.tar.bz2") == "archive"
+    assert _archive_subdir("bundle.tgz") == "bundle"
+    assert _archive_subdir("stuff.7z") == "stuff"
+    assert _archive_subdir("weird name!.zip") == "weird_name_"   # non-safe chars -> _
+    assert _archive_subdir(".zip") == "archive"                  # empty stem -> fallback
+
+
+def test_two_archives_same_member_extract_to_distinct_subdirs(tmp_path):
+    # Two archives sharing member path "calc/OUTCAR" must not clobber each other:
+    # each extracts under extracted/<archive-stem>/.
+    root = tmp_path / "extracted"
+    (tmp_path / "a.zip").write_bytes(_zip_bytes([("calc/OUTCAR", b"first")]))
+    (tmp_path / "b.zip").write_bytes(_zip_bytes([("calc/OUTCAR", b"second")]))
+    _extract_zip(tmp_path / "a.zip", root / _archive_subdir("a.zip"), 1 << 20)
+    _extract_zip(tmp_path / "b.zip", root / _archive_subdir("b.zip"), 1 << 20)
+    assert (root / "a" / "calc" / "OUTCAR").read_bytes() == b"first"
+    assert (root / "b" / "calc" / "OUTCAR").read_bytes() == b"second"
+
+
+class _MultiFileStreamSession:
+    """Streaming session serving a fixed ``{url: bytes}`` map (200 responses)."""
+
+    def __init__(self, blobs):
+        self.blobs = blobs
+
+    def get(self, url, stream=False, timeout=None):
+        content = self.blobs[url]
+        return _FakeStreamResp(200, content=content,
+                               headers={"Content-Length": str(len(content))})
+
+
+def test_fetch_record_two_zips_same_member_yield_two_units(tmp_path):
+    # End-to-end at the record level: two archives with the same internal member
+    # path extract into distinct subdirs and produce two independent calc units.
+    blob_a = _zip_bytes([("calc/OUTCAR", b"first-outcar")])
+    blob_b = _zip_bytes([("calc/OUTCAR", b"second-outcar")])
+    rec = {
+        "recid": "555",
+        "files": [
+            {"key": "a.zip", "download": "http://x/a.zip", "size": len(blob_a),
+             "checksum": "md5:" + md5(blob_a).hexdigest()},
+            {"key": "b.zip", "download": "http://x/b.zip", "size": len(blob_b),
+             "checksum": "md5:" + md5(blob_b).hexdigest()},
+        ],
+    }
+    session = _MultiFileStreamSession({"http://x/a.zip": blob_a, "http://x/b.zip": blob_b})
+    raw_dir = tmp_path / "raw"
+    rej = RejectionLogger(tmp_path / "rej.jsonl")
+    entry = fetch_record(rec, session, raw_dir, max_bytes=None, rej=rej)
+    rej.close()
+    assert entry is not None and entry["n_calc_units"] == 2
+    # the two OUTCARs live under distinct per-archive subdirs (relative to raw_dir)
+    outcar_dirs = sorted(Path(u["outcar"]).parent.parent.name for u in entry["calc_units"])
+    assert outcar_dirs == ["a", "b"]

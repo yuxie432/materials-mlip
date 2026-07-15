@@ -49,7 +49,19 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
     resolve against `--raw-dir`.
   - `store.py` — stage 4: `ShardedExtxyzWriter` (rotating `shard-NNNNN.extxyz.gz`) +
     `MetadataWriter` (one JSONL record per calc), joined by `calc_id`/`frame_id`.
-  - `cli.py` — `python -m zenodo_harvest.cli {discover,triage,fetch,parse} ...` (loads `.env`).
+  - `dataset_ops.py` — array-job glue (stages over dataset dirs, not the network):
+    - `split` — round-robin a manifest into `<stem>.part-NNN.jsonl` parts, one per array task.
+    - `merge-datasets` — fold per-task dataset dirs into one (rename+renumber shards, never
+      recompressing them; rewrite each metadata record's `shards`; refuse locked/duplicate
+      sources; post-verify the merged join).
+    - `verify` — assert the metadata↔shard `frame_id` bijection + report curation stats
+      (frames by parser/run_type/functional/license, element coverage) — the cheap gate after
+      every array job.
+    - `purge-raw` — delete `<raw-dir>/<recid>/` trees whose every calc_id is already in the
+      dataset (reclaim scratch); `--dry-run` reports without deleting.
+  - `cli.py` — `python -m zenodo_harvest.cli {discover,triage,fetch,parse,split,merge-datasets,verify,purge-raw} ...`
+    (loads `.env`; `verify`/`merge-datasets` exit non-zero on an integrity failure). Parse and
+    merge take a `.parse.lock` on the dataset dir so two writers never corrupt one dir.
 - Manifests are JSONL under `data/manifests/`; the dataset (extxyz.gz shards + `metadata.jsonl`)
   under `data/dataset/` (all gitignored). Full trial run:
   ```
@@ -61,6 +73,17 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   python -m zenodo_harvest.cli parse --in data/manifests/fetched.jsonl
   ```
   Full cluster harvest: add `--exhaustive` to `discover` (recursive date-partitioning past 10k).
+  Parallel parse on the cluster (array-job model): `split` the fetched manifest into N parts,
+  run N array tasks each parsing its part into its OWN `--dataset-dir`, then `merge-datasets`
+  the per-task dirs into one, `verify` the merged dataset, and `purge-raw` the parsed archives:
+  ```
+  python -m zenodo_harvest.cli split --in data/manifests/fetched.jsonl --parts 16 \
+      --out-dir data/manifests/parts
+  # array task i: parse --in .../fetched.part-0i.jsonl --dataset-dir data/dataset/task-i ...
+  python -m zenodo_harvest.cli merge-datasets --into data/dataset data/dataset/task-*
+  python -m zenodo_harvest.cli verify --dataset-dir data/dataset
+  python -m zenodo_harvest.cli purge-raw --raw-dir data/raw --dataset-dir data/dataset
+  ```
 - `ZENODO_TOKEN` lives in `.env` (gitignored, loaded by `config.load_dotenv`). Stage 0–1 depend
   only on `requests`; stages 2–4 need `pymatgen` + `ase` (`pip install -e .[parse]`).
 - **Frame properties**: per-ionic-step energy (`e_0_energy`, σ→0, with pymatgen's `final_energy`

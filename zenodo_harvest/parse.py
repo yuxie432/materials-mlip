@@ -54,6 +54,7 @@ from ase import Atoms
 from . import config
 from .manifest import RejectionLogger, read_jsonl
 from .store import (
+    DatasetLock,
     MetadataWriter,
     ShardedExtxyzWriter,
     next_shard_index,
@@ -593,49 +594,53 @@ def parse(
     dataset_dir = Path(dataset_dir)
     raw_dir = Path(raw_dir)
     metadata_path = dataset_dir / "metadata.jsonl"
-    done_calc_ids, committed_frame_ids = _load_committed(metadata_path)
-    pruned = prune_uncommitted_frames(dataset_dir, committed_frame_ids)
-    start_index = next_shard_index(dataset_dir)  # after pruning may drop shards
-    if done_calc_ids or pruned["frames_dropped"]:
-        logger.info("parse resume: %d calc(s) already done, pruned %s, new shards from %05d",
-                    len(done_calc_ids), pruned, start_index)
-
-    rej = RejectionLogger(rejections_path)
     stats: dict[str, Any] = {"records": 0, "calc_units": 0, "calcs_parsed": 0,
                              "skipped_existing": 0, "frames": 0}
 
-    with ShardedExtxyzWriter(dataset_dir, frames_per_shard, start_index=start_index) as xyz, \
-            MetadataWriter(metadata_path) as meta_w:
-        for rec in read_jsonl(in_path):
-            stats["records"] += 1
-            base_meta = {"provenance": rec["provenance"],
-                         "_extracted_root": str(_resolve(raw_dir, rec["local_dir"]) / "extracted")}
-            for unit in rec["calc_units"]:
-                stats["calc_units"] += 1
-                # Resolve stored (relative, or legacy absolute) paths against raw_dir.
-                unit = {k: str(_resolve(raw_dir, v)) for k, v in unit.items()}
-                calc_id = _calc_id(unit, base_meta)
-                if calc_id in done_calc_ids:
-                    stats["skipped_existing"] += 1
-                    continue
-                result = parse_calc_unit(unit, base_meta, rec.get("availability", {}), rej)
-                if not result:
-                    continue
-                frames, meta = result
-                shards: set[str] = set()
-                for fr in frames:
-                    shards.add(xyz.write(fr))
-                    stats["frames"] += 1
-                meta["shards"] = sorted(shards)
-                # durability ordering: frames must be on disk BEFORE their metadata,
-                # or a crash could leave metadata pointing at frames in no shard.
-                xyz.flush()
-                meta_w.write(_jsonable(meta))
-                done_calc_ids.add(calc_id)  # a duplicate unit later in THIS run is skipped too
-                stats["calcs_parsed"] += 1
-            if max_records and stats["records"] >= max_records:
-                break
-    rej.close()
+    # Hold the dataset-dir lock across prune + all writes: two parse tasks sharing
+    # one --dataset-dir would interleave shard/metadata writes and corrupt both
+    # (the parallel model is one dataset dir per array task; merge afterwards).
+    with DatasetLock(dataset_dir):
+        done_calc_ids, committed_frame_ids = _load_committed(metadata_path)
+        pruned = prune_uncommitted_frames(dataset_dir, committed_frame_ids)
+        start_index = next_shard_index(dataset_dir)  # after pruning may drop shards
+        if done_calc_ids or pruned["frames_dropped"]:
+            logger.info("parse resume: %d calc(s) already done, pruned %s, new shards from %05d",
+                        len(done_calc_ids), pruned, start_index)
+
+        rej = RejectionLogger(rejections_path)
+        with ShardedExtxyzWriter(dataset_dir, frames_per_shard, start_index=start_index) as xyz, \
+                MetadataWriter(metadata_path) as meta_w:
+            for rec in read_jsonl(in_path):
+                stats["records"] += 1
+                base_meta = {"provenance": rec["provenance"],
+                             "_extracted_root": str(_resolve(raw_dir, rec["local_dir"]) / "extracted")}
+                for unit in rec["calc_units"]:
+                    stats["calc_units"] += 1
+                    # Resolve stored (relative, or legacy absolute) paths against raw_dir.
+                    unit = {k: str(_resolve(raw_dir, v)) for k, v in unit.items()}
+                    calc_id = _calc_id(unit, base_meta)
+                    if calc_id in done_calc_ids:
+                        stats["skipped_existing"] += 1
+                        continue
+                    result = parse_calc_unit(unit, base_meta, rec.get("availability", {}), rej)
+                    if not result:
+                        continue
+                    frames, meta = result
+                    shards: set[str] = set()
+                    for fr in frames:
+                        shards.add(xyz.write(fr))
+                        stats["frames"] += 1
+                    meta["shards"] = sorted(shards)
+                    # durability ordering: frames must be on disk BEFORE their metadata,
+                    # or a crash could leave metadata pointing at frames in no shard.
+                    xyz.flush()
+                    meta_w.write(_jsonable(meta))
+                    done_calc_ids.add(calc_id)  # a duplicate unit later in THIS run is skipped too
+                    stats["calcs_parsed"] += 1
+                if max_records and stats["records"] >= max_records:
+                    break
+        rej.close()
     stats["rejections"] = rej.n
     stats["pruned"] = pruned
     logger.info("parse: %s", stats)
