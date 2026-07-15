@@ -14,13 +14,19 @@ vasprun.xml → 4047 frames) + 17378016 (OUTCAR-only → 40 frames):
   parameters (run_type, INCAR, k-points, POTCAR spec, ENCUT/EDIFF/…), quality
   (`electronic_converged` + `scf_dE` magnitude, ionic convergence, counts), and
   availability flags. Compact to Parquet later if/when query speed needs it.
-- **Energy** stored per frame = `e_0_energy` (σ→0). **Forces** per frame. Both
-  via an ASE `SinglePointCalculator` so extxyz emits standard `energy`/`forces`.
-- **Stress is parsed but NOT written to extxyz** — kept in metadata (`stress_units:
-  kBar`, raw 3×3 in frame info as `stress_kbar`). VASP's kBar sign/scale
-  convention → confirm with mentor before shipping stress into training. *(open)*
+- **Energy** stored per frame = `e_0_energy` (σ→0), with pymatgen's `final_energy`
+  bugfix applied to *every* ionic step. **Forces** per frame. Both written under
+  MACE's default **`REF_energy`/`REF_forces`** keys, straight into `atoms.info`/
+  `atoms.arrays` (a `SinglePointCalculator` would emit the reserved `energy`/`forces`
+  keys, which ASE re-absorbs into a calculator on read-back — removing them from
+  `info`/`arrays`; the `REF_` keys survive and stay queryable).
+- **Stress is parsed but NOT a training label** — the raw 3×3 tensor stays in the
+  frame info as `stress_kbar` (kBar; the OUTCAR-only path keeps ASE's tensor as
+  `stress_ase_evA3`). VASP's kBar sign/scale convention → confirm with mentor
+  before shipping stress into training. *(open)*
 - **Per-atom charges/spins** exist only in OUTCAR (end-of-run), so they attach to
-  the final frame only, and only when an OUTCAR sits beside the vasprun.
+  the final frame only (as `dft_charge`/`dft_magmom` output arrays), and only when
+  an OUTCAR sits beside the vasprun.
 - **POTCAR** files are not parsed (copyright + often absent): we keep the `titel`
   strings; `hash` is null.
 - Parser precedence: `pymatgen.Vasprun` (primary) → ASE `vasp-out` (OUTCAR-only
@@ -113,12 +119,12 @@ Per-frame layout (ASE `Atoms`, written with `ase.io.write(..., format="extxyz")`
 | positions | per-atom | (columns) |
 | chemical symbols | per-atom | `species` |
 | cell + PBC | frame header | `Lattice`, `pbc` |
-| forces | per-atom array | `forces` |
-| charges (Bader/Mulliken/…) | per-atom array | `initial_charges` / `charges` |
-| spins / magmoms | per-atom array | `initial_magmoms` / `magmoms` |
-| total energy | frame info | `energy` (MACE reads `REF_energy`) |
-| stress (if present) | frame info | `stress` |
-| convergence flags | frame info | `electronic_converged`, `dE_last_scf` |
+| forces | per-atom array | `REF_forces` (MACE default) |
+| charges (Bader/Mulliken/…) | per-atom array | `dft_charge` |
+| spins / magmoms | per-atom array | `dft_magmom` |
+| total energy | frame info | `REF_energy` (MACE default) |
+| stress (if present) | frame info | `stress_kbar` (kBar, raw; not a label) |
+| convergence flags | frame info | `electronic_converged`, `scf_dE` |
 | **link to metadata** | frame info | `frame_id`, `source_recid` |
 
 Keep the extxyz header **small**: only physical data + a `frame_id` foreign key.

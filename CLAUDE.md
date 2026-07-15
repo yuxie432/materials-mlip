@@ -61,10 +61,15 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   Full cluster harvest: add `--exhaustive` to `discover` (recursive date-partitioning past 10k).
 - `ZENODO_TOKEN` lives in `.env` (gitignored, loaded by `config.load_dotenv`). Stage 0–1 depend
   only on `requests`; stages 2–4 need `pymatgen` + `ase` (`pip install -e .[parse]`).
-- **Frame properties**: energy (`e_0_energy`, i.e. σ→0) + forces are written to extxyz via an ASE
-  `SinglePointCalculator`. **Stress is parsed but kept in metadata only** (`stress_units: kBar`) —
-  VASP's kBar sign/scale convention must be confirmed before feeding stress to training. Per-atom
-  charges/spins come from OUTCAR (end-of-run) and are attached to the final frame only.
+- **Frame properties**: per-ionic-step energy (`e_0_energy`, σ→0, with pymatgen's `final_energy`
+  bugfix applied to *every* step) and forces are written to extxyz under MACE's default
+  **`REF_energy`/`REF_forces`** keys — placed directly in `atoms.info`/`atoms.arrays` (not via a
+  `SinglePointCalculator`, whose reserved `energy`/`forces` keys ASE re-absorbs into a calculator on
+  read-back, removing them from `info`/`arrays`). **Stress is parsed but not a training label**: the
+  raw VASP 3×3 tensor stays in the frame info as `stress_kbar` (kBar) — VASP's kBar sign/scale
+  convention must be confirmed before feeding stress to training. Per-atom DFT charges/spins come
+  from OUTCAR (end-of-run) and attach to the final frame only, under explicit output keys
+  `dft_charge`/`dft_magmom` (not ASE's `initial_*` input fields).
 
 ## Scope and starting point
 

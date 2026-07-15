@@ -30,8 +30,15 @@ VASP_STEMS = [
 VASP_PRIMARY = {"vasprun", "outcar", "vaspout"}
 
 _COMPRESS = r"(?:\.(?:gz|bz2|xz|zst|lz4))?"
+# A canonical stem as a *word* (start of basename or after a separator), then any
+# number of separator-delimited suffix tokens and/or an extension, plus optional
+# compression. The trailing ``(?:[._\-]\w+)*`` is what lets us also match numbered
+# / suffixed variants VASP or uploaders emit — ``vasprun_1.xml``, ``OUTCAR_final``,
+# ``vasprun.relax.xml`` — instead of dropping those records at triage (recall).
+# Over-matching (e.g. ``poscar_notes.txt``) is safe: POSCAR is not a primary output
+# so it never seeds a calc unit on its own, and pymatgen parse is the precision gate.
 _VASP_RE = re.compile(
-    r"(?:^|[/_.\-])(" + "|".join(VASP_STEMS) + r")(?:\.\w+)?" + _COMPRESS + r"$",
+    r"(?:^|[/_.\-])(" + "|".join(VASP_STEMS) + r")(?:[._\-]\w+)*" + _COMPRESS + r"$",
     re.IGNORECASE,
 )
 

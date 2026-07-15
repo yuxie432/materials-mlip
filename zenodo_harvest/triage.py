@@ -21,9 +21,13 @@ from pathlib import Path
 import requests
 
 from .manifest import read_jsonl
-from .models import _VASP_RE, VASP_PRIMARY
+from .models import ARCHIVE_EXTS, VASP_PRIMARY, _VASP_RE
 
 logger = logging.getLogger(__name__)
+
+# Only ZIP has a tail central directory we can read over HTTP Range; every other
+# archive format must be downloaded before its contents are knowable.
+_UNPEEKABLE_ARCHIVE_EXTS = ARCHIVE_EXTS - {".zip"}
 
 EOCD_SIG = b"\x50\x4b\x05\x06"  # end of central directory
 CDH_SIG = 0x02014b50            # central directory file header
@@ -122,7 +126,10 @@ def triage(
     peek:
         Attempt remote ZIP central-directory inspection on ``archive`` records.
     require_confirmed:
-        If True, keep an ``archive`` record only if peeking confirmed VASP files.
+        If True, drop an ``archive`` record that peeking could not confirm — but
+        *only* when every archive in it was peekable (``.zip``). A ``.tar``/``.tar.gz``/
+        ``.rar``/``.7z`` cannot be range-peeked yet fetch can still extract it, so
+        such records are kept (confirmed at download) rather than silently discarded.
     """
     in_path, out_path = Path(in_path), Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -154,7 +161,11 @@ def triage(
                                 stats["peek_confirmed"] += 1
                                 break
             if require_confirmed and rec["vasp_category"] == "archive" and not confirmed:
-                continue
+                # Only drop if we actually had a chance to confirm: every archive was
+                # peekable (.zip) and came back without VASP files. If any archive is
+                # unpeekable (tar/rar/7z), keep it — fetch confirms it at download.
+                if not any(f.get("ext") in _UNPEEKABLE_ARCHIVE_EXTS for f in rec["files"]):
+                    continue
             out.write(json.dumps(rec) + "\n")
             kept += 1
     stats["kept"] = kept

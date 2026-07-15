@@ -38,6 +38,9 @@ python -m zenodo_harvest.cli parse \
     --in data/manifests/fetched.jsonl    # -> data/dataset/{shard-*.extxyz.gz,metadata.jsonl}
 ```
 
-Set `ZENODO_TOKEN` to raise the rate limit. For a full harvest on the cluster,
-add `--exhaustive` to `discover` (recursive date-partitioning past Zenodo's 10k
-search window).
+Each parsed ionic step becomes one extxyz frame with energy/forces under MACE's
+default **`REF_energy`/`REF_forces`** keys (train with those keys directly). Set
+`ZENODO_TOKEN` to raise the rate limit. Install `pip install -e .[archives]` to also
+harvest `.rar`/`.7z` uploads (rarfile also needs an `unrar`/`bsdtar` binary). For a
+full harvest on the cluster, add `--exhaustive` to `discover` (recursive
+date-partitioning past Zenodo's 10k search window).

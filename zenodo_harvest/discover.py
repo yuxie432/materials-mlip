@@ -21,20 +21,34 @@ logger = logging.getLogger(__name__)
 
 # Broad, recall-oriented seed queries. Zenodo's default operator is OR, so keep
 # multi-word phrases quoted when you mean a phrase. These target materials DFT;
-# tune per harvest. Precision is recovered later in triage + parse.
+# tune per harvest. Precision is recovered later in triage + parse. NB: ``q`` is
+# metadata-only (title/description/keywords), never file contents — so we also cast
+# for method/tooling terms and the code's own filenames, which uploaders often name.
 DEFAULT_QUERIES = [
     "VASP",
     "vasprun.xml",
     "OUTCAR",
-    '"first principles" AND (energy OR forces OR relaxation)',
-    '"density functional theory" AND (dataset OR trajectory OR forces)',
+    "INCAR",
+    '"projector augmented wave" OR "plane wave" OR PAW',
+    '"first principles" AND (energy OR forces OR relaxation OR "molecular dynamics")',
+    '"density functional theory" AND (dataset OR trajectory OR forces OR relaxation)',
     '"machine learning" AND (interatomic potential OR force field) AND DFT',
     "MACE OR NequIP OR Allegro OR GAP AND training data",
     '"ab initio" molecular dynamics forces',
+    'phonon AND (DFT OR VASP OR "first principles")',
+    '"formation energy" AND (DFT OR VASP OR "first principles")',
 ]
 
-# Restrict to datasets by default; software/other can carry data too but are noisier.
-DEFAULT_RESOURCE_TYPES = ("dataset",)
+# Resource types worth scanning by default — a *quality-leaning* prior, not maximal
+# recall. `dataset` is curated research data (the core); `other` is cheap (~few
+# records) and occasionally exposes a raw OUTCAR/POSCAR dump directly. Deliberately
+# EXCLUDED from the default: `software` (VASP data there is usually small
+# tutorial/example runs) and `publication` (mostly PDFs; real data is normally
+# re-deposited as its own dataset) — both add download/parse cost for lower-quality
+# yield. They remain one `--resource-type` flag away when you want to widen. Whatever
+# is scanned, the `resource_type` is recorded in the metadata so a training set can
+# be filtered/weighted by source (alongside the convergence / ENCUT / k-point tags).
+DEFAULT_RESOURCE_TYPES = ("dataset", "other")
 
 
 def discover(

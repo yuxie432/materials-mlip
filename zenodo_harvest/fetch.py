@@ -11,8 +11,10 @@ disk as one directory per calculation, ready for parsing. Design goals:
   within a record any file already present with a matching md5 is skipped — so an
   interrupted harvest resumes cleanly, with no duplicate work or manifest lines
   (important on the cluster).
-* **Robust**: size-capped, checksum-verified, zip-slip-safe; unsupported archives
-  (`.rar`, `.7z` — no stdlib/portable tooling) are logged as rejections, not fatal.
+* **Robust**: size-capped (archive *and* per-member uncompressed), checksum-verified,
+  zip-slip-safe, streamed (never loads a whole member into RAM). `.zip`/`.tar*` use
+  the stdlib; `.rar`/`.7z` are handled when the optional `archives` extra (rarfile/
+  py7zr) is installed, else logged as a rejection rather than being fatal.
 """
 
 from __future__ import annotations
@@ -32,6 +34,30 @@ from . import config
 from .manifest import JsonlWriter, RejectionLogger, read_jsonl
 
 logger = logging.getLogger(__name__)
+
+# Optional archive backends (installed via the ``archives`` extra). ``.rar`` also
+# needs an ``unrar``/``bsdtar`` binary on PATH; ``rarfile`` raises at open time if
+# it is missing, which we catch and log as a clean skip rather than a crash.
+try:
+    import py7zr  # type: ignore
+except ImportError:  # pragma: no cover - optional dep
+    py7zr = None  # type: ignore
+try:
+    import rarfile  # type: ignore
+except ImportError:  # pragma: no cover - optional dep
+    rarfile = None  # type: ignore
+
+# Per-member *uncompressed* size cap: bounds disk and defuses decompression bombs
+# (the archive-level max_bytes only caps the *compressed* download). Extraction
+# streams in chunks, so memory stays ~chunk-sized regardless of member size.
+DEFAULT_MAX_MEMBER_BYTES = 2_000_000_000
+
+# Record-level rejection reasons that are terminal (re-running can't help): the
+# archive downloaded + extracted fine but held no usable VASP outputs. These recids
+# are skipped on resume so their (often large) archives aren't re-downloaded and
+# re-rejected every run. Transient reasons (download_error/http_*) are NOT here, so
+# they still retry. See --retry-rejected to override.
+_TERMINAL_REJECT_REASONS = {"no_calc_units_after_extract", "no_vasp_files_fetched"}
 
 # Files worth extracting for parsing / provenance. A canonical VASP stem taken as
 # a *word* — at the start of the basename or after a path/name separator — with
@@ -96,7 +122,8 @@ def download_file(
                 for chunk in r.iter_content(1 << 20):
                     written += len(chunk)
                     if max_bytes and written > max_bytes:
-                        fh.close(); tmp.unlink(missing_ok=True)
+                        fh.close()
+                        tmp.unlink(missing_ok=True)
                         return False, "over_size_cap"
                     fh.write(chunk)
     except requests.RequestException as exc:
@@ -130,7 +157,26 @@ def _is_within(base: Path, target: Path) -> bool:
         return False
 
 
-def _extract_zip(path: Path, dest: Path) -> tuple[list[str], list[str]]:
+def _copy_capped(src: Any, out: Path, cap: int) -> bool:
+    """Stream ``src`` -> ``out`` in chunks; abort (delete partial) if over ``cap``.
+
+    Streaming keeps peak memory ~chunk-sized regardless of the member's uncompressed
+    size (the old ``src.read()`` allocated the whole member — an OOM / zip-bomb risk).
+    """
+    written = 0
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("wb") as dst:
+        for chunk in iter(lambda: src.read(1 << 20), b""):
+            written += len(chunk)
+            if written > cap:
+                dst.close()
+                out.unlink(missing_ok=True)
+                return False
+            dst.write(chunk)
+    return True
+
+
+def _extract_zip(path: Path, dest: Path, member_cap: int) -> tuple[list[str], list[str]]:
     extracted: list[str] = []
     with zipfile.ZipFile(path) as zf:
         names = zf.namelist()
@@ -143,14 +189,16 @@ def _extract_zip(path: Path, dest: Path) -> tuple[list[str], list[str]]:
             out = dest / info.filename
             if not _is_within(dest, out):
                 continue  # zip-slip guard
-            out.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(info) as src, out.open("wb") as dst:
-                dst.write(src.read())
-            extracted.append(info.filename)
+            if info.file_size > member_cap:  # header says it's too big -> skip pre-extract
+                logger.warning("skip oversized member %s (%d B) in %s", base, info.file_size, path.name)
+                continue
+            with zf.open(info) as src:
+                if _copy_capped(src, out, member_cap):
+                    extracted.append(info.filename)
     return names, extracted
 
 
-def _extract_tar(path: Path, dest: Path) -> tuple[list[str], list[str]]:
+def _extract_tar(path: Path, dest: Path, member_cap: int) -> tuple[list[str], list[str]]:
     extracted: list[str] = []
     with tarfile.open(path) as tf:
         names = tf.getnames()
@@ -163,14 +211,66 @@ def _extract_tar(path: Path, dest: Path) -> tuple[list[str], list[str]]:
             out = dest / member.name
             if not _is_within(dest, out):
                 continue
-            out.parent.mkdir(parents=True, exist_ok=True)
+            if member.size > member_cap:
+                logger.warning("skip oversized member %s (%d B) in %s", base, member.size, path.name)
+                continue
             src = tf.extractfile(member)
             if src is None:
                 continue
-            with out.open("wb") as dst:
-                dst.write(src.read())
-            extracted.append(member.name)
+            if _copy_capped(src, out, member_cap):
+                extracted.append(member.name)
     return names, extracted
+
+
+def _extract_rar(path: Path, dest: Path, member_cap: int) -> tuple[list[str], list[str]]:
+    extracted: list[str] = []
+    with rarfile.RarFile(path) as rf:  # type: ignore[union-attr]
+        names = rf.namelist()
+        for info in rf.infolist():
+            if info.isdir():
+                continue
+            base = info.filename.rsplit("/", 1)[-1]
+            if not _PARSE_RE.search(base):
+                continue
+            out = dest / info.filename
+            if not _is_within(dest, out):
+                continue
+            if getattr(info, "file_size", 0) > member_cap:
+                logger.warning("skip oversized member %s in %s", base, path.name)
+                continue
+            with rf.open(info) as src:
+                if _copy_capped(src, out, member_cap):
+                    extracted.append(info.filename)
+    return names, extracted
+
+
+def _extract_7z(path: Path, dest: Path, member_cap: int) -> tuple[list[str], list[str]]:
+    extracted: list[str] = []
+    with py7zr.SevenZipFile(path, "r") as zf:  # type: ignore[union-attr]
+        infos = zf.list()
+        names = [i.filename for i in infos]
+        sizes = {i.filename: getattr(i, "uncompressed", 0) or 0 for i in infos}
+        targets = [
+            n for n in names
+            if not n.endswith("/")
+            and _PARSE_RE.search(n.rsplit("/", 1)[-1])
+            and _is_within(dest, dest / n)
+            and sizes.get(n, 0) <= member_cap
+        ]
+        if not targets:
+            return names, extracted
+        for name, bio in zf.read(targets).items():  # py7zr decompresses selected members
+            out = dest / name
+            out.parent.mkdir(parents=True, exist_ok=True)
+            data = bio.read()
+            if len(data) > member_cap:
+                continue
+            out.write_bytes(data)
+            extracted.append(name)
+    return names, extracted
+
+
+_EXTRACTORS = {"zip": _extract_zip, "tar": _extract_tar, "rar": _extract_rar, "sevenzip": _extract_7z}
 
 
 def _is_archive(name: str) -> str | None:
@@ -179,11 +279,24 @@ def _is_archive(name: str) -> str | None:
         return "zip"
     if low.endswith(_TAR_SUFFIXES):
         return "tar"
-    if low.endswith((".rar", ".7z")):
-        return "unsupported"
+    if low.endswith(".rar"):
+        return "rar"
+    if low.endswith(".7z"):
+        return "sevenzip"
     # A single gzipped file (e.g. OUTCAR.gz) is not an archive to unpack; it is
     # handled by the _PARSE_RE / availability branches in fetch_record.
     return None
+
+
+def _archive_subdir(base: str) -> str:
+    """A filesystem-safe per-archive extraction subdir (avoids cross-archive
+    member-path collisions when one record ships multiple archives)."""
+    stem = base
+    for suf in (*_TAR_SUFFIXES, ".zip", ".rar", ".7z"):
+        if stem.lower().endswith(suf):
+            stem = stem[: -len(suf)]
+            break
+    return re.sub(r"[^A-Za-z0-9._-]", "_", stem) or "archive"
 
 
 # Role detection for grouping extracted files into calc units. Separator-tolerant
@@ -209,31 +322,83 @@ def _unit_role(base: str) -> str | None:
     return None
 
 
+_PRIMARY_ROLES = ("vasprun", "vaspout", "outcar")
+
+
+def _unit_tag(base: str, role: str) -> str:
+    """Distinguishing prefix/suffix of a filename once its role word is removed.
+
+    ``site1_OUTCAR`` -> ``site1``; ``vasprun.xml`` -> ``""``; ``vasprun_1.xml`` ->
+    ``1``. Files sharing a tag in a multi-calc directory belong to the same calc.
+    """
+    low = base.lower()
+    i = low.find(role)
+    tag = (low[:i] + low[i + len(role):]) if i != -1 else low
+    tag = re.sub(r"\.(xml|h5|gz|bz2|xz|zst|json)$", "", tag)
+    return tag.strip(" ._-/")
+
+
+def _assign_role(slot: dict[str, str], role: str, path: Path) -> None:
+    if role == "vasprun" and "vasprun" in slot:
+        if path.name.lower() == "vasprun.xml":  # prefer the canonical name if several
+            slot["vasprun"] = str(path)
+    else:
+        slot.setdefault(role, str(path))
+
+
 def _find_calc_units(root: Path) -> list[dict[str, str]]:
-    """Group extracted files into one calc unit per directory holding VASP output."""
-    by_dir: dict[Path, dict[str, str]] = {}
+    """Group extracted files into calc units — one per distinct primary output.
+
+    Grouping by directory alone silently collapses multiple independent
+    calculations that share a flat directory but differ only by a filename
+    prefix/suffix (e.g. ``site1_OUTCAR`` + ``site2_OUTCAR``): all-but-one primary is
+    dropped and the survivors are cross-paired. So within each directory: with a
+    single primary the whole directory is one unit (the common per-calc-directory
+    layout — tagged inputs stay attached); with several primaries we split by tag so
+    each OUTCAR/vasprun/vaspout seeds its own unit, pairing same-tag inputs and
+    sharing untagged inputs across them.
+    """
+    by_dir: dict[Path, list[tuple[str, Path]]] = {}
     for p in root.rglob("*"):
         if not p.is_file():
             continue
         role = _unit_role(p.name)
-        if role is None:
+        if role is not None:
+            by_dir.setdefault(p.parent, []).append((role, p))
+
+    units: list[dict[str, str]] = []
+    for _d, items in sorted(by_dir.items()):
+        primaries = [(r, p) for r, p in items if r in _PRIMARY_ROLES]
+        if not primaries:
+            continue  # inputs only (POSCAR/INCAR/…): no energies/forces to parse
+        if len(primaries) == 1:
+            slot: dict[str, str] = {"dir": str(_d)}
+            for r, p in items:
+                _assign_role(slot, r, p)
+            units.append(slot)
             continue
-        slot = by_dir.setdefault(p.parent, {})
-        if role == "vasprun" and "vasprun" in slot:
-            # prefer the canonical vasprun.xml if several exist in one dir
-            if p.name.lower() == "vasprun.xml":
-                slot["vasprun"] = str(p)
-        else:
-            slot.setdefault(role, str(p))
-    units = []
-    for d, slot in sorted(by_dir.items()):
-        if any(k in slot for k in ("vasprun", "vaspout", "outcar")):
-            units.append({"dir": str(d), **slot})
+        # multiple primaries in one flat directory -> split into one unit per tag
+        groups: dict[str, list[tuple[str, Path]]] = {}
+        shared_inputs: list[tuple[str, Path]] = []
+        for r, p in items:
+            tag = _unit_tag(p.name, r)
+            if r not in _PRIMARY_ROLES and tag == "":
+                shared_inputs.append((r, p))  # untagged input applies to every calc here
+            else:
+                groups.setdefault(tag, []).append((r, p))
+        for _tag, grp in sorted(groups.items()):
+            if not any(r in _PRIMARY_ROLES for r, _ in grp):
+                continue  # a tagged input with no matching primary -> nothing to seed
+            slot = {"dir": str(_d)}
+            for r, p in (*grp, *shared_inputs):
+                _assign_role(slot, r, p)
+            units.append(slot)
     return units
 
 
 def fetch_record(rec: dict, session: requests.Session, raw_dir: Path,
-                 max_bytes: int | None, rej: RejectionLogger) -> dict | None:
+                 max_bytes: int | None, rej: RejectionLogger,
+                 max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES) -> dict | None:
     """Download + stage one record. Returns a fetched-manifest entry or None."""
     recid = rec["recid"]
     dest = raw_dir / recid
@@ -247,11 +412,13 @@ def fetch_record(rec: dict, session: requests.Session, raw_dir: Path,
         base = (key or "").rsplit("/", 1)[-1]
         kind = _is_archive(base)
 
-        if kind == "unsupported":
-            rej.reject("fetch", f"{recid}:{key}", "archive_unsupported", format=base.split(".")[-1])
+        if kind in ("rar", "sevenzip") and (
+                (kind == "rar" and rarfile is None) or (kind == "sevenzip" and py7zr is None)):
+            rej.reject("fetch", f"{recid}:{key}", "archive_unsupported",
+                       format=base.rsplit(".", 1)[-1], detail="install the 'archives' extra")
             continue
 
-        if kind in ("zip", "tar"):
+        if kind is not None:  # a real archive to download + selectively extract
             if max_bytes and size > max_bytes:
                 rej.reject("fetch", f"{recid}:{key}", "over_size_cap", size=size)
                 continue
@@ -260,11 +427,15 @@ def fetch_record(rec: dict, session: requests.Session, raw_dir: Path,
             if not ok:
                 rej.reject("fetch", f"{recid}:{key}", why, size=size)
                 continue
+            # Extract into a per-archive subdir so identical member paths across
+            # multiple archives in one record can't overwrite each other.
+            extract_dir = dest / "extracted" / _archive_subdir(base)
             try:
-                names, extracted = (_extract_zip if kind == "zip" else _extract_tar)(
-                    arc, dest / "extracted")
-            except (zipfile.BadZipFile, tarfile.TarError, EOFError) as exc:
-                rej.reject("fetch", f"{recid}:{key}", "extract_error", detail=str(exc))
+                names, extracted = _EXTRACTORS[kind](arc, extract_dir, max_member_bytes)
+            except (zipfile.BadZipFile, tarfile.TarError, EOFError, OSError, ValueError) as exc:
+                rej.reject("fetch", f"{recid}:{key}", "extract_error",
+                           detail=f"{type(exc).__name__}: {exc}")
+                arc.unlink(missing_ok=True)
                 continue
             info = _safe_members(names)
             for k, v in info["availability"].items():
@@ -314,6 +485,7 @@ def fetch_record(rec: dict, session: requests.Session, raw_dir: Path,
             "title": rec.get("title"),
             "creators": rec.get("creators"),
             "license": rec.get("license"),
+            "resource_type": rec.get("resource_type"),  # source-quality tag for late filtering
             "publication_date": rec.get("publication_date"),
             "keywords": rec.get("keywords"),
         },
@@ -332,6 +504,24 @@ def _done_recids(out_path: Path) -> set[str]:
     return {rec["recid"] for rec in read_jsonl(out_path) if rec.get("recid")}
 
 
+def _terminal_reject_recids(rejections_path: Path) -> set[str]:
+    """recids terminally rejected in a prior run (won't succeed on retry).
+
+    Reading these into the skip set stops fetch from re-downloading + re-extracting
+    + re-rejecting the same (often large) archives on every resume, and stops
+    rejections.jsonl from growing without bound. Only record-level terminal reasons
+    count; transient per-file failures (download errors, 5xx) are left to retry.
+    """
+    if not rejections_path.is_file():
+        return set()
+    out: set[str] = set()
+    for r in read_jsonl(rejections_path):
+        if (r.get("stage") == "fetch" and r.get("reason") in _TERMINAL_REJECT_REASONS
+                and isinstance(r.get("id"), str) and ":" not in r["id"]):  # ":" => per-file id
+            out.add(r["id"])
+    return out
+
+
 def fetch(
     in_path: str | Path,
     out_path: str | Path = config.MANIFEST_DIR / "fetched.jsonl",
@@ -340,16 +530,23 @@ def fetch(
     max_bytes: int | None = 500_000_000,
     max_records: int | None = None,
     token: str | None = None,
+    retry_rejected: bool = False,
 ) -> dict:
     """Fetch all records in ``in_path`` (a triaged keep-list).
 
-    Resumable at the record level: any recid already present in ``out_path`` is
+    Resumable at the record level: any recid already staged in ``out_path`` — or
+    terminally rejected in ``rejections_path`` (unless ``retry_rejected``) — is
     skipped, so a re-run after an interrupted harvest neither re-downloads it nor
-    appends a duplicate manifest line. ``max_records`` caps records fetched *this
+    appends duplicate manifest/rejection lines. Pass ``retry_rejected=True`` to
+    reprocess previously-rejected records (e.g. after raising ``max_bytes`` or
+    installing the ``archives`` extra). ``max_records`` caps records fetched *this
     run* (newly staged), not counting resumed skips.
     """
     out_path, raw_dir = Path(out_path), Path(raw_dir)
+    rejections_path = Path(rejections_path)
     done = _done_recids(out_path)
+    if not retry_rejected:
+        done |= _terminal_reject_recids(rejections_path)
     rej = RejectionLogger(rejections_path)
     stats = {"records": 0, "fetched": 0, "skipped_existing": 0, "calc_units": 0}
     with _session(token or os.environ.get("ZENODO_TOKEN")) as session, \

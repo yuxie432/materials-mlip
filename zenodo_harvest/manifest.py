@@ -9,16 +9,37 @@ docs/DESIGN.md §5).
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Iterator
 
+logger = logging.getLogger(__name__)
+
 
 def read_jsonl(path: str | Path) -> Iterator[dict]:
+    """Yield one dict per JSONL line, tolerating a truncated *final* line.
+
+    A crash / power loss / disk-full during an append (``flush`` is not ``fsync``)
+    can leave the last line half-written. Since every stage reads its predecessor's
+    manifest at the *start* of a resumed run, a hard ``json.loads`` there would
+    abort the very resume the append-only design exists to enable. So a malformed
+    **last** non-empty line is logged and skipped; a malformed non-final line still
+    raises, since that signals genuine mid-file corruption rather than a torn tail.
+    """
+    prev: str | None = None
     with Path(path).open() as fh:
-        for line in fh:
-            line = line.strip()
-            if line:
-                yield json.loads(line)
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            if prev is not None:
+                yield json.loads(prev)  # prev was newline-terminated -> must be whole
+            prev = line
+    if prev is not None:
+        try:
+            yield json.loads(prev)
+        except json.JSONDecodeError as exc:
+            logger.warning("skipping truncated final line in %s: %s", path, exc)
 
 
 def write_jsonl(path: str | Path, rows: list[dict]) -> None:

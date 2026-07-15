@@ -12,10 +12,15 @@ Run: ``python -m pytest tests/ -q`` from the repo root.
 from __future__ import annotations
 
 import io
+import json
 import zipfile
+from pathlib import Path
+
+import pytest
 
 from zenodo_harvest import discover as discover_mod
-from zenodo_harvest.fetch import _PARSE_RE, _unit_role
+from zenodo_harvest.fetch import _PARSE_RE, _find_calc_units, _unit_role, _unit_tag
+from zenodo_harvest.manifest import read_jsonl
 from zenodo_harvest.models import (
     CATEGORY_RANK,
     VASP_PRIMARY,
@@ -93,11 +98,16 @@ def test_vasp_re_primary_group():
     assert m and m.group(1).lower() in VASP_PRIMARY
 
 
-def test_vasp_re_known_suffix_gap():
-    # Documented recall gap (harvest-error-backlog #3): a trailing suffix before
-    # the extension is NOT matched by _VASP_RE. Guards against silent change.
-    assert _VASP_RE.search("vasprun_1.xml") is None
-    assert _VASP_RE.search("OUTCAR_final") is None
+def test_vasp_re_matches_suffixed_variants():
+    # harvest-error-backlog #3 FIXED: a trailing suffix/number before the extension
+    # now matches, so records whose only VASP files are numbered/suffixed variants
+    # are no longer dropped at triage. (Previously these were a documented gap.)
+    for name in ["vasprun_1.xml", "vasprun_2.xml", "OUTCAR_final",
+                 "vasprun.relax.xml", "OUTCAR.1", "OUTCAR_final.gz"]:
+        assert _VASP_RE.search(name), name
+    # ...while still rejecting clearly-unrelated files.
+    for name in ["paper.pdf", "notes.txt", "data.zip", "README", "energy.dat", "structure.cif"]:
+        assert _VASP_RE.search(name) is None, name
 
 
 # --------------------------------------------------------------------------- #
@@ -222,6 +232,68 @@ def test_discover_keeps_newest_version(tmp_path):
     )
     assert summary["unique_concepts"] == 2
     kept = {line.strip() for line in out.read_text().splitlines() if line.strip()}
-    import json
     recids = sorted(json.loads(x)["recid"] for x in kept)
     assert recids == ["200", "300"]        # newest of concept 50 wins
+
+
+# --------------------------------------------------------------------------- #
+# _find_calc_units — one calc unit per distinct primary (flat multi-calc split) #
+# --------------------------------------------------------------------------- #
+
+def test_find_calc_units_splits_flat_multicalc(tmp_path):
+    # Regression for the site1/site2 collapse: a flat dir with two independent
+    # calcs (distinguished by prefix) must yield TWO units, each paired with its
+    # OWN CONTCAR, and neither primary OUTCAR may be dropped.
+    d = tmp_path / "extracted"
+    d.mkdir()
+    for n in ["site1_OUTCAR", "site1_CONTCAR", "site2_OUTCAR", "site2_CONTCAR"]:
+        (d / n).write_text("x")
+    units = _find_calc_units(d)
+    assert len(units) == 2
+    assert sorted(Path(u["outcar"]).name for u in units) == ["site1_OUTCAR", "site2_OUTCAR"]
+    pairing = {Path(u["outcar"]).name: Path(u["contcar"]).name for u in units}
+    assert pairing == {"site1_OUTCAR": "site1_CONTCAR", "site2_OUTCAR": "site2_CONTCAR"}
+
+
+def test_find_calc_units_single_primary_dir_is_one_unit(tmp_path):
+    # The common per-calc-directory layout: one primary + inputs -> exactly one unit,
+    # even when an input carries an incidental tag (POSCAR-final).
+    d = tmp_path / "extracted" / "relax"
+    d.mkdir(parents=True)
+    for n in ["INCAR", "POSCAR-final", "KPOINTS", "OUTCAR", "vasprun.xml"]:
+        (d / n).write_text("x")
+    units = _find_calc_units(tmp_path / "extracted")
+    assert len(units) == 1
+    assert Path(units[0]["vasprun"]).name == "vasprun.xml"
+    assert Path(units[0]["outcar"]).name == "OUTCAR"
+
+
+def test_find_calc_units_inputs_only_yields_nothing(tmp_path):
+    d = tmp_path / "extracted"
+    d.mkdir()
+    for n in ["INCAR", "POSCAR", "KPOINTS"]:  # no OUTCAR/vasprun -> no energies/forces
+        (d / n).write_text("x")
+    assert _find_calc_units(d) == []
+
+
+def test_unit_tag():
+    assert _unit_tag("site1_OUTCAR", "outcar") == "site1"
+    assert _unit_tag("vasprun.xml", "vasprun") == ""
+    assert _unit_tag("vasprun_1.xml", "vasprun") == "1"
+
+
+# --------------------------------------------------------------------------- #
+# read_jsonl — tolerate a truncated final line (crash-safe resume)            #
+# --------------------------------------------------------------------------- #
+
+def test_read_jsonl_tolerates_truncated_final_line(tmp_path):
+    p = tmp_path / "m.jsonl"
+    p.write_text('{"a": 1}\n{"b": 2}\n{"c": 3')  # crash mid-append: torn last line
+    assert list(read_jsonl(p)) == [{"a": 1}, {"b": 2}]
+
+
+def test_read_jsonl_raises_on_malformed_nonfinal_line(tmp_path):
+    p = tmp_path / "m.jsonl"
+    p.write_text('{"a": 1}\n{oops not json\n{"c": 3}\n')  # genuine mid-file corruption
+    with pytest.raises(json.JSONDecodeError):
+        list(read_jsonl(p))

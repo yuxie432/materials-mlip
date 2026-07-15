@@ -12,12 +12,21 @@ functional, the full INCAR + k-points + POTCAR spec, and availability flags for
 heavy data we deliberately don't store (charge/spin density, eigenvalues, DOS).
 
 What lands where (docs/DESIGN.md §3):
-* extxyz frame  : positions, symbols, cell, energy, forces (+ site charges/magmoms
-                  on the final frame if an OUTCAR provides them), small quality tags.
+* extxyz frame  : positions, symbols, cell, energy (``REF_energy``) + forces
+                  (``REF_forces``) (+ per-site DFT charges/magmoms as
+                  ``dft_charge``/``dft_magmom`` on the final frame if an OUTCAR
+                  provides them), small quality tags.
 * metadata JSONL: provenance, citation, calc parameters, convergence, availability.
 
-Stress is parsed but kept in metadata only (VASP reports kBar with a sign/scale
-convention that must be confirmed before feeding stress to training).
+Energy/forces use the ``REF_energy``/``REF_forces`` keys (MACE's defaults). They are
+written into ``atoms.info``/``atoms.arrays`` directly rather than via an ASE
+``SinglePointCalculator`` because ASE re-absorbs the reserved ``energy``/``forces``
+keys into a calculator on read-back, removing them from ``info``/``arrays`` — the
+``REF_`` keys survive the round-trip and stay queryable.
+
+Stress is parsed but NOT emitted as a training label: the raw VASP 3×3 tensor is
+kept in the frame info (``stress_kbar``, in kBar) because VASP's kBar sign/scale
+convention must be confirmed before feeding stress to training.
 """
 
 from __future__ import annotations
@@ -30,7 +39,6 @@ from typing import Any
 
 import numpy as np
 from ase import Atoms
-from ase.calculators.singlepoint import SinglePointCalculator
 
 from . import config
 from .manifest import RejectionLogger, read_jsonl
@@ -51,6 +59,8 @@ def _jsonable(obj: Any) -> Any:
         return {str(k): _jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_jsonable(v) for v in obj]
+    if isinstance(obj, np.bool_):  # before np.integer: np.bool_ must stay JSON true/false
+        return bool(obj)
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, (np.floating,)):
@@ -62,15 +72,55 @@ def _jsonable(obj: Any) -> Any:
     return str(obj)  # enums, Kpoints style, etc.
 
 
+def _corrected_e0_energy(step: dict) -> float | None:
+    """Sigma→0 energy of one ionic step, with pymatgen's vasprun.xml bugfix applied.
+
+    The ionic-step ``<energy>`` block's ``e_0_energy`` (what ``step["e_0_energy"]``
+    holds) is unreliable in some vasprun.xml files — the same bug pymatgen corrects
+    in :pyattr:`Vasprun.final_energy` (outputs.py) but only for the *final* step. We
+    apply that identical correction to *every* step: recompute the σ→0 energy from
+    the last electronic step's (e_0 − e_fr) shift added to the ionic free energy, and
+    prefer it when it differs from the raw value by > 1e-7 eV (or the raw is absent).
+    Returns None only if no energy can be recovered (e.g. GW/response runs).
+    """
+    raw = step.get("e_0_energy")
+    esteps = step.get("electronic_steps") or []
+    if esteps:
+        last = esteps[-1]
+        try:
+            fixed = round((last["e_0_energy"] - last["e_fr_energy"]) + step["e_fr_energy"], 8)
+        except (KeyError, TypeError):
+            return raw
+        if raw is None or abs(raw - fixed) > 1e-7:
+            return fixed
+    return raw
+
+
 def _scf_convergence(vasprun: Any) -> dict:
-    """Electronic convergence bool + magnitude (ΔE of last two SCF steps)."""
-    dE = None
+    """Electronic convergence bool + magnitude (ΔE of last two SCF steps).
+
+    ``vaspout.h5`` exposes no per-SCF electronic steps, so pymatgen's
+    ``converged_electronic`` would report an unconditional ``True`` there — which
+    would silently admit an unconverged calc untagged. When electronic steps are
+    absent we record ``electronic_converged=None`` (unknown) instead.
+    """
     try:
         esteps = vasprun.ionic_steps[-1]["electronic_steps"]
-        if len(esteps) >= 2:
-            dE = abs(esteps[-1]["e_0_energy"] - esteps[-2]["e_0_energy"])
     except (IndexError, KeyError, TypeError):
-        pass
+        esteps = []
+    if not esteps:  # e.g. vaspout.h5 (no SCF trace) — don't fabricate a convergence verdict
+        try:
+            ionic = bool(vasprun.converged_ionic)
+        except (KeyError, TypeError):
+            ionic = None
+        return {"electronic_converged": None, "scf_dE": None, "scf_dE_key": "e_0_energy",
+                "ionic_converged": ionic, "scf_note": "electronic steps unavailable"}
+    dE = None
+    if len(esteps) >= 2:
+        try:
+            dE = abs(esteps[-1]["e_0_energy"] - esteps[-2]["e_0_energy"])
+        except (KeyError, TypeError):
+            pass
     return {
         "electronic_converged": bool(vasprun.converged_electronic),
         "scf_dE": dE,
@@ -99,11 +149,14 @@ def _calc_parameters(vasprun: Any) -> dict:
         v = incar.get(key)
         return v if v is not None else params.get(key)
 
+    run_type = str(vasprun.run_type)                # functional + U/vdW flavour
     return {
         "code": "vasp",
         "code_version": getattr(vasprun, "vasp_version", None),
-        "run_type": str(vasprun.run_type),          # functional + U/vdW flavour
-        "functional": str(vasprun.run_type),
+        "run_type": run_type,
+        # base XC alone (run_type minus the +U/+vdW suffixes) so `functional` is a
+        # distinct, coarser selection key rather than a duplicate of run_type.
+        "functional": run_type.split("+")[0],
         "hubbard_u": ldau,
         "spin_polarized": bool(vasprun.is_spin),
         "encut": _param("ENCUT"),
@@ -139,17 +192,20 @@ def _frame(structure: Any, energy: float | None, forces: Any, *, calc_id: str,
            magmoms: list | None = None, charges: list | None = None) -> Atoms:
     from pymatgen.io.ase import AseAtomsAdaptor
     atoms = AseAtomsAdaptor.get_atoms(structure)
-    results: dict[str, Any] = {}
+    # Write labels under MACE's default REF_* keys, straight into info/arrays. A
+    # SinglePointCalculator would emit the reserved `energy`/`forces` keys, which
+    # ASE re-absorbs into a calculator on read-back (removing them from info/arrays);
+    # the REF_* keys survive the round-trip and stay queryable. Per-atom DFT outputs
+    # go under explicit output names (dft_charge/dft_magmom) rather than ASE's
+    # `initial_*` input fields, which would mislabel computed outputs as inputs.
     if energy is not None:
-        results["energy"] = float(energy)
+        atoms.info["REF_energy"] = float(energy)
     if forces is not None:
-        results["forces"] = np.asarray(forces, dtype=float)
-    if results:
-        atoms.calc = SinglePointCalculator(atoms, **results)
+        atoms.arrays["REF_forces"] = np.asarray(forces, dtype=float)
     if magmoms is not None:
-        atoms.set_initial_magnetic_moments(magmoms)
+        atoms.arrays["dft_magmom"] = np.asarray(magmoms, dtype=float)
     if charges is not None:
-        atoms.set_initial_charges(charges)
+        atoms.arrays["dft_charge"] = np.asarray(charges, dtype=float)
     atoms.info.update({
         "source": "zenodo",
         "calc_id": calc_id,
@@ -183,7 +239,7 @@ def _frames_and_meta(v: Any, calc_id: str, outcar_path: str | None,
     for i, st in enumerate(steps):
         last = i == len(steps) - 1
         frame = _frame(
-            st["structure"], st.get("e_0_energy"), st.get("forces"),
+            st["structure"], _corrected_e0_energy(st), st.get("forces"),
             calc_id=calc_id, frame_id=f"{calc_id}#{i}", ionic_step=i, conv=conv,
             magmoms=site["magmoms"] if last else None,
             charges=site["charges"] if last else None,
@@ -256,27 +312,45 @@ def parse_calc_unit(unit: dict, base_meta: dict, availability: dict,
            if (vasprun or vaspout or outcar) else unit["dir"])
     calc_id = _calc_id(unit, base_meta)
 
+    # Primary parse: pymatgen Vasprun/Vaspout. On failure, if an OUTCAR is present
+    # in the same unit, fall back to the ASE OUTCAR reader rather than dropping the
+    # whole calc — real uploads carry vasprun.xml files pymatgen refuses (e.g. a
+    # Fortran field-overflow ``LAMBDA_D_K=****`` in the parameters block) yet a
+    # perfectly readable OUTCAR sits beside them.
+    frames: list[Atoms] | None = None
+    meta: dict | None = None
+    fallback_from: str | None = None
     if vasprun:
         try:
             frames, meta = parse_vasprun(vasprun, calc_id, outcar)
         except Exception as exc:
-            rej.reject("parse", calc_id, "vasprun_parse_error", detail=f"{type(exc).__name__}: {exc}")
-            return None
+            if not outcar:
+                rej.reject("parse", calc_id, "vasprun_parse_error", detail=f"{type(exc).__name__}: {exc}")
+                return None
+            logger.warning("vasprun parse failed for %s (%s); falling back to OUTCAR", calc_id, exc)
+            fallback_from = "vasprun"
     elif vaspout:
         try:
             frames, meta = parse_vaspout(vaspout, calc_id, outcar)
         except Exception as exc:
-            rej.reject("parse", calc_id, "vaspout_parse_error", detail=f"{type(exc).__name__}: {exc}")
-            return None
-    else:
-        # OUTCAR-only fallback (ASE reads the ionic trajectory well).
+            if not outcar:
+                rej.reject("parse", calc_id, "vaspout_parse_error", detail=f"{type(exc).__name__}: {exc}")
+                return None
+            logger.warning("vaspout parse failed for %s (%s); falling back to OUTCAR", calc_id, exc)
+            fallback_from = "vaspout"
+
+    if frames is None:  # OUTCAR-only unit, or a primary-parse fallback
         assert outcar is not None  # _find_calc_units guarantees a primary file
         try:
             frames, meta = _parse_outcar_ase(outcar, calc_id)
         except Exception as exc:
-            rej.reject("parse", calc_id, "outcar_parse_error", detail=f"{type(exc).__name__}: {exc}")
+            reason = f"{fallback_from}_parse_error" if fallback_from else "outcar_parse_error"
+            rej.reject("parse", calc_id, reason, detail=f"{type(exc).__name__}: {exc}")
             return None
+        if fallback_from:
+            meta["fallback_from"] = fallback_from  # provenance: primary was present but unparseable
 
+    assert meta is not None
     if not frames:
         rej.reject("parse", calc_id, "no_frames")
         return None
@@ -301,19 +375,45 @@ def _parse_outcar_ase(outcar_path: str, calc_id: str) -> tuple[list[Atoms], dict
     ASE's OUTCAR reader reaches into the working directory for a neighbouring
     CONTCAR/POSCAR (constraints), which crashes on uploads with nonstandard
     POTCAR-hash species lines (e.g. ``La_GW/21d20268``). Reading a lone copy in a
-    temp dir sidesteps that and is format-pinned to avoid filename sniffing.
+    temp dir sidesteps that and is format-pinned to avoid filename sniffing. A
+    compressed OUTCAR (``OUTCAR.gz``/``.bz2``/``.xz``) is decompressed first so the
+    lone temp copy is always plain text.
     """
+    import bz2
+    import gzip
+    import lzma
     import os
     import shutil
     import tempfile
 
     from ase.io import read
+    _openers: dict[str, Any] = {".gz": gzip.open, ".bz2": bz2.open, ".xz": lzma.open, ".lzma": lzma.open}
+    opener = next((fn for suf, fn in _openers.items() if outcar_path.lower().endswith(suf)), None)
     with tempfile.TemporaryDirectory() as td:
         lone = os.path.join(td, "OUTCAR")
-        shutil.copy(outcar_path, lone)
+        if opener is None:
+            shutil.copy(outcar_path, lone)
+        else:
+            with opener(outcar_path, "rb") as src, open(lone, "wb") as dst:
+                shutil.copyfileobj(src, dst)
         traj = read(lone, format="vasp-out", index=":")
+    if not isinstance(traj, list):
+        traj = [traj]
     frames = []
     for i, atoms in enumerate(traj):
+        # ASE's vasp-out reader attaches a calculator with energy/forces AND stress
+        # (eV/Å³). Lift energy/forces onto the REF_* keys used everywhere else, keep
+        # the stress only under a non-reserved key (parity with the vasprun path,
+        # which withholds a trainable stress), then drop the calculator so no reserved
+        # `energy`/`forces`/`stress` key leaks into extxyz.
+        res = dict(atoms.calc.results) if atoms.calc is not None else {}
+        atoms.calc = None
+        if "energy" in res:
+            atoms.info["REF_energy"] = float(res["energy"])
+        if "forces" in res:
+            atoms.arrays["REF_forces"] = np.asarray(res["forces"], dtype=float)
+        if "stress" in res:  # ASE Voigt stress, eV/Å³ (units differ from vasprun path's kBar)
+            atoms.info["stress_ase_evA3"] = _jsonable(res["stress"])
         atoms.info.update({"source": "zenodo", "calc_id": calc_id,
                            "frame_id": f"{calc_id}#{i}", "ionic_step": i,
                            "electronic_converged": None})
@@ -392,6 +492,9 @@ def parse(
                     shards.add(xyz.write(fr))
                     stats["frames"] += 1
                 meta["shards"] = sorted(shards)
+                # durability ordering: frames must be on disk BEFORE their metadata,
+                # or a crash could leave metadata pointing at frames in no shard.
+                xyz.flush()
                 meta_w.write(_jsonable(meta))
                 done_calc_ids.add(calc_id)  # a duplicate unit later in THIS run is skipped too
                 stats["calcs_parsed"] += 1
