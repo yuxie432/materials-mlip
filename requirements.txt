@@ -6,7 +6,6 @@ requests>=2.31
 # "v2026.5.18" in CLAUDE.md is a source-tree tag, not a release version.
 pymatgen>=2026.5.4    # Vasprun/Outcar parsing, converged_electronic, run_type
 ase>=3.25             # extxyz(.gz) read/write, OUTCAR trajectory fallback
-tqdm>=4.66            # progress bars for long harvests
 
 # Optional: consolidate metadata.jsonl -> parquet for fast column queries.
 # pyarrow>=15

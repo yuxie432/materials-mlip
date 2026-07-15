@@ -150,6 +150,7 @@ class Candidate:
     keywords: list[str]
     license: str | None
     resource_type: str | None
+    access_right: str | None  # "open"/"embargoed"/"restricted"/"closed" (may be absent)
     zenodo_url: str
     files_total: int
     bytes_total: int
@@ -185,6 +186,7 @@ class Candidate:
         rtype = rtype.get("type") if isinstance(rtype, dict) else rtype
         lic = meta.get("license", {})
         lic = lic.get("id") if isinstance(lic, dict) else lic
+        access = meta.get("access_right")  # a plain string in the records API
         keywords = meta.get("keywords", []) or []
         return cls(
             recid=str(rec.get("id")),
@@ -198,6 +200,7 @@ class Candidate:
             keywords=keywords,
             license=lic,
             resource_type=rtype,
+            access_right=access,
             zenodo_url=(rec.get("links") or {}).get("self_html") or f"https://zenodo.org/records/{rec.get('id')}",
             files_total=len(norm_files),
             bytes_total=sum((f.get("size") or 0) for f in norm_files),

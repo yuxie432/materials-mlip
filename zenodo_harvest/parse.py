@@ -6,10 +6,21 @@ call); ``vaspout.h5`` (VASP's newer HDF5 output) is read via pymatgen's
 ``Vaspout`` — a ``Vasprun`` subclass with the same API — and ``OUTCAR``-only
 calculations fall back to ASE's trajectory reader.
 
-Per CLAUDE.md, every calc records electronic convergence *and its magnitude*
-(ΔE between the last two SCF steps of the final ionic step), the run-type/
-functional, the full INCAR + k-points + POTCAR spec, and availability flags for
-heavy data we deliberately don't store (charge/spin density, eigenvalues, DOS).
+Electronic convergence is recorded at two granularities. Per frame, the info keys
+``electronic_converged``/``scf_dE`` carry *that ionic step's OWN* SCF verdict and
+magnitude (vasprun.xml exposes ``electronic_steps`` for every ionic step, so each
+frame is tagged independently — see :func:`_step_scf`). Calc-level ``quality`` keeps
+the FINAL-step verdict under the same keys with pymatgen's ``converged_electronic``
+semantics (unchanged), plus ``n_frames_scf_unconverged``. The run-type/functional,
+full INCAR + k-points + POTCAR spec, and availability flags for heavy data we don't
+store (charge/spin density, eigenvalues, DOS) are recorded too.
+
+No-energy-frame policy: a frame whose corrected σ→0 energy is unrecoverable (e.g.
+GW/response steps) is DROPPED — it is dead weight that can break MACE loaders.
+Energy-only frames (no forces) are KEPT. Kept frames keep their ORIGINAL ionic-step
+index in ``frame_id``/``ionic_step`` (never renumbered). ``quality`` records
+``n_frames`` (stored), ``n_frames_with_forces``, and ``n_frames_dropped_no_energy``;
+a calc that drops some frames logs one ``frames_no_energy`` audit line.
 
 What lands where (docs/DESIGN.md §3):
 * extxyz frame  : positions, symbols, cell, energy (``REF_energy``) + forces
@@ -96,9 +107,74 @@ def _corrected_e0_energy(step: dict) -> float | None:
     return raw
 
 
-def _scf_convergence(vasprun: Any) -> dict:
-    """Electronic convergence bool + magnitude (ΔE of last two SCF steps).
+def _step_scf(step: dict, nelm: int | None) -> tuple[float | None, bool | None]:
+    """Per-ionic-step SCF magnitude + convergence verdict (a pure helper).
 
+    Mirrors pymatgen's ``Vasprun.converged_electronic`` (io/vasp/outputs.py) applied
+    to ONE ionic step: an SCF loop is "converged" iff it ran *fewer* electronic steps
+    than NELM (i.e. it reached self-consistency before hitting the cap) —
+    ``len(electronic_steps) < NELM``. pymatgen's ALGO=CHI / LEPSILON / ALGO=Exact
+    +NELM==1 special cases hinge on INCAR fields not present in a single step dict,
+    so they stay calc-level (see :func:`_scf_convergence`); this per-step helper
+    implements only the general NELM rule.
+
+    Returns ``(scf_dE, converged)``:
+    * ``scf_dE`` = ``|e_0_energy[-1] − e_0_energy[-2]|`` of this step's electronic
+      steps (None if < 2 e-steps, or a value is missing).
+    * ``converged`` = ``len(e-steps) < NELM`` (None if there are no e-steps or NELM
+      is unknown — don't fabricate a verdict, mirroring the vaspout.h5 handling).
+    """
+    esteps = step.get("electronic_steps") or []
+    dE: float | None = None
+    if len(esteps) >= 2:
+        try:
+            dE = abs(esteps[-1]["e_0_energy"] - esteps[-2]["e_0_energy"])
+        except (KeyError, TypeError):
+            dE = None
+    converged: bool | None = None
+    if esteps and nelm:
+        converged = len(esteps) < nelm
+    return dE, converged
+
+
+def _nelm(v: Any) -> int:
+    """Max SCF steps NELM. pymatgen reads ``parameters["NELM"]``; 60 is VASP's default."""
+    for src in ("parameters", "incar"):
+        try:
+            nelm = getattr(v, src).get("NELM")
+        except (AttributeError, TypeError):
+            nelm = None
+        if nelm is not None:
+            return int(nelm)
+    return 60
+
+
+def _select_frame_steps(steps: list) -> tuple[list[tuple[int, float]], int]:
+    """Partition ionic steps into ``(kept, n_dropped_no_energy)`` (a pure helper).
+
+    A step whose corrected σ→0 energy is unrecoverable (``_corrected_e0_energy``
+    returns None — e.g. GW/response steps) is DROPPED: an energyless frame is dead
+    weight that can break MACE loaders. Energy-only steps (energy but no forces) are
+    KEPT. Each kept step carries its ORIGINAL ionic-step index so frame_ids
+    (``<calc_id>#<i>``) and the ``ionic_step`` tag stay stable/meaningful — kept
+    frames are never renumbered.
+    """
+    kept: list[tuple[int, float]] = []
+    dropped = 0
+    for i, st in enumerate(steps):
+        e = _corrected_e0_energy(st)
+        if e is None:
+            dropped += 1
+        else:
+            kept.append((i, e))
+    return kept, dropped
+
+
+def _scf_convergence(vasprun: Any) -> dict:
+    """Calc-level electronic convergence bool + magnitude (ΔE of last two SCF steps).
+
+    This is the FINAL-ionic-step verdict, using pymatgen's ``converged_electronic``
+    semantics unchanged (per-frame verdicts are separate — see :func:`_step_scf`).
     ``vaspout.h5`` exposes no per-SCF electronic steps, so pymatgen's
     ``converged_electronic`` would report an unconditional ``True`` there — which
     would silently admit an unconverged calc untagged. When electronic steps are
@@ -188,7 +264,8 @@ def _site_props_from_outcar(outcar_path: str, natoms: int) -> dict:
 
 
 def _frame(structure: Any, energy: float | None, forces: Any, *, calc_id: str,
-           frame_id: str, ionic_step: int, conv: dict,
+           frame_id: str, ionic_step: int, electronic_converged: bool | None,
+           scf_dE: float | None,
            magmoms: list | None = None, charges: list | None = None) -> Atoms:
     from pymatgen.io.ase import AseAtomsAdaptor
     atoms = AseAtomsAdaptor.get_atoms(structure)
@@ -211,10 +288,12 @@ def _frame(structure: Any, energy: float | None, forces: Any, *, calc_id: str,
         "calc_id": calc_id,
         "frame_id": frame_id,
         "ionic_step": ionic_step,
-        "electronic_converged": conv["electronic_converged"],
+        # Per-frame (this ionic step's own) SCF verdict/magnitude — key names
+        # unchanged, semantics now per-frame (see _step_scf / module docstring).
+        "electronic_converged": electronic_converged,
     })
-    if conv["scf_dE"] is not None:
-        atoms.info["scf_dE"] = conv["scf_dE"]
+    if scf_dE is not None:
+        atoms.info["scf_dE"] = scf_dE
     return atoms
 
 
@@ -226,24 +305,38 @@ def _frames_and_meta(v: Any, calc_id: str, outcar_path: str | None,
     subclasses ``Vasprun`` and exposes the same API, so only the constructor and
     the recorded ``parser`` tag differ.
     """
-    conv = _scf_convergence(v)
+    conv = _scf_convergence(v)  # calc-level final-step verdict (keys/semantics unchanged)
     steps = v.ionic_steps
     natoms = len(v.final_structure)
+    nelm = _nelm(v)
 
     # Per-atom charges/spins (final geometry only) if an OUTCAR is alongside.
     site = {"magmoms": None, "charges": None}
     if outcar_path:
         site = _site_props_from_outcar(outcar_path, natoms)
 
+    # Drop steps with no recoverable energy (keep original indices); count them.
+    kept_steps, n_dropped = _select_frame_steps(steps)
+
     frames: list[Atoms] = []
-    for i, st in enumerate(steps):
-        last = i == len(steps) - 1
+    n_unconverged = 0
+    n_with_forces = 0
+    for pos, (i, energy) in enumerate(kept_steps):
+        st = steps[i]
+        last = pos == len(kept_steps) - 1  # site props attach to the last KEPT frame
+        scf_dE, econv = _step_scf(st, nelm)  # this step's OWN convergence
+        if econv is False:
+            n_unconverged += 1
+        forces = st.get("forces")
         frame = _frame(
-            st["structure"], _corrected_e0_energy(st), st.get("forces"),
-            calc_id=calc_id, frame_id=f"{calc_id}#{i}", ionic_step=i, conv=conv,
+            st["structure"], energy, forces,
+            calc_id=calc_id, frame_id=f"{calc_id}#{i}", ionic_step=i,
+            electronic_converged=econv, scf_dE=scf_dE,
             magmoms=site["magmoms"] if last else None,
             charges=site["charges"] if last else None,
         )
+        if forces is not None:
+            n_with_forces += 1
         # keep per-frame stress in the frame info (kBar; metadata notes the units).
         # Vasprun exposes it as "stress"; Vaspout as "stresses".
         stress = st.get("stress")
@@ -257,7 +350,10 @@ def _frames_and_meta(v: Any, calc_id: str, outcar_path: str | None,
         "calc_id": calc_id,
         "calc_parameters": _calc_parameters(v),
         "quality": {**conv, "n_ionic_steps": len(steps), "n_atoms": natoms,
-                    "n_frames": len(frames)},
+                    "n_frames": len(frames),
+                    "n_frames_scf_unconverged": n_unconverged,
+                    "n_frames_with_forces": n_with_forces,
+                    "n_frames_dropped_no_energy": n_dropped},
         "parser": parser,
         "stress_units": "kBar",
         "site_charges_present": site["charges"] is not None,
@@ -286,6 +382,20 @@ def parse_vaspout(vaspout_path: str, calc_id: str, outcar_path: str | None) -> t
     v = Vaspout(vaspout_path, parse_dos=False, parse_eigen=False,
                 parse_projected_eigen=False, store_potcar=False)
     return _frames_and_meta(v, calc_id, outcar_path, "pymatgen.Vaspout")
+
+
+def _resolve(raw_dir: Path, stored: str) -> Path:
+    """Resolve a fetched-manifest path against ``raw_dir``.
+
+    fetch.py stores calc-unit paths RELATIVE to ``raw_dir`` so staged data can move
+    between cluster scratch areas without invalidating the manifest. Older manifests
+    stored absolute paths; pathlib's ``raw_dir / "/abs"`` yields ``/abs`` unchanged,
+    so this single join handles both the new relative and old absolute forms. Because
+    :func:`_calc_id` keys off the primary file's path *relative to* ``<local_dir>/
+    extracted``, the recid prefix cancels and the calc_id is byte-identical whichever
+    form the manifest used (and regardless of where raw_dir now points).
+    """
+    return raw_dir / stored
 
 
 def _calc_id(unit: dict, base_meta: dict) -> str:
@@ -355,15 +465,21 @@ def parse_calc_unit(unit: dict, base_meta: dict, availability: dict,
         rej.reject("parse", calc_id, "no_frames")
         return None
 
+    # Audit: if some (but not all) frames were dropped for lack of a recoverable
+    # energy, log ONE line for the calc (not one per frame). The calc is still kept.
+    n_dropped = meta["quality"].get("n_frames_dropped_no_energy", 0)
+    if n_dropped:
+        rej.reject("parse", calc_id, "frames_no_energy", dropped=n_dropped, kept=len(frames))
+
     # merge availability (from fetch listing) with what the parser could confirm
     avail = dict(availability)
     avail["spin_density"] = avail.get("charge_density", False) and meta["calc_parameters"].get("spin_polarized", False)
-    avail["magnetisation"] = meta.get("site_magmoms_present", False) or meta["calc_parameters"].get("spin_polarized", False)
+    avail["magnetization"] = meta.get("site_magmoms_present", False) or meta["calc_parameters"].get("spin_polarized", False)
     meta["availability"] = avail
 
+    # provenance.parser dropped: top-level meta["parser"] is the single source.
     meta["provenance"] = {**base_meta["provenance"],
                           "file_path": rel,
-                          "parser": meta["parser"],
                           "harvested_at": datetime.now(timezone.utc).isoformat()}
     meta["frame_ids"] = [f.info["frame_id"] for f in frames]
     return frames, meta
@@ -400,6 +516,8 @@ def _parse_outcar_ase(outcar_path: str, calc_id: str) -> tuple[list[Atoms], dict
     if not isinstance(traj, list):
         traj = [traj]
     frames = []
+    n_dropped = 0
+    n_with_forces = 0
     for i, atoms in enumerate(traj):
         # ASE's vasp-out reader attaches a calculator with energy/forces AND stress
         # (eV/Å³). Lift energy/forces onto the REF_* keys used everywhere else, keep
@@ -408,10 +526,13 @@ def _parse_outcar_ase(outcar_path: str, calc_id: str) -> tuple[list[Atoms], dict
         # `energy`/`forces`/`stress` key leaks into extxyz.
         res = dict(atoms.calc.results) if atoms.calc is not None else {}
         atoms.calc = None
-        if "energy" in res:
-            atoms.info["REF_energy"] = float(res["energy"])
+        if "energy" not in res:
+            n_dropped += 1  # drop energyless frames (parity with the vasprun path)
+            continue
+        atoms.info["REF_energy"] = float(res["energy"])
         if "forces" in res:
             atoms.arrays["REF_forces"] = np.asarray(res["forces"], dtype=float)
+            n_with_forces += 1
         if "stress" in res:  # ASE Voigt stress, eV/Å³ (units differ from vasprun path's kBar)
             atoms.info["stress_ase_evA3"] = _jsonable(res["stress"])
         atoms.info.update({"source": "zenodo", "calc_id": calc_id,
@@ -422,9 +543,15 @@ def _parse_outcar_ase(outcar_path: str, calc_id: str) -> tuple[list[Atoms], dict
         "calc_id": calc_id,
         "calc_parameters": {"code": "vasp", "run_type": None, "functional": None,
                             "note": "parsed from OUTCAR only; parameters limited"},
+        # No SCF trace from OUTCAR here, so per-frame convergence stays None (never
+        # False) -> n_frames_scf_unconverged is 0. n_ionic_steps counts all steps
+        # read; n_frames counts those actually stored (after the no-energy drop).
         "quality": {"electronic_converged": None, "scf_dE": None,
-                    "ionic_converged": None, "n_ionic_steps": len(frames),
-                    "n_atoms": len(frames[0]) if frames else 0, "n_frames": len(frames)},
+                    "ionic_converged": None, "n_ionic_steps": len(traj),
+                    "n_atoms": len(frames[0]) if frames else 0, "n_frames": len(frames),
+                    "n_frames_scf_unconverged": 0,
+                    "n_frames_with_forces": n_with_forces,
+                    "n_frames_dropped_no_energy": n_dropped},
         "parser": "ase.OUTCAR",
         "site_charges_present": False, "site_magmoms_present": False,
     }
@@ -449,6 +576,7 @@ def parse(
     rejections_path: str | Path = config.MANIFEST_DIR / "rejections.jsonl",
     frames_per_shard: int = 10_000,
     max_records: int | None = None,
+    raw_dir: str | Path = config.RAW_DIR,
 ) -> dict:
     """Parse every fetched record into extxyz shards + a metadata JSONL.
 
@@ -457,8 +585,13 @@ def parse(
     existing shard is never reopened (no overflow), and orphan frames from a
     previously crashed run — written to a shard but never committed to metadata —
     are pruned before writing resumes.
+
+    ``raw_dir`` is where fetch staged the files; manifest paths are stored relative
+    to it and resolved back here (see :func:`_resolve`), so relocated scratch data
+    still parses. Absolute paths in older manifests pass through unchanged.
     """
     dataset_dir = Path(dataset_dir)
+    raw_dir = Path(raw_dir)
     metadata_path = dataset_dir / "metadata.jsonl"
     done_calc_ids, committed_frame_ids = _load_committed(metadata_path)
     pruned = prune_uncommitted_frames(dataset_dir, committed_frame_ids)
@@ -476,9 +609,11 @@ def parse(
         for rec in read_jsonl(in_path):
             stats["records"] += 1
             base_meta = {"provenance": rec["provenance"],
-                         "_extracted_root": str(Path(rec["local_dir"]) / "extracted")}
+                         "_extracted_root": str(_resolve(raw_dir, rec["local_dir"]) / "extracted")}
             for unit in rec["calc_units"]:
                 stats["calc_units"] += 1
+                # Resolve stored (relative, or legacy absolute) paths against raw_dir.
+                unit = {k: str(_resolve(raw_dir, v)) for k, v in unit.items()}
                 calc_id = _calc_id(unit, base_meta)
                 if calc_id in done_calc_ids:
                     stats["skipped_existing"] += 1

@@ -79,7 +79,13 @@ splitting the work: **be permissive early, strict late.**
 ```
 
 - **Stage 0 discover** (`discover.py`): cast a wide net with many metadata
-  keywords. False positives are fine here — they're cheap to carry.
+  keywords. False positives are fine here — they're cheap to carry. Records whose
+  `access_right` is present and not `open` are dropped (they 403 at fetch anyway);
+  `license` is recorded as a tag only (no gating — a license allowlist is still an
+  open decision with the mentor). An accepted hit is streamed to an append-only
+  sidecar checkpoint (`<out>.hits.jsonl`) as it is seen, with per-window/per-query
+  completion sentinels, so a crashed `--exhaustive` run resumes without redoing
+  completed API paging (`--fresh` forces a clean rebuild).
 - **Stage 1 triage** (`triage.py`): classify each record from its file listing
   into `vasp_direct` / `archive` / `processed_atomistic` / `unlikely`. For
   `archive` records where the payload is hidden, **peek the zip central
@@ -110,7 +116,12 @@ splitting the work: **be permissive early, strict late.**
 
 extxyz is the right default (mentor's call, and it is the de-facto MLIP training
 format; round-trips through ASE and pymatgen). **One frame = one ionic step.** A
-relaxation with 40 ionic steps becomes 40 frames.
+relaxation with 40 ionic steps becomes 40 frames — minus any step whose corrected
+σ→0 energy is unrecoverable (e.g. GW/response steps), which is **dropped** (an
+energyless frame is dead weight that can break MACE loaders). Energy-only steps (no
+forces) are kept. Kept frames keep their **original ionic-step index** in
+`frame_id`/`ionic_step` (never renumbered), and the counts land in `quality`
+(`n_frames`, `n_frames_with_forces`, `n_frames_dropped_no_energy`).
 
 Per-frame layout (ASE `Atoms`, written with `ase.io.write(..., format="extxyz")`):
 
@@ -124,7 +135,7 @@ Per-frame layout (ASE `Atoms`, written with `ase.io.write(..., format="extxyz")`
 | spins / magmoms | per-atom array | `dft_magmom` |
 | total energy | frame info | `REF_energy` (MACE default) |
 | stress (if present) | frame info | `stress_kbar` (kBar, raw; not a label) |
-| convergence flags | frame info | `electronic_converged`, `scf_dE` |
+| convergence flags | frame info | `electronic_converged`, `scf_dE` (this frame's OWN ionic step) |
 | **link to metadata** | frame info | `frame_id`, `source_recid` |
 
 Keep the extxyz header **small**: only physical data + a `frame_id` foreign key.
@@ -137,7 +148,7 @@ parallel writes on the cluster, lets jobs append independently, and lets trainin
 stream shards. gzip typically gives ~3–5× on extxyz.
 
 *Availability-only* signals (mentor: record but don't store) — charge density,
-spin density, electronic eigenvalues, magnetisation, DOS — become **boolean
+spin density, electronic eigenvalues, magnetization, DOS — become **boolean
 columns in the metadata store**, plus the source file name, so the heavy data can
 be re-fetched later if wanted.
 
@@ -164,6 +175,7 @@ Proposed metadata record (one per calculation; frames reference it):
     "version_doi": "10.5281/zenodo.17378016",
     "url": "https://zenodo.org/records/17378016",
     "license": "cc-by-4.0",                 // matters if the dataset is redistributed
+    "access_right": "open",                  // discover drops non-open records (403 at fetch)
     "citation": ["<from record metadata / .bib>"],
     "file_path_in_archive": "LaSn5/relax/vasprun.xml",
     "harvested_at": "2026-07-09T..."
@@ -178,32 +190,43 @@ Proposed metadata record (one per calculation; frames reference it):
     "incar": { ... full INCAR ... },
     "spin_polarized": true
   },
-  "quality": {
+  "quality": {                               // calc-level = FINAL ionic step (pymatgen)
     "electronic_converged": true,            // pymatgen Vasprun.converged_electronic
-    "dE_last_scf": 3.1e-7,                    // |E[-1] - E[-2]| of final ionic step's SCF
+    "scf_dE": 3.1e-7,                         // |E[-1] - E[-2]| of final ionic step's SCF
     "ionic_converged": true,
-    "n_ionic_steps": 40, "n_atoms": 12
+    "n_ionic_steps": 40, "n_atoms": 12,
+    "n_frames": 39,                          // frames actually stored
+    "n_frames_scf_unconverged": 1,           // frames whose OWN SCF step didn't converge
+    "n_frames_with_forces": 39,              // frames carrying REF_forces
+    "n_frames_dropped_no_energy": 1          // GW/response steps dropped (no recoverable energy)
   },
   "availability": {                          // recorded, not stored (too big)
     "charge_density": true, "chgcar_file": "CHGCAR",
     "spin_density": true, "eigenvalues": true,
-    "dos": false, "magnetisation": true
+    "dos": false, "magnetization": true
   },
   "frame_ids": ["...#0", "...#1", ...]
 }
 ```
 
-**Convergence** (mentor's emphasis): store both the boolean and the *magnitude* —
-the energy difference between the last and second-last electronic step of the
-final ionic step (`vasprun.ionic_steps[-1]["electronic_steps"]`). Unconverged
-frames are kept but **tagged** (`electronic_converged=false`), never silently
-mixed in.
+**Convergence** (mentor's emphasis): store both the boolean and the *magnitude*.
+This is now tagged **per frame** — vasprun.xml exposes `electronic_steps` for every
+ionic step, so each frame's `electronic_converged`/`scf_dE` carry *that step's own*
+verdict and ΔE (`|E[-1]-E[-2]|` of its last two SCF steps; `converged` mirrors
+pymatgen's `len(electronic_steps) < NELM`). Calc-level `quality` keeps the
+FINAL-step verdict under the same keys (pymatgen `converged_electronic`, unchanged)
+plus `n_frames_scf_unconverged` (count of frames whose own SCF didn't converge).
+Unconverged frames are kept but **tagged**, never silently mixed in. (vaspout.h5 and
+the OUTCAR-only path expose no SCF trace, so their per-frame verdicts stay `null`.)
 
 ### 3c. The manifest ties it together
 
 `data/manifests/*.jsonl` records what was discovered/triaged/downloaded/parsed,
 so any stage is resumable and the whole harvest is auditable. `calc_id` /
-`frame_id` are the join keys between extxyz shards and the metadata table.
+`frame_id` are the join keys between extxyz shards and the metadata table. Paths
+inside `fetched.jsonl` are stored **relative to the fetch `raw_dir`**, so staged
+data can move between cluster scratch areas without breaking the manifest; parse
+resolves them against `--raw-dir` (legacy absolute paths still pass through).
 
 ## 4. Maximising coverage (exhausting Zenodo)
 

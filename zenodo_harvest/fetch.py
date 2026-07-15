@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import tarfile
+import time
 import zipfile
 from hashlib import md5
 from pathlib import Path
@@ -31,6 +32,7 @@ from typing import Any
 import requests
 
 from . import config
+from .client import _parse_retry_after
 from .manifest import JsonlWriter, RejectionLogger, read_jsonl
 
 logger = logging.getLogger(__name__)
@@ -105,30 +107,43 @@ def download_file(
     session: requests.Session, url: str, dest: Path, expected_md5: str | None,
     max_bytes: int | None = None,
 ) -> tuple[bool, str]:
-    """Download ``url`` to ``dest``, verifying md5. Returns (ok, reason)."""
+    """Download ``url`` to ``dest``, verifying md5. Returns (ok, reason).
+
+    On HTTP 429 the download backs off (``min(Retry-After, 120)`` s) and retries in
+    place, up to 3 attempts; only once that budget is spent does it fall through to
+    the ``http_429`` transient rejection (so a still-throttled file simply retries on
+    the next run rather than being dropped as a hard failure).
+    """
     if dest.exists() and expected_md5 and _md5(dest) == expected_md5:
         return True, "cached"
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
-    try:
-        with session.get(url, stream=True, timeout=120) as r:
-            if r.status_code != 200:
-                return False, f"http_{r.status_code}"
-            clen = r.headers.get("Content-Length")
-            if max_bytes and clen and int(clen) > max_bytes:
-                return False, "over_size_cap"
-            written = 0
-            with tmp.open("wb") as fh:
-                for chunk in r.iter_content(1 << 20):
-                    written += len(chunk)
-                    if max_bytes and written > max_bytes:
-                        fh.close()
-                        tmp.unlink(missing_ok=True)
-                        return False, "over_size_cap"
-                    fh.write(chunk)
-    except requests.RequestException as exc:
-        tmp.unlink(missing_ok=True)
-        return False, f"download_error:{type(exc).__name__}"
+    for attempt in range(3):
+        try:
+            with session.get(url, stream=True, timeout=120) as r:
+                if r.status_code == 429 and attempt < 2:
+                    wait = min(_parse_retry_after(r.headers.get("Retry-After")), 120)
+                    logger.warning("download rate limited; sleeping %ss", wait)
+                    time.sleep(wait)
+                    continue
+                if r.status_code != 200:
+                    return False, f"http_{r.status_code}"  # incl. http_429 after retries
+                clen = r.headers.get("Content-Length")
+                if max_bytes and clen and int(clen) > max_bytes:
+                    return False, "over_size_cap"
+                written = 0
+                with tmp.open("wb") as fh:
+                    for chunk in r.iter_content(1 << 20):
+                        written += len(chunk)
+                        if max_bytes and written > max_bytes:
+                            fh.close()
+                            tmp.unlink(missing_ok=True)
+                            return False, "over_size_cap"
+                        fh.write(chunk)
+        except requests.RequestException as exc:
+            tmp.unlink(missing_ok=True)
+            return False, f"download_error:{type(exc).__name__}"
+        break  # a non-429 response streamed to completion
     if expected_md5 and _md5(tmp) != expected_md5:
         tmp.unlink(missing_ok=True)
         return False, "md5_mismatch"
@@ -473,6 +488,12 @@ def fetch_record(rec: dict, session: requests.Session, raw_dir: Path,
         rej.reject("fetch", recid, "no_calc_units_after_extract")
         return None
 
+    # Store paths RELATIVE to raw_dir. Absolute paths break the manifest as soon as
+    # staged data is moved between cluster scratch areas; parse resolves these back
+    # against its --raw-dir. calc_id keys off the primary path relative to
+    # <local_dir>/extracted, so the recid prefix cancels and the id is unchanged.
+    rel_units = [{k: str(Path(v).relative_to(raw_dir)) for k, v in u.items()} for u in units]
+
     return {
         "recid": recid,
         "provenance": {
@@ -489,9 +510,9 @@ def fetch_record(rec: dict, session: requests.Session, raw_dir: Path,
             "publication_date": rec.get("publication_date"),
             "keywords": rec.get("keywords"),
         },
-        "local_dir": str(dest),
+        "local_dir": str(dest.relative_to(raw_dir)),
         "n_calc_units": len(units),
-        "calc_units": units,
+        "calc_units": rel_units,
         "availability": availability,
         "availability_files": availability_files,
     }

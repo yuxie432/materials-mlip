@@ -22,7 +22,7 @@ import logging
 import os
 import time
 from datetime import date, timedelta
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 import requests
 
@@ -33,6 +33,22 @@ MAX_SEARCH_WINDOW = 10_000
 # Zenodo caps page size at 25 on /api/records (size>=50 -> HTTP 400). With size=25
 # the 10k window is reachable in 400 pages.
 DEFAULT_PAGE_SIZE = 25
+
+
+def _parse_retry_after(value: str | None, default: int = 5) -> int:
+    """Seconds to wait from a ``Retry-After`` header value.
+
+    RFC 7231 allows two forms: integer delta-seconds *or* an HTTP-date. Zenodo
+    sends the delta form, but a stray HTTP-date (or garbage) must not crash the
+    retry loop — so fall back to a small default rather than parsing dates (which
+    we never need for this API).
+    """
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 class ZenodoClient:
@@ -84,12 +100,26 @@ class ZenodoClient:
         attempt = 0
         while True:
             self._throttle()
-            resp = self.session.get(url, params=params, timeout=60)
+            try:
+                resp = self.session.get(url, params=params, timeout=60)
+            except requests.RequestException as exc:
+                # Transient network failure (ConnectionError/ReadTimeout/…): retry
+                # on the SAME budget as a 5xx (exponential backoff), then give up
+                # and re-raise so the caller sees a real hard failure.
+                self._last_request = time.monotonic()
+                if attempt >= max_retries:
+                    raise
+                wait = 2 ** attempt
+                attempt += 1
+                logger.warning("request error %s; retry %d/%d in %ss",
+                               type(exc).__name__, attempt, max_retries, wait)
+                time.sleep(wait)
+                continue
             self._last_request = time.monotonic()
             if resp.status_code == 429:
                 # Throttling is expected, not a failure: honour Retry-After and
                 # retry without spending the 5xx error budget.
-                wait = int(resp.headers.get("Retry-After", 5)) + 1
+                wait = _parse_retry_after(resp.headers.get("Retry-After")) + 1
                 logger.warning("rate limited; sleeping %ss", wait)
                 time.sleep(wait)
                 continue
@@ -162,6 +192,8 @@ class ZenodoClient:
         end: date | None = None,
         size: int = DEFAULT_PAGE_SIZE,
         extra: dict[str, Any] | None = None,
+        should_skip: Callable[[date, date], bool] | None = None,
+        on_window_done: Callable[[date, date], None] | None = None,
     ) -> Iterator[dict]:
         """Exhaustively yield every record for ``query`` across all versions/dates.
 
@@ -169,18 +201,29 @@ class ZenodoClient:
         we recursively bisect the ``created`` date interval until every sub-window
         has <= 10k hits, then page through each. This is the scalable path for a
         full harvest (safe to run on the cluster; resume by partitioning dates).
+
+        ``should_skip(start, end)`` and ``on_window_done(start, end)`` are optional
+        checkpoint hooks invoked *only at leaf windows* (the ones actually paged):
+        ``should_skip`` lets a resumed caller skip a window it already completed, and
+        ``on_window_done`` is called once a leaf window has been fully yielded. NB:
+        which windows are leaves depends on the live hit counts, so bisection leaves
+        can shift between runs if counts changed — callers must match windows exactly.
         """
         end = end or date.today()
-        yield from self._iter_range(query, start, end, size, extra)
+        yield from self._iter_range(query, start, end, size, extra, should_skip, on_window_done)
 
     def _iter_range(
-        self, query: str, start: date, end: date, size: int, extra: dict[str, Any] | None
+        self, query: str, start: date, end: date, size: int, extra: dict[str, Any] | None,
+        should_skip: Callable[[date, date], bool] | None = None,
+        on_window_done: Callable[[date, date], None] | None = None,
     ) -> Iterator[dict]:
         ranged = f"({query}) AND created:[{start.isoformat()} TO {end.isoformat()}]"
         total = self.count(ranged, extra)
         if total == 0:
             return
-        if total <= MAX_SEARCH_WINDOW or start >= end:
+        if total <= MAX_SEARCH_WINDOW or start >= end:  # leaf window (paged directly)
+            if should_skip is not None and should_skip(start, end):
+                return  # resumed: this exact window was completed in a prior run
             if total > MAX_SEARCH_WINDOW:
                 logger.warning(
                     "single-day window %s still has %d hits; truncating at %d",
@@ -188,10 +231,13 @@ class ZenodoClient:
                 )
             logger.info("harvest %s..%s : %d records", start, end, total)
             yield from self.iter_window(ranged, size=size, extra=extra)
+            if on_window_done is not None:
+                on_window_done(start, end)
             return
         mid = start + (end - start) / 2
-        yield from self._iter_range(query, start, mid, size, extra)
-        yield from self._iter_range(query, mid + timedelta(days=1), end, size, extra)
+        yield from self._iter_range(query, start, mid, size, extra, should_skip, on_window_done)
+        yield from self._iter_range(query, mid + timedelta(days=1), end, size, extra,
+                                    should_skip, on_window_done)
 
     # -- single record -----------------------------------------------------
 

@@ -16,10 +16,12 @@ from __future__ import annotations
 import json
 import logging
 import struct
+import time
 from pathlib import Path
 
 import requests
 
+from .client import _parse_retry_after
 from .manifest import read_jsonl
 from .models import ARCHIVE_EXTS, VASP_PRIMARY, _VASP_RE
 
@@ -32,14 +34,42 @@ _UNPEEKABLE_ARCHIVE_EXTS = ARCHIVE_EXTS - {".zip"}
 EOCD_SIG = b"\x50\x4b\x05\x06"  # end of central directory
 CDH_SIG = 0x02014b50            # central directory file header
 
+# Range GETs for the zip peek share Zenodo's 30/min search budget, so a peek can
+# be rate-limited (429) just like a search. Retry it (bounded) rather than giving
+# up — see _ranged_get.
+_PEEK_MAX_ATTEMPTS = 3
+# Polite spacing (seconds) between successive peek requests in the triage loop.
+_PEEK_MIN_INTERVAL = 1.0
+
 
 # ---------------------------------------------------------------------------
 # Remote ZIP central-directory reader (best-effort, no full download).
 # ---------------------------------------------------------------------------
 
+def _ranged_get(session: requests.Session, url: str, range_header: str,
+                max_attempts: int = _PEEK_MAX_ATTEMPTS) -> requests.Response | None:
+    """A single Range GET, honouring 429 + Retry-After (sleep, retry, ≤ attempts).
+
+    A 429 here is throttling, not "peek failed". Treating it as failure is unsafe:
+    under ``--require-confirmed`` a peek that comes back empty silently DROPS the
+    record, so a rate-limited peek would be indistinguishable from "peeked, no VASP
+    inside" — a real record lost to transient throttling. So back off on Retry-After
+    and retry. Returns the response (caller checks for 206), or None if still 429
+    after the budget is spent.
+    """
+    for _ in range(max_attempts):
+        r = session.get(url, headers={"Range": range_header}, timeout=60)
+        if r.status_code != 429:
+            return r
+        wait = _parse_retry_after(r.headers.get("Retry-After")) + 1
+        logger.warning("peek rate limited; sleeping %ss", wait)
+        time.sleep(wait)
+    return None
+
+
 def _range_get(session: requests.Session, url: str, start: int, end: int) -> bytes | None:
-    r = session.get(url, headers={"Range": f"bytes={start}-{end}"}, timeout=60)
-    if r.status_code != 206:  # 200 => Range ignored; refuse to pull the whole (GB-sized) file
+    r = _ranged_get(session, url, f"bytes={start}-{end}")
+    if r is None or r.status_code != 206:  # 200 => Range ignored; refuse whole (GB) file
         return None
     return r.content
 
@@ -55,8 +85,8 @@ def peek_zip_filenames(url: str, session: requests.Session | None = None, tail: 
     """
     session = session or requests.Session()
     try:
-        r = session.get(url, headers={"Range": f"bytes=-{tail}"}, timeout=60)
-        if r.status_code != 206:
+        r = _ranged_get(session, url, f"bytes=-{tail}")  # retries 429 (see _ranged_get)
+        if r is None or r.status_code != 206:
             return None
         blob = r.content
         cr = r.headers.get("Content-Range", "")
@@ -116,6 +146,7 @@ def triage(
     peek: bool = False,
     peek_max_bytes: int = 20_000_000_000,
     require_confirmed: bool = False,
+    peek_interval: float = _PEEK_MIN_INTERVAL,
 ) -> dict:
     """Filter candidates to a keep-list.
 
@@ -130,6 +161,9 @@ def triage(
         *only* when every archive in it was peekable (``.zip``). A ``.tar``/``.tar.gz``/
         ``.rar``/``.7z`` cannot be range-peeked yet fetch can still extract it, so
         such records are kept (confirmed at download) rather than silently discarded.
+    peek_interval:
+        Minimum seconds between successive peek requests (polite spacing; peek Range
+        GETs share Zenodo's 30/min search budget, so don't burst them). Set 0 in tests.
     """
     in_path, out_path = Path(in_path), Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -137,6 +171,7 @@ def triage(
     session.headers["User-Agent"] = "zenodo-harvest/0.1 (triage)"
 
     kept = 0
+    last_peek = 0.0
     stats: dict[str, int] = {"seen": 0, "kept": 0, "peeked": 0, "peek_confirmed": 0}
     with out_path.open("w") as out:
         for rec in read_jsonl(in_path):
@@ -147,7 +182,11 @@ def triage(
             if peek and rec["vasp_category"] == "archive" and not confirmed:
                 for f in rec["files"]:
                     if (f.get("ext") == ".zip") and (f.get("size") or 0) <= peek_max_bytes and f.get("download"):
+                        wait = peek_interval - (time.monotonic() - last_peek)
+                        if wait > 0:
+                            time.sleep(wait)
                         names = peek_zip_filenames(f["download"], session)
+                        last_peek = time.monotonic()
                         stats["peeked"] += 1
                         if names:
                             hits = _zip_vasp_hits(names)

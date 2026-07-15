@@ -4,8 +4,9 @@ Two sinks, joined by ``calc_id`` / ``frame_id`` (see docs/DESIGN.md §3):
 
 * :class:`ShardedExtxyzWriter` — atomistic data as gzipped extxyz, ~N frames per
   shard so files stay a manageable size and parallel writers each own their
-  shards. Frame headers stay small: energy/forces/stress (via an attached
-  calculator) + a few quality tags + the ``frame_id``/``calc_id`` join keys.
+  shards. Frame headers stay small: energy/forces written directly under the
+  ``REF_energy``/``REF_forces`` info/arrays keys (not via a ``SinglePointCalculator``),
+  raw stress, a few quality tags, and the ``frame_id``/``calc_id`` join keys.
 * :class:`MetadataWriter` — one JSONL record per calculation holding the bulky,
   frame-invariant data: provenance, citation, full calc parameters, convergence,
   and availability flags.

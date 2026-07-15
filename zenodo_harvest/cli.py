@@ -47,6 +47,8 @@ def _add_discover(sub: argparse._SubParsersAction) -> None:
                    default=None, help="resource type(s) to keep (default: dataset)")
     p.add_argument("--exhaustive", action="store_true",
                    help="recursive date-partitioning to exceed the 10k window (cluster)")
+    p.add_argument("--fresh", action="store_true",
+                   help="ignore + remove any <out>.hits.jsonl checkpoint (clean rebuild)")
     p.add_argument("--max-records", type=int, default=None)
     p.add_argument("--base", default="https://zenodo.org")
 
@@ -81,6 +83,8 @@ def _add_parse(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("parse", help="stage 3: parse fetched calcs -> extxyz.gz + metadata.jsonl")
     p.add_argument("--in", dest="in_path", required=True, help="fetched manifest JSONL")
     p.add_argument("--dataset-dir", default=str(config.DATASET_DIR))
+    p.add_argument("--raw-dir", default=str(config.RAW_DIR),
+                   help="where fetch staged the files; manifest paths resolve against it")
     p.add_argument("--rejections", default=None,
                    help="rejection log path (default: <dataset-dir>/../manifests/rejections.jsonl)")
     p.add_argument("--frames-per-shard", type=int, default=10_000)
@@ -113,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
             resource_types=args.resource_types or DEFAULT_RESOURCE_TYPES,
             exhaustive=args.exhaustive,
             max_records=args.max_records,
+            fresh=args.fresh,
         )
     elif args.cmd == "triage":
         summary = triage(
@@ -132,6 +137,7 @@ def main(argv: list[str] | None = None) -> int:
         summary = parse(
             args.in_path, dataset_dir=args.dataset_dir, rejections_path=rejections,
             frames_per_shard=args.frames_per_shard, max_records=args.max_records,
+            raw_dir=args.raw_dir,
         )
     else:  # pragma: no cover
         parser.error(f"unknown command {args.cmd}")

@@ -41,10 +41,12 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
     **selectively extract only VASP files** from archives; records availability of heavy files
     (CHGCAR/WAVECAR/DOSCAR/EIGENVAL/…) without extracting them; skips `.rar`/`.7z` (no portable
     tooling) with a logged rejection. Emits `fetched.jsonl` (one calc-unit list per record).
-  - `parse.py` — stage 3: pymatgen `Vasprun` (primary) → per-ionic-step ASE frames; records
-    electronic convergence bool + magnitude (`scf_dE`), `run_type`, full INCAR/k-points/POTCAR,
-    availability flags. OUTCAR-only calcs fall back to ASE's `vasp-out` reader (read from an
-    isolated temp copy — ASE otherwise crashes on uploads with hash-annotated POTCAR species).
+  - `parse.py` — stage 3: pymatgen `Vasprun` (primary) → per-ionic-step ASE frames; tags each
+    frame with *its own* step's electronic convergence bool + magnitude (`scf_dE`), drops steps
+    with no recoverable energy, records `run_type`, full INCAR/k-points/POTCAR, availability
+    flags. OUTCAR-only calcs fall back to ASE's `vasp-out` reader (read from an isolated temp
+    copy — ASE otherwise crashes on uploads with hash-annotated POTCAR species). Manifest paths
+    resolve against `--raw-dir`.
   - `store.py` — stage 4: `ShardedExtxyzWriter` (rotating `shard-NNNNN.extxyz.gz`) +
     `MetadataWriter` (one JSONL record per calc), joined by `calc_id`/`frame_id`.
   - `cli.py` — `python -m zenodo_harvest.cli {discover,triage,fetch,parse} ...` (loads `.env`).
@@ -65,7 +67,12 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   bugfix applied to *every* step) and forces are written to extxyz under MACE's default
   **`REF_energy`/`REF_forces`** keys — placed directly in `atoms.info`/`atoms.arrays` (not via a
   `SinglePointCalculator`, whose reserved `energy`/`forces` keys ASE re-absorbs into a calculator on
-  read-back, removing them from `info`/`arrays`). **Stress is parsed but not a training label**: the
+  read-back, removing them from `info`/`arrays`). A step with no recoverable energy (e.g.
+  GW/response) is **dropped** (energy-only steps, no forces, are kept); kept frames keep their
+  original ionic-step index in `frame_id`/`ionic_step`. Each frame's `electronic_converged`/`scf_dE`
+  are **that step's own** SCF verdict/magnitude (calc-level `quality` keeps the final-step verdict
+  plus counts: `n_frames`, `n_frames_scf_unconverged`, `n_frames_with_forces`,
+  `n_frames_dropped_no_energy`). **Stress is parsed but not a training label**: the
   raw VASP 3×3 tensor stays in the frame info as `stress_kbar` (kBar) — VASP's kBar sign/scale
   convention must be confirmed before feeding stress to training. Per-atom DFT charges/spins come
   from OUTCAR (end-of-run) and attach to the final frame only, under explicit output keys
@@ -89,7 +96,10 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   but store the actual **magnitude** of non-convergence too: the energy difference between the last and
   second-last electronic step of the final ionic step
   (`vasprun.ionic_steps[-1]["electronic_steps"]` vs. `vasprun.ionic_steps[-2]["electronic_steps"]`).
-  Unconverged calculations are noisier and must be tagged, not silently included.
+  Unconverged calculations are noisier and must be tagged, not silently included. This is now tagged
+  **per frame** (each ionic step's own SCF verdict/magnitude, mirroring pymatgen's
+  `len(electronic_steps) < NELM`), with the calc-level `converged_electronic` (final step) retained
+  in `quality`.
 - **Run-type classification**: pymatgen's `Vasprun.run_type` classifies DFT flavour and Hubbard U / vdW
   corrections — useful metadata but too coarse alone to guarantee dataset consistency (foundation-model
   papers, e.g. the NequIP foundation potentials draft, discuss why "one-size-fits-all" settings/datasets
