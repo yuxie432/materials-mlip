@@ -12,9 +12,11 @@ disk as one directory per calculation, ready for parsing. Design goals:
   interrupted harvest resumes cleanly, with no duplicate work or manifest lines
   (important on the cluster).
 * **Robust**: size-capped (archive *and* per-member uncompressed), checksum-verified,
-  zip-slip-safe, streamed (never loads a whole member into RAM). `.zip`/`.tar*` use
-  the stdlib; `.rar`/`.7z` are handled when the optional `archives` extra (rarfile/
-  py7zr) is installed, else logged as a rejection rather than being fatal.
+  zip-slip-safe, streamed (zip/tar/rar never load a whole member into RAM; 7z
+  decompresses selected members in memory — py7zr's API — bounded by the member
+  cap). `.zip`/`.tar*` use the stdlib; `.rar`/`.7z` are handled when the optional
+  `archives` extra (rarfile/py7zr) is installed, else logged as a rejection rather
+  than being fatal.
 """
 
 from __future__ import annotations

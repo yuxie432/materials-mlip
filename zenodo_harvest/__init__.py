@@ -1,7 +1,8 @@
 """zenodo_harvest — harvest DFT (VASP) datasets from Zenodo for MLIP training.
 
 Pipeline stages (see docs/DESIGN.md); all five run end-to-end via
-``python -m zenodo_harvest.cli {discover,triage,fetch,parse}``:
+``python -m zenodo_harvest.cli {discover,triage,fetch,parse}``, with dataset
+management for the array-job model via ``{split,merge-datasets,verify,purge-raw}``:
 
     stage 0  discover  keyword/date-partitioned search -> candidate manifest (JSONL)
     stage 1  triage    score candidates by their file listing (+ optional zip peek)
