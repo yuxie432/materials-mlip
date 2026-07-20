@@ -175,7 +175,7 @@ def _dataset_stats(records: list[dict], frames: list[Atoms]) -> dict:
     by_license: Counter = Counter()
     by_resource_type: Counter = Counter()
     conv = {"true": 0, "false": 0, "null": 0}
-    tot_scf_unconverged = tot_dropped = tot_with_forces = 0
+    tot_scf_unconverged = tot_dropped = tot_with_forces = tot_with_stress = 0
     for rec in records:
         nf = len(rec.get("frame_ids", []))
         cp = rec.get("calc_parameters", {}) or {}
@@ -191,6 +191,7 @@ def _dataset_stats(records: list[dict], frames: list[Atoms]) -> dict:
         tot_scf_unconverged += int(q.get("n_frames_scf_unconverged", 0) or 0)
         tot_dropped += int(q.get("n_frames_dropped_no_energy", 0) or 0)
         tot_with_forces += int(q.get("n_frames_with_forces", 0) or 0)
+        tot_with_stress += int(q.get("n_frames_with_stress", 0) or 0)
 
     elements: Counter = Counter()
     for f in frames:
@@ -208,6 +209,7 @@ def _dataset_stats(records: list[dict], frames: list[Atoms]) -> dict:
         "total_n_frames_scf_unconverged": tot_scf_unconverged,
         "total_n_frames_dropped_no_energy": tot_dropped,
         "total_n_frames_with_forces": tot_with_forces,
+        "total_n_frames_with_stress": tot_with_stress,
         "element_frame_counts": dict(sorted(elements.items())),
     }
 

@@ -60,6 +60,9 @@ def _add_discover(sub: argparse._SubParsersAction) -> None:
                    help="recursive date-partitioning to exceed the 10k window (cluster)")
     p.add_argument("--fresh", action="store_true",
                    help="ignore + remove any <out>.hits.jsonl checkpoint (clean rebuild)")
+    p.add_argument("--no-license-gate", dest="license_gate", action="store_false",
+                   help="keep records with any license (default: drop NC/ND/no-license, "
+                        "keeping only redistributable data)")
     p.add_argument("--max-records", type=int, default=None)
     p.add_argument("--base", default="https://zenodo.org")
 
@@ -99,6 +102,8 @@ def _add_parse(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--rejections", default=None,
                    help="rejection log path (default: <dataset-dir>/../manifests/rejections.jsonl)")
     p.add_argument("--frames-per-shard", type=int, default=10_000)
+    p.add_argument("--gzip-level", type=int, default=6,
+                   help="gzip compression level 1-9 for shards (1=fast/large, 9=small/slow, default 6)")
     p.add_argument("--max-records", type=int, default=None)
 
 
@@ -160,6 +165,7 @@ def main(argv: list[str] | None = None) -> int:
             exhaustive=args.exhaustive,
             max_records=args.max_records,
             fresh=args.fresh,
+            license_gate=args.license_gate,
         )
     elif args.cmd == "triage":
         summary = triage(
@@ -180,7 +186,7 @@ def main(argv: list[str] | None = None) -> int:
             summary = parse(
                 args.in_path, dataset_dir=args.dataset_dir, rejections_path=rejections,
                 frames_per_shard=args.frames_per_shard, max_records=args.max_records,
-                raw_dir=args.raw_dir,
+                raw_dir=args.raw_dir, gzip_level=args.gzip_level,
             )
         except DatasetLockError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)

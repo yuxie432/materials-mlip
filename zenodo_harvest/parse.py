@@ -24,10 +24,21 @@ a calc that drops some frames logs one ``frames_no_energy`` audit line.
 
 What lands where (docs/DESIGN.md §3):
 * extxyz frame  : positions, symbols, cell, energy (``REF_energy``) + forces
-                  (``REF_forces``) (+ per-site DFT charges/magmoms as
-                  ``dft_charge``/``dft_magmom`` on the final frame if an OUTCAR
-                  provides them), small quality tags.
-* metadata JSONL: provenance, citation, calc parameters, convergence, availability.
+                  (``REF_forces``) + stress (``REF_stress``) (+ per-site DFT
+                  charges/magmoms as ``dft_charge``/``dft_magmom`` on the final frame
+                  if an OUTCAR provides them), the force-consistent free energy
+                  ``E_free`` and (vasprun path) the electronic-entropy term
+                  ``entropy_TS``, small quality tags.
+* metadata JSONL: provenance, citation, calc parameters (incl. ``potcar_set_hash``),
+                  convergence, availability.
+
+Energy-reference bookkeeping: the label is the σ→0 energy E0 (``REF_energy``), but
+VASP's forces/stress are consistent with the FREE energy F, so every frame also stores
+F as ``E_free`` (and the vasprun path the exact term T·S = E − F as ``entropy_TS``);
+``quality.max_abs_free_minus_e0_per_atom`` summarises the worst |F − E0|/atom so a
+train-time filter can drop frames where the entropy correction makes E0 an unreliable
+label for the stored forces. ``calc_parameters.potcar_set_hash`` fingerprints the
+POTCAR set (from TITEL strings) as a cross-record consistency key.
 
 Energy/forces use the ``REF_energy``/``REF_forces`` keys (MACE's defaults). They are
 written into ``atoms.info``/``atoms.arrays`` directly rather than via an ASE
@@ -35,13 +46,18 @@ written into ``atoms.info``/``atoms.arrays`` directly rather than via an ASE
 keys into a calculator on read-back, removing them from ``info``/``arrays`` — the
 ``REF_`` keys survive the round-trip and stay queryable.
 
-Stress is parsed but NOT emitted as a training label: the raw VASP 3×3 tensor is
-kept in the frame info (``stress_kbar``, in kBar) because VASP's kBar sign/scale
-convention must be confirmed before feeding stress to training.
+Stress IS a training label (mentor decision 2026-07-20): per-frame stress is stored
+under MACE's ``REF_stress`` key in **ASE's convention** — a Voigt-6 vector
+``[xx, yy, zz, yz, xz, xy]`` in eV/Å³ with ASE's sign. The vasprun/vaspout path
+converts VASP's raw kBar 3×3 tensor via :func:`_stress_to_ase_voigt` (exactly ASE's
+own vasprun.xml reader: ``× −0.1 × ase.units.GPa`` then Voigt reorder); the OUTCAR
+path takes ASE's ``vasp-out`` stress, which is already in this convention. Both paths
+therefore emit an identical, MACE-trainable ``REF_stress``.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import warnings
 from datetime import datetime, timezone
@@ -49,7 +65,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import ase.units
 from ase import Atoms
+from ase.stress import full_3x3_to_voigt_6_stress
 
 from . import config
 from .manifest import RejectionLogger, read_jsonl
@@ -84,6 +102,63 @@ def _jsonable(obj: Any) -> Any:
     return str(obj)  # enums, Kpoints style, etc.
 
 
+def _potcar_set_hash(titels: list[str]) -> str | None:
+    """Deterministic fingerprint of a calc's POTCAR set from its ordered TITEL strings.
+
+    VASP's *real* POTCAR content hash needs the POTCAR file, which we never have
+    (copyright + usually absent) — but the TITEL line (e.g. ``PAW_PBE Fe_pv
+    06Sep2000``) already pins the functional, element variant, and generation date, so
+    a hash of the ordered titels uniquely identifies the pseudopotential *set*. That
+    makes POTCAR a usable cross-record consistency key: two calcs with the same
+    ``potcar_set_hash`` used identical pseudopotentials (a real comparability axis for
+    absolute energies — see the energy-reference notes). Returns None if no titels.
+    """
+    titels = [t for t in titels if t]
+    if not titels:
+        return None
+    return hashlib.sha1("\n".join(titels).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _outcar_potcar_titels(outcar_path: str) -> list[str]:
+    """Ordered, de-duplicated POTCAR TITEL strings from a (plain-text) OUTCAR.
+
+    The OUTCAR header repeats ``TITEL  = PAW_PBE Fe_pv 06Sep2000`` once per species;
+    we keep first-seen order so :func:`_potcar_set_hash` is stable. Best-effort — a
+    read failure just yields ``[]`` (POTCAR hash stays None on that OUTCAR calc).
+    """
+    titels: list[str] = []
+    try:
+        with open(outcar_path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if "TITEL" in line and "=" in line:
+                    t = line.split("=", 1)[1].strip()
+                    if t and t not in titels:
+                        titels.append(t)
+    except OSError:
+        pass
+    return titels
+
+
+def _stress_to_ase_voigt(stress_kbar_3x3: Any) -> np.ndarray | None:
+    """VASP raw stress (kBar 3×3, from vasprun.xml/vaspout.h5) → ASE convention.
+
+    Returns a Voigt-6 vector ``[xx, yy, zz, yz, xz, xy]`` in eV/Å³ with ASE's sign
+    (or ``None`` if the input is not a 3×3 tensor — e.g. a malformed vaspout entry —
+    so a bad stress is skipped rather than crashing the parse). This reproduces
+    *exactly* ASE's own vasprun.xml reader (``ase.io.vasp.read_vasp_xml``:
+    ``stress *= -0.1 * GPa`` then a Voigt reorder), so a ``REF_stress`` computed here is
+    identical to what ASE would attach if it read the same file — and matches the OUTCAR
+    path, where ASE's ``vasp-out`` reader already yields this convention. VASP reports
+    stress in kBar with the sign *opposite* to ASE's; ``1 kBar = 0.1 GPa`` and
+    ``ase.units.GPa`` converts GPa → eV/Å³. Mentor decision 2026-07-20: stress is a
+    training label, stored in ASE's convention.
+    """
+    arr = np.asarray(stress_kbar_3x3, dtype=float)
+    if arr.shape != (3, 3):
+        return None
+    return full_3x3_to_voigt_6_stress(arr * (-0.1 * ase.units.GPa))
+
+
 def _corrected_e0_energy(step: dict) -> float | None:
     """Sigma→0 energy of one ionic step, with pymatgen's vasprun.xml bugfix applied.
 
@@ -106,6 +181,22 @@ def _corrected_e0_energy(step: dict) -> float | None:
         if raw is None or abs(raw - fixed) > 1e-7:
             return fixed
     return raw
+
+
+def _entropy_ts(step: dict) -> float | None:
+    """Electronic-entropy term ``T·S = E − F`` (eV) of one ionic step (a pure helper).
+
+    From VASP's ``e_wo_entrp`` (E, energy without entropy) and ``e_fr_energy`` (F, the
+    free/force-consistent energy); ``None`` if either is missing (the OUTCAR/ASE path
+    exposes F but not E). Physically ≥ 0 since ``F = E − T·S`` with ``T·S ≥ 0``. A large
+    value means our σ→0 energy label sits far from the force-consistent free energy, so
+    the frame's energy and forces are mutually inconsistent (train-time filter signal).
+    """
+    e_wo = step.get("e_wo_entrp")
+    e_fr = step.get("e_fr_energy")
+    if e_wo is None or e_fr is None:
+        return None
+    return float(e_wo - e_fr)
 
 
 def _step_scf(step: dict, nelm: int | None) -> tuple[float | None, bool | None]:
@@ -245,6 +336,10 @@ def _calc_parameters(vasprun: Any) -> dict:
         "potcar_symbols": _jsonable(vasprun.potcar_symbols),
         "potcar_spec": [{"titel": s.get("titel"), "hash": s.get("hash")}
                         for s in (vasprun.potcar_spec or [])],
+        # Fingerprint of the POTCAR *set* from its titels — a real cross-record
+        # consistency key (VASP's own content hash needs the absent POTCAR file).
+        "potcar_set_hash": _potcar_set_hash(
+            [s.get("titel") for s in (vasprun.potcar_spec or [])]),
         "incar": incar,
     }
 
@@ -322,6 +417,8 @@ def _frames_and_meta(v: Any, calc_id: str, outcar_path: str | None,
     frames: list[Atoms] = []
     n_unconverged = 0
     n_with_forces = 0
+    n_with_stress = 0
+    max_ts_gap = 0.0  # max |E_free - E0| per atom across frames (label<->force consistency)
     for pos, (i, energy) in enumerate(kept_steps):
         st = steps[i]
         last = pos == len(kept_steps) - 1  # site props attach to the last KEPT frame
@@ -338,13 +435,30 @@ def _frames_and_meta(v: Any, calc_id: str, outcar_path: str | None,
         )
         if forces is not None:
             n_with_forces += 1
-        # keep per-frame stress in the frame info (kBar; metadata notes the units).
-        # Vasprun exposes it as "stress"; Vaspout as "stresses".
+        # Electronic-entropy bookkeeping. Our energy label is E0 (sigma->0), but VASP's
+        # forces/stress are consistent with the FREE energy F, so a large entropy term
+        # means E0 is not the exact potential of the stored forces. Record F (E_free) on
+        # every frame so a train-time filter can check |F - E0|; on the vasprun path
+        # also record the exact term T*S = E - F (= e_wo_entrp - e_fr_energy).
+        e_free = st.get("e_fr_energy")
+        if e_free is not None:
+            frame.info["E_free"] = float(e_free)
+            if natoms:
+                max_ts_gap = max(max_ts_gap, abs(e_free - energy) / natoms)
+        ts = _entropy_ts(st)
+        if ts is not None:
+            frame.info["entropy_TS"] = ts
+        # Per-frame stress as a training label under MACE's REF_stress key, converted
+        # to ASE's convention (eV/Å³ Voigt, sign-flipped — see _stress_to_ase_voigt).
+        # Vasprun exposes the raw kBar tensor as "stress"; Vaspout as "stresses".
         stress = st.get("stress")
         if stress is None:
             stress = st.get("stresses")
         if stress is not None:
-            frame.info["stress_kbar"] = _jsonable(stress)
+            voigt = _stress_to_ase_voigt(stress)
+            if voigt is not None:
+                frame.info["REF_stress"] = voigt
+                n_with_stress += 1
         frames.append(frame)
 
     meta = {
@@ -354,9 +468,13 @@ def _frames_and_meta(v: Any, calc_id: str, outcar_path: str | None,
                     "n_frames": len(frames),
                     "n_frames_scf_unconverged": n_unconverged,
                     "n_frames_with_forces": n_with_forces,
-                    "n_frames_dropped_no_energy": n_dropped},
+                    "n_frames_with_stress": n_with_stress,
+                    "n_frames_dropped_no_energy": n_dropped,
+                    # max over frames of |E_free - E0|/atom (eV/atom): how far the
+                    # sigma->0 label sits from the force-consistent free energy.
+                    "max_abs_free_minus_e0_per_atom": max_ts_gap},
         "parser": parser,
-        "stress_units": "kBar",
+        "stress_units": "eV/A^3 (ASE Voigt [xx,yy,zz,yz,xz,xy], REF_stress label)",
         "site_charges_present": site["charges"] is not None,
         "site_magmoms_present": site["magmoms"] is not None,
     }
@@ -514,28 +632,37 @@ def _parse_outcar_ase(outcar_path: str, calc_id: str) -> tuple[list[Atoms], dict
             with opener(outcar_path, "rb") as src, open(lone, "wb") as dst:
                 shutil.copyfileobj(src, dst)
         traj = read(lone, format="vasp-out", index=":")
+        potcar_titels = _outcar_potcar_titels(lone)  # read TITEL lines before td closes
     if not isinstance(traj, list):
         traj = [traj]
     frames = []
     n_dropped = 0
     n_with_forces = 0
+    n_with_stress = 0
+    max_ts_gap = 0.0
     for i, atoms in enumerate(traj):
         # ASE's vasp-out reader attaches a calculator with energy/forces AND stress
-        # (eV/Å³). Lift energy/forces onto the REF_* keys used everywhere else, keep
-        # the stress only under a non-reserved key (parity with the vasprun path,
-        # which withholds a trainable stress), then drop the calculator so no reserved
-        # `energy`/`forces`/`stress` key leaks into extxyz.
+        # (already ASE convention: eV/Å³ Voigt). Lift energy/forces/stress onto the
+        # REF_* keys used everywhere else, then drop the calculator so no reserved
+        # `energy`/`forces`/`stress` key leaks into extxyz (ASE would re-absorb them).
+        # The OUTCAR-path stress is already in ASE units, so — unlike the vasprun path
+        # (raw kBar) — it needs no conversion; both end up as the same REF_stress label.
         res = dict(atoms.calc.results) if atoms.calc is not None else {}
         atoms.calc = None
         if "energy" not in res:
             n_dropped += 1  # drop energyless frames (parity with the vasprun path)
             continue
         atoms.info["REF_energy"] = float(res["energy"])
+        if "free_energy" in res:  # F (force-consistent) vs E0 label; no e_wo_entrp here
+            atoms.info["E_free"] = float(res["free_energy"])
+            if len(atoms):
+                max_ts_gap = max(max_ts_gap, abs(res["free_energy"] - res["energy"]) / len(atoms))
         if "forces" in res:
             atoms.arrays["REF_forces"] = np.asarray(res["forces"], dtype=float)
             n_with_forces += 1
-        if "stress" in res:  # ASE Voigt stress, eV/Å³ (units differ from vasprun path's kBar)
-            atoms.info["stress_ase_evA3"] = _jsonable(res["stress"])
+        if "stress" in res:  # ASE Voigt stress, eV/Å³ (already ASE convention)
+            atoms.info["REF_stress"] = np.asarray(res["stress"], dtype=float)
+            n_with_stress += 1
         atoms.info.update({"source": "zenodo", "calc_id": calc_id,
                            "frame_id": f"{calc_id}#{i}", "ionic_step": i,
                            "electronic_converged": None})
@@ -543,17 +670,26 @@ def _parse_outcar_ase(outcar_path: str, calc_id: str) -> tuple[list[Atoms], dict
     meta = {
         "calc_id": calc_id,
         "calc_parameters": {"code": "vasp", "run_type": None, "functional": None,
+                            # POTCAR titels ARE recoverable from the OUTCAR header, so
+                            # the set-hash consistency key works on this path too.
+                            "potcar_titels": potcar_titels or None,
+                            "potcar_set_hash": _potcar_set_hash(potcar_titels),
                             "note": "parsed from OUTCAR only; parameters limited"},
         # No SCF trace from OUTCAR here, so per-frame convergence stays None (never
         # False) -> n_frames_scf_unconverged is 0. n_ionic_steps counts all steps
         # read; n_frames counts those actually stored (after the no-energy drop).
+        # max_abs_free_minus_e0_per_atom uses ASE's free_energy (F) vs energy (E0);
+        # entropy_TS itself is unavailable here (ASE exposes no e_wo_entrp).
         "quality": {"electronic_converged": None, "scf_dE": None,
                     "ionic_converged": None, "n_ionic_steps": len(traj),
                     "n_atoms": len(frames[0]) if frames else 0, "n_frames": len(frames),
                     "n_frames_scf_unconverged": 0,
                     "n_frames_with_forces": n_with_forces,
-                    "n_frames_dropped_no_energy": n_dropped},
+                    "n_frames_with_stress": n_with_stress,
+                    "n_frames_dropped_no_energy": n_dropped,
+                    "max_abs_free_minus_e0_per_atom": max_ts_gap},
         "parser": "ase.OUTCAR",
+        "stress_units": "eV/A^3 (ASE Voigt [xx,yy,zz,yz,xz,xy], REF_stress label)",
         "site_charges_present": False, "site_magmoms_present": False,
     }
     return frames, meta
@@ -578,6 +714,7 @@ def parse(
     frames_per_shard: int = 10_000,
     max_records: int | None = None,
     raw_dir: str | Path = config.RAW_DIR,
+    gzip_level: int = 6,
 ) -> dict:
     """Parse every fetched record into extxyz shards + a metadata JSONL.
 
@@ -609,7 +746,8 @@ def parse(
                         len(done_calc_ids), pruned, start_index)
 
         rej = RejectionLogger(rejections_path)
-        with ShardedExtxyzWriter(dataset_dir, frames_per_shard, start_index=start_index) as xyz, \
+        with ShardedExtxyzWriter(dataset_dir, frames_per_shard, start_index=start_index,
+                                 compresslevel=gzip_level) as xyz, \
                 MetadataWriter(metadata_path) as meta_w:
             for rec in read_jsonl(in_path):
                 stats["records"] += 1

@@ -95,11 +95,20 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   original ionic-step index in `frame_id`/`ionic_step`. Each frame's `electronic_converged`/`scf_dE`
   are **that step's own** SCF verdict/magnitude (calc-level `quality` keeps the final-step verdict
   plus counts: `n_frames`, `n_frames_scf_unconverged`, `n_frames_with_forces`,
-  `n_frames_dropped_no_energy`). **Stress is parsed but not a training label**: the
-  raw VASP 3×3 tensor stays in the frame info as `stress_kbar` (kBar) — VASP's kBar sign/scale
-  convention must be confirmed before feeding stress to training. Per-atom DFT charges/spins come
+  `n_frames_dropped_no_energy`). **Stress is a training label** (mentor 2026-07-20): per-frame
+  stress is written under MACE's **`REF_stress`** key in **ASE's convention** — a Voigt-6 vector
+  `[xx,yy,zz,yz,xz,xy]` in eV/Å³ with ASE's sign. The vasprun/vaspout path converts VASP's raw
+  kBar tensor (`× −0.1 × ase.units.GPa` + Voigt reorder, exactly ASE's own vasprun.xml reader);
+  the OUTCAR path uses ASE's already-converted `vasp-out` stress. Per-atom DFT charges/spins come
   from OUTCAR (end-of-run) and attach to the final frame only, under explicit output keys
   `dft_charge`/`dft_magmom` (not ASE's `initial_*` input fields).
+- **Energy-reference tracking** (2026-07-20): the label is E0 (σ→0) but VASP's forces/stress are
+  consistent with the *free* energy F, so every frame stores F as `E_free` (vasprun also the exact
+  entropy term `entropy_TS` = E−F); `quality.max_abs_free_minus_e0_per_atom` lets a train-time
+  filter drop frames where |F−E0| makes E0 an unreliable label for the stored forces.
+  `calc_parameters.potcar_set_hash` (a hash of the ordered POTCAR TITEL strings; works on both
+  parser paths) fingerprints the pseudopotential set — a real cross-record consistency key, since
+  absolute VASP energies are only comparable within an identical POTCAR set + functional + settings.
 
 ## Scope and starting point
 

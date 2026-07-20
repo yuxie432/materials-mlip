@@ -28,7 +28,7 @@ from typing import Iterable
 
 from .client import ZenodoClient
 from .manifest import JsonlWriter, read_jsonl
-from .models import Candidate
+from .models import Candidate, is_reusable_license
 
 logger = logging.getLogger(__name__)
 
@@ -53,15 +53,15 @@ DEFAULT_QUERIES = [
 ]
 
 # Resource types worth scanning by default — a *quality-leaning* prior, not maximal
-# recall. `dataset` is curated research data (the core); `other` is cheap (~few
-# records) and occasionally exposes a raw OUTCAR/POSCAR dump directly. Deliberately
-# EXCLUDED from the default: `software` (VASP data there is usually small
-# tutorial/example runs) and `publication` (mostly PDFs; real data is normally
-# re-deposited as its own dataset) — both add download/parse cost for lower-quality
-# yield. They remain one `--resource-type` flag away when you want to widen. Whatever
-# is scanned, the `resource_type` is recorded in the metadata so a training set can
-# be filtered/weighted by source (alongside the convergence / ENCUT / k-point tags).
-DEFAULT_RESOURCE_TYPES = ("dataset", "other")
+# recall. Only `dataset` (curated research data) by default. Measured 2026-07-20:
+# `dataset` yields ~40% useful VASP records (60% of its archives peek-confirm VASP);
+# `other` yields only ~3.5% (77% of it is "unlikely" — no VASP/archive files at all),
+# so it was DROPPED (mentor decision). Also EXCLUDED: `software` (mostly toy/tutorial
+# runs) and `publication` (mostly PDFs; real data is re-deposited as its own dataset).
+# All three remain one `--resource-type` flag away when you want to widen. Whatever is
+# scanned, `resource_type` is recorded in the metadata so a training set can be
+# filtered/weighted by source (alongside the convergence / ENCUT / k-point tags).
+DEFAULT_RESOURCE_TYPES = ("dataset",)
 
 
 def _accept(seen_concept: dict[str, Candidate], cand: Candidate) -> None:
@@ -80,6 +80,7 @@ def discover(
     exhaustive: bool = False,
     max_records: int | None = None,
     fresh: bool = False,
+    license_gate: bool = True,
 ) -> dict:
     """Run discovery and write a deduplicated candidate manifest.
 
@@ -95,6 +96,12 @@ def discover(
     fresh:
         Ignore and delete any existing ``<out>.hits.jsonl`` checkpoint, forcing a
         clean rebuild rather than resuming from it.
+    license_gate:
+        If True (default, mentor decision 2026-07-20), drop records whose license
+        forbids redistribution/derivatives — NonCommercial (NC), NoDerivatives (ND),
+        or no explicit license — keeping only openly-reusable data (see
+        :func:`models.is_reusable_license`). The license id is still recorded for
+        attribution. Pass False to keep everything (license stays a tag only).
     """
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -127,7 +134,9 @@ def discover(
     resumed_concepts = len(seen_concept)
 
     scanned = 0
-    counters = {"skipped_windows": 0, "skipped_queries": 0, "skipped_access_right": 0}
+    counters = {"skipped_windows": 0, "skipped_queries": 0, "skipped_access_right": 0,
+                "skipped_license": 0}
+    license_rejected: Counter = Counter()  # by-id audit of what the license gate dropped
     reached_cap = bool(max_records and len(seen_concept) >= max_records)
 
     def _keep(rec: dict, q: str) -> None:
@@ -143,10 +152,17 @@ def discover(
         cand = Candidate.from_record(rec)
         # access_right gate: non-open records 403 at fetch anyway, so drop them here
         # to save doomed downloads and keep the rejection log clean. A missing value
-        # is treated as open (kept). NB: license stays TAG-ONLY (never a gate) — a
-        # license-allowlist gate is still an open decision with the mentor.
+        # is treated as open (kept).
         if cand.access_right is not None and cand.access_right != "open":
             counters["skipped_access_right"] += 1
+            return
+        # license gate (mentor 2026-07-20): drop NC/ND/no-license records so the
+        # assembled dataset stays redistributable; license id is still tagged for
+        # attribution. Measured cost is small (~8-9% of all VASP-relevant records but
+        # only ~3% of the useful rank>=3 ones — mostly CC-NonCommercial).
+        if license_gate and not is_reusable_license(cand.license):
+            counters["skipped_license"] += 1
+            license_rejected[str(cand.license)] += 1
             return
         sidecar.write({"kind": "hit", "candidate": cand.to_dict()})  # persist ASAP
         _accept(seen_concept, cand)
@@ -206,6 +222,8 @@ def discover(
         "skipped_windows": counters["skipped_windows"],
         "skipped_queries": counters["skipped_queries"],
         "skipped_access_right": counters["skipped_access_right"],
+        "skipped_license": counters["skipped_license"],
+        "skipped_license_by_id": dict(license_rejected.most_common(10)),
     }
     logger.info("discovery summary: %s", summary)
     return summary

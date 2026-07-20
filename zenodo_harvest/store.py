@@ -4,9 +4,10 @@ Two sinks, joined by ``calc_id`` / ``frame_id`` (see docs/DESIGN.md §3):
 
 * :class:`ShardedExtxyzWriter` — atomistic data as gzipped extxyz, ~N frames per
   shard so files stay a manageable size and parallel writers each own their
-  shards. Frame headers stay small: energy/forces written directly under the
-  ``REF_energy``/``REF_forces`` info/arrays keys (not via a ``SinglePointCalculator``),
-  raw stress, a few quality tags, and the ``frame_id``/``calc_id`` join keys.
+  shards. Frame headers stay small: energy/forces/stress written directly under the
+  ``REF_energy``/``REF_forces``/``REF_stress`` info/arrays keys (not via a
+  ``SinglePointCalculator``), a few quality tags, and the ``frame_id``/``calc_id``
+  join keys.
 * :class:`MetadataWriter` — one JSONL record per calculation holding the bulky,
   frame-invariant data: provenance, citation, full calc parameters, convergence,
   and availability flags.
@@ -38,11 +39,16 @@ class ShardedExtxyzWriter:
     """Append ASE frames to rotating ``shard-NNNNN.extxyz.gz`` files."""
 
     def __init__(self, out_dir: str | Path, frames_per_shard: int = 10_000,
-                 prefix: str = "shard", start_index: int = 0):
+                 prefix: str = "shard", start_index: int = 0, compresslevel: int = 6):
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.frames_per_shard = frames_per_shard
         self.prefix = prefix
+        # gzip level 1..9 (1=fastest/largest, 9=slowest/smallest, 6=gzip default).
+        # extxyz compresses well even at low levels; a lower level trades a little size
+        # for much less CPU on a big cluster harvest. Only affects freshly-written
+        # shards — merge moves opaque blobs and never recompresses.
+        self.compresslevel = compresslevel
         self._shard_index = start_index
         self._in_shard = 0
         self._fh: Any = None
@@ -54,7 +60,8 @@ class ShardedExtxyzWriter:
     def _open_shard(self) -> None:
         if self._fh is not None:
             self._fh.close()
-        self._fh = gzip.open(self._shard_path(self._shard_index), "at")
+        self._fh = gzip.open(self._shard_path(self._shard_index), "at",
+                             compresslevel=self.compresslevel)
         self._in_shard = 0
 
     def write(self, atoms: Atoms) -> str:

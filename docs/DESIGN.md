@@ -20,10 +20,12 @@ vasprun.xml → 4047 frames) + 17378016 (OUTCAR-only → 40 frames):
   `atoms.arrays` (a `SinglePointCalculator` would emit the reserved `energy`/`forces`
   keys, which ASE re-absorbs into a calculator on read-back — removing them from
   `info`/`arrays`; the `REF_` keys survive and stay queryable).
-- **Stress is parsed but NOT a training label** — the raw 3×3 tensor stays in the
-  frame info as `stress_kbar` (kBar; the OUTCAR-only path keeps ASE's tensor as
-  `stress_ase_evA3`). VASP's kBar sign/scale convention → confirm with mentor
-  before shipping stress into training. *(open)*
+- **Stress IS a training label** (mentor decision 2026-07-20) — stored under MACE's
+  `REF_stress` key in **ASE's convention**: a Voigt-6 vector `[xx,yy,zz,yz,xz,xy]` in
+  eV/Å³ with ASE's sign. The vasprun/vaspout path converts VASP's raw kBar 3×3 tensor
+  (`× −0.1 × ase.units.GPa` + Voigt reorder — exactly ASE's own vasprun.xml reader);
+  the OUTCAR path takes ASE's `vasp-out` stress, already in this convention. Both paths
+  emit an identical `REF_stress`.
 - **Per-atom charges/spins** exist only in OUTCAR (end-of-run), so they attach to
   the final frame only (as `dft_charge`/`dft_magmom` output arrays), and only when
   an OUTCAR sits beside the vasprun.
@@ -80,9 +82,15 @@ splitting the work: **be permissive early, strict late.**
 
 - **Stage 0 discover** (`discover.py`): cast a wide net with many metadata
   keywords. False positives are fine here — they're cheap to carry. Records whose
-  `access_right` is present and not `open` are dropped (they 403 at fetch anyway);
-  `license` is recorded as a tag only (no gating — a license allowlist is still an
-  open decision with the mentor). An accepted hit is streamed to an append-only
+  `access_right` is present and not `open` are dropped (they 403 at fetch anyway).
+  A **license gate** (mentor decision 2026-07-20, default on; `--no-license-gate`
+  to disable) drops records whose license forbids redistribution/derivatives —
+  Creative-Commons NonCommercial (NC) / NoDerivatives (ND) and records with no
+  explicit license (Zenodo `notspecified`/absent = all rights reserved) — keeping
+  only openly-reusable data (CC0/CC-BY/CC-BY-SA, `other-open`, permissive software
+  licences). The license id is still recorded for attribution (CC-BY/CC-BY-SA).
+  Measured cost of the gate is small: ~8% of VASP-relevant records and only ~2-3%
+  of the *useful* (rank ≥ 3) ones, almost all CC-NonCommercial. An accepted hit is streamed to an append-only
   sidecar checkpoint (`<out>.hits.jsonl`) as it is seen, with per-window/per-query
   completion sentinels, so a crashed `--exhaustive` run resumes without redoing
   completed API paging (`--fresh` forces a clean rebuild).
@@ -133,8 +141,9 @@ Per-frame layout (ASE `Atoms`, written with `ase.io.write(..., format="extxyz")`
 | forces | per-atom array | `REF_forces` (MACE default) |
 | charges (Bader/Mulliken/…) | per-atom array | `dft_charge` |
 | spins / magmoms | per-atom array | `dft_magmom` |
-| total energy | frame info | `REF_energy` (MACE default) |
-| stress (if present) | frame info | `stress_kbar` (kBar, raw; not a label) |
+| total energy | frame info | `REF_energy` (MACE default; σ→0 E0) |
+| stress (if present) | frame info | `REF_stress` (eV/Å³, ASE Voigt; training label) |
+| free energy F (force-consistent) | frame info | `E_free`; vasprun also `entropy_TS` (=E−F) |
 | convergence flags | frame info | `electronic_converged`, `scf_dE` (this frame's OWN ionic step) |
 | **link to metadata** | frame info | `frame_id`, `source_recid` |
 
@@ -186,7 +195,8 @@ Proposed metadata record (one per calculation; frames reference it):
     "hubbard_u": {"Fe": 4.0}, "vdw": null,
     "encut": 520, "ediff": 1e-6, "ismear": -5, "sigma": 0.05,
     "kpoints": {"scheme": "Monkhorst", "grid": [8,8,8]},
-    "potcars": [{"symbol": "Fe_pv", "hash": "..."}],
+    "potcar_spec": [{"titel": "PAW_PBE Fe_pv 06Sep2000", "hash": null}],
+    "potcar_set_hash": "a1b2c3d4e5f60718",   // fingerprint of the POTCAR set (from titels)
     "incar": { ... full INCAR ... },
     "spin_polarized": true
   },
@@ -198,7 +208,9 @@ Proposed metadata record (one per calculation; frames reference it):
     "n_frames": 39,                          // frames actually stored
     "n_frames_scf_unconverged": 1,           // frames whose OWN SCF step didn't converge
     "n_frames_with_forces": 39,              // frames carrying REF_forces
-    "n_frames_dropped_no_energy": 1          // GW/response steps dropped (no recoverable energy)
+    "n_frames_with_stress": 39,              // frames carrying REF_stress
+    "n_frames_dropped_no_energy": 1,         // GW/response steps dropped (no recoverable energy)
+    "max_abs_free_minus_e0_per_atom": 4e-5   // worst |F - E0|/atom: E0-label vs force-consistency
   },
   "availability": {                          // recorded, not stored (too big)
     "charge_density": true, "chgcar_file": "CHGCAR",

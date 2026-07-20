@@ -101,6 +101,25 @@ def test_classify_primary_beats_archive():
     assert "extra.zip" in fc["archives"]
 
 
+def test_classify_input_only_is_low_rank():
+    # A record exposing ONLY VASP input files (no vasprun/OUTCAR/vaspout, no archive)
+    # has no energies/forces to train on -> vasp_input_only (rank 1), dropped by the
+    # default --min-rank 3 (mentor decision 2026-07-20). Regression for the old
+    # behaviour where INCAR/POSCAR-only records over-ranked as vasp_direct.
+    fc = classify_files(_files("relax/POSCAR", "relax/INCAR", "relax/KPOINTS", "relax/CONTCAR"))
+    assert fc["category"] == "vasp_input_only"
+    assert fc["rank"] == CATEGORY_RANK["vasp_input_only"] == 1
+    assert fc["primary_vasp_files"] == []
+
+
+def test_classify_input_plus_archive_stays_archive():
+    # Inputs exposed directly BUT an archive present -> archive (the zip may hide the
+    # outputs); archive is checked before the input-only branch.
+    fc = classify_files(_files("INCAR", "POSCAR", "outputs.zip"))
+    assert fc["category"] == "archive"
+    assert fc["rank"] == CATEGORY_RANK["archive"]
+
+
 # --------------------------------------------------------------------------- #
 # _VASP_RE (triage/models) — canonical names + separator-led prefixes         #
 # --------------------------------------------------------------------------- #
@@ -363,13 +382,16 @@ def test_download_file_falls_through_to_http_429(monkeypatch, tmp_path):
 # discover — newest-version-wins dedup by conceptrecid                        #
 # --------------------------------------------------------------------------- #
 
-def _record(recid, conceptrecid, title="t"):
+def _record(recid, conceptrecid, title="t", license="cc-by-4.0"):
+    meta = {"title": title, "resource_type": {"type": "dataset"},
+            "creators": [{"name": "A"}], "keywords": []}
+    if license is not None:  # reusable by default so the license gate keeps these
+        meta["license"] = {"id": license}
     return {
         "id": recid,
         "conceptrecid": conceptrecid,
         "created": "2024-01-01T00:00:00+00:00",
-        "metadata": {"title": title, "resource_type": {"type": "dataset"},
-                     "creators": [{"name": "A"}], "keywords": []},
+        "metadata": meta,
         "files": [{"key": "vasprun.xml", "size": 1, "links": {"self": "http://x"}}],
         "links": {"self_html": f"https://zenodo.org/records/{recid}"},
     }
@@ -394,6 +416,40 @@ def test_discover_keeps_newest_version(tmp_path):
     kept = {line.strip() for line in out.read_text().splitlines() if line.strip()}
     recids = sorted(json.loads(x)["recid"] for x in kept)
     assert recids == ["200", "300"]        # newest of concept 50 wins
+
+
+def test_is_reusable_license():
+    from zenodo_harvest.models import is_reusable_license
+    # collect: CC0/CC-BY/CC-BY-SA + Zenodo's other-open + permissive software licenses
+    for lic in ["cc-by-4.0", "cc-by-3.0", "cc-by-sa-4.0", "cc-zero", "cc0-1.0",
+                "other-open", "mit-license", "apache-2.0", "bsd-3-clause",
+                "gpl-3.0-or-later", "apgl-v3"]:
+        assert is_reusable_license(lic), lic
+    # reject: NonCommercial, NoDerivatives, and no-usable-license
+    for lic in ["cc-by-nc-4.0", "cc-by-nc-sa-4.0", "cc-by-nd-4.0", "cc-by-nc-nd-4.0",
+                None, "notspecified", "all-rights-reserved", "closed"]:
+        assert not is_reusable_license(lic), lic
+
+
+def test_discover_license_gate(tmp_path):
+    # Default gate ON: NC/ND/no-license records dropped, reusable ones kept.
+    recs = [_record(100, "50", license="cc-by-4.0"),        # keep
+            _record(200, "60", license="cc-by-nc-4.0"),     # drop (NonCommercial)
+            _record(300, "70", license="cc-by-nd-4.0"),     # drop (NoDerivatives)
+            _record(400, "80", license=None)]               # drop (no license)
+    out = tmp_path / "candidates.jsonl"
+    summary = discover_mod.discover(_FakeClient(recs), queries=["VASP"], out_path=out,
+                                    resource_types=("dataset",))
+    assert summary["unique_concepts"] == 1
+    assert summary["skipped_license"] == 3
+    recids = sorted(json.loads(line)["recid"]
+                    for line in out.read_text().splitlines() if line.strip())
+    assert recids == ["100"]
+    # ...and --no-license-gate keeps them all.
+    out2 = tmp_path / "c2.jsonl"
+    s2 = discover_mod.discover(_FakeClient(recs), queries=["VASP"], out_path=out2,
+                               resource_types=("dataset",), license_gate=False)
+    assert s2["unique_concepts"] == 4 and s2["skipped_license"] == 0
 
 
 def test_discover_skips_non_open_access_right(tmp_path):
@@ -635,6 +691,16 @@ def test_select_frame_steps_all_dropped():
     from zenodo_harvest.parse import _select_frame_steps
     kept, dropped = _select_frame_steps([{"electronic_steps": []}, {"electronic_steps": []}])
     assert kept == [] and dropped == 2              # all-dropped -> caller hits `no_frames`
+
+
+def test_entropy_ts():
+    from zenodo_harvest.parse import _entropy_ts
+    # T*S = E - F = e_wo_entrp - e_fr_energy (>= 0; F is the lower, force-consistent one)
+    assert _entropy_ts({"e_wo_entrp": -100.40, "e_fr_energy": -100.50}) == pytest.approx(0.10)
+    assert _entropy_ts({"e_wo_entrp": -5.0, "e_fr_energy": -5.0}) == 0.0   # tetrahedron: no entropy
+    assert _entropy_ts({"e_fr_energy": -5.0}) is None                      # OUTCAR path: no E
+    assert _entropy_ts({"e_wo_entrp": -5.0}) is None
+    assert _entropy_ts({}) is None
 
 
 # --------------------------------------------------------------------------- #

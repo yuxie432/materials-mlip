@@ -50,11 +50,15 @@ ARCHIVE_EXTS = {
 # uploader's, not ours; tag rather than treat as raw VASP.
 PROCESSED_EXTS = {".extxyz", ".xyz", ".traj", ".aselmdb", ".lmdb", ".h5", ".hdf5", ".json", ".cif"}
 
-# Category ranking (higher = more directly usable as raw VASP).
+# Category ranking (higher = more directly usable as raw VASP). A record whose only
+# VASP files are inputs (POSCAR/INCAR/…) with no output to parse and no archive that
+# might hide one ranks `vasp_input_only` — skipped by triage's default --min-rank 3
+# (mentor decision 2026-07-20: input-only records carry no energies/forces to train on).
 CATEGORY_RANK = {
     "vasp_direct": 4,      # recognisable VASP output files exposed directly
     "archive": 3,          # archive(s) present; contents unknown until peeked
     "processed_atomistic": 2,  # extxyz/xyz/traj/etc. already extracted by uploader
+    "vasp_input_only": 1,  # only VASP INPUT files (POSCAR/INCAR/…) — no outputs to parse
     "unlikely": 0,
 }
 
@@ -98,15 +102,21 @@ def classify_files(files: list[dict[str, Any]]) -> dict[str, Any]:
     if primary_hits:
         category = "vasp_direct"
         signals.append(f"exposes primary VASP outputs: {primary_hits[:3]}")
-    elif vasp_hits:
-        category = "vasp_direct"
-        signals.append(f"exposes VASP files: {vasp_hits[:3]}")
     elif archives:
+        # An archive may hide primary outputs even when only inputs are exposed
+        # directly, so it outranks a directly-exposed input-only listing: peek/download
+        # decides. (Checked before the vasp_hits branch for exactly this reason.)
         category = "archive"
         signals.append(f"{len(archives)} archive(s), contents unknown (peek/download to confirm)")
     elif processed:
         category = "processed_atomistic"
         signals.append(f"pre-extracted atomistic files: {processed[:3]}")
+    elif vasp_hits:
+        # VASP files are present but none are primary outputs and there's no archive
+        # to hide any — i.e. inputs only (POSCAR/INCAR/…). No energies/forces to train
+        # on, so rank below processed data (dropped by triage's default --min-rank 3).
+        category = "vasp_input_only"
+        signals.append(f"only VASP input files (no outputs to parse): {vasp_hits[:3]}")
     else:
         category = "unlikely"
         signals.append("no VASP/archive/atomistic files in listing")
@@ -133,6 +143,42 @@ _META_KEYWORDS = re.compile(
 def metadata_signal(title: str, description: str, keywords: list[str]) -> list[str]:
     text = " ".join([title or "", description or "", " ".join(keywords or [])])
     return sorted({m.group(0).lower() for m in _META_KEYWORDS.finditer(text)})
+
+
+# ---------------------------------------------------------------------------
+# License gating (mentor decision 2026-07-20). We collect openly-reusable data and
+# drop licenses that forbid the redistribution/derivative use an assembled + published
+# dataset (or a released MLIP + its training data) would need: Creative-Commons
+# NonCommercial (NC) and NoDerivatives (ND), plus records with no usable license
+# (Zenodo's "notspecified"/absent == all rights reserved). Everything else is kept —
+# CC0/CC-BY/CC-BY-SA, Zenodo's "other-open", and permissive software licences. The
+# license id is ALSO retained as a metadata tag so CC-BY / CC-BY-SA attribution (and
+# ShareAlike terms) can be honoured downstream. NB: Zenodo uses legacy ids such as
+# ``cc-by-4.0`` / ``cc-zero`` / ``cc-by-nc-sa-4.0`` / ``notspecified`` (verified live).
+# ---------------------------------------------------------------------------
+
+# License-id *tokens* (split on -_.space) that mark a non-redistributable license.
+_NONFREE_LICENSE_TOKENS = {"nc", "nd"}
+# License ids (lower-cased) that mean "no reusable license granted".
+_NO_LICENSE_IDS = {"", "notspecified", "all-rights-reserved", "arr", "closed",
+                   "restricted", "copyright", "none"}
+
+
+def is_reusable_license(lic: str | None) -> bool:
+    """Whether a Zenodo license id permits redistribution + derivative use.
+
+    Blocklist semantics: reject NonCommercial (``…-nc-…``) and NoDerivatives
+    (``…-nd-…``) Creative-Commons variants and any record with no explicit /
+    all-rights-reserved license; accept everything else (CC0/CC-BY/CC-BY-SA,
+    ``other-open``, and permissive software licences like MIT/BSD/Apache/GPL). A
+    missing license is treated as all-rights-reserved on Zenodo, so **not** reusable.
+    """
+    if lic is None:
+        return False
+    norm = lic.strip().lower()
+    if norm in _NO_LICENSE_IDS:
+        return False
+    return not (set(re.split(r"[-_.\s]+", norm)) & _NONFREE_LICENSE_TOKENS)
 
 
 @dataclass

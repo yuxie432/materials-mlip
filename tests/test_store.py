@@ -268,6 +268,55 @@ def test_prune_rewrites_truncated_but_committed_top_shard(tmp_path):
 # next_shard_index / existing_shard_paths — numeric (not lexical) ordering    #
 # --------------------------------------------------------------------------- #
 
+def test_stress_to_ase_voigt_matches_ase_convention():
+    # parse._stress_to_ase_voigt must reproduce EXACTLY what ASE's own vasprun.xml
+    # reader (ase.io.vasp.read_vasp_xml) does to the raw kBar <varray name="stress">:
+    #   stress *= -0.1 * GPa ; stress = stress.reshape(9)[[0,4,8,5,2,1]]  (-> Voigt)
+    # pymatgen returns that same raw kBar 3x3, so this is the correct REF_stress.
+    import ase.units
+    import numpy as np
+    from zenodo_harvest.parse import _stress_to_ase_voigt
+    kbar_3x3 = [[10.0, 1.0, 2.0], [1.0, -5.0, 3.0], [2.0, 3.0, 7.0]]  # symmetric, kBar
+    got = _stress_to_ase_voigt(kbar_3x3)
+    ase_ref = (np.array(kbar_3x3, dtype=float) * (-0.1 * ase.units.GPa)
+               ).reshape(9)[[0, 4, 8, 5, 2, 1]]  # ASE read_vasp_xml formula, verbatim
+    assert got.shape == (6,)
+    assert np.allclose(got, ase_ref)
+    # sanity: sign is flipped vs VASP and magnitude is ~1e-3 eV/A^3 per kBar
+    assert got[0] < 0  # +10 kBar (VASP compressive) -> negative xx in ASE convention
+    assert abs(got[0]) == pytest.approx(10 * 0.1 * ase.units.GPa)
+
+
+def test_potcar_set_hash_deterministic_and_order_sensitive():
+    from zenodo_harvest.parse import _potcar_set_hash
+    a = _potcar_set_hash(["PAW_PBE Fe_pv 06Sep2000", "PAW_PBE O 08Apr2002"])
+    assert a == _potcar_set_hash(["PAW_PBE Fe_pv 06Sep2000", "PAW_PBE O 08Apr2002"])  # stable
+    assert a != _potcar_set_hash(["PAW_PBE O 08Apr2002", "PAW_PBE Fe_pv 06Sep2000"])  # order matters
+    assert a != _potcar_set_hash(["PAW_PBE Fe 06Sep2000", "PAW_PBE O 08Apr2002"])     # variant matters
+    assert _potcar_set_hash([]) is None
+    assert _potcar_set_hash([None, ""]) is None  # blanks dropped -> None
+    assert len(a) == 16
+
+
+def test_outcar_potcar_titels_extracted_in_order(tmp_path):
+    from zenodo_harvest.parse import _outcar_potcar_titels, _potcar_set_hash
+    outcar = tmp_path / "OUTCAR"
+    outcar.write_text(
+        "  SOME HEADER\n"
+        "   TITEL  = PAW_PBE Fe_pv 06Sep2000\n"
+        "   LEXCH  = PE\n"
+        "   TITEL  = PAW_PBE O 08Apr2002\n"
+        "   TITEL  = PAW_PBE Fe_pv 06Sep2000\n"   # repeat -> de-duplicated
+        "  ... rest of run ...\n"
+    )
+    titels = _outcar_potcar_titels(str(outcar))
+    assert titels == ["PAW_PBE Fe_pv 06Sep2000", "PAW_PBE O 08Apr2002"]  # first-seen order, unique
+    # and it feeds the same set-hash the vasprun path would compute from these titels
+    assert _potcar_set_hash(titels) == _potcar_set_hash(
+        ["PAW_PBE Fe_pv 06Sep2000", "PAW_PBE O 08Apr2002"])
+    assert _outcar_potcar_titels(str(tmp_path / "nope")) == []  # missing file -> []
+
+
 def test_shard_indexing_is_numeric_not_lexical(tmp_path):
     for idx in (2, 10):                              # lexical would sort "00010" < "00002"
         (tmp_path / f"shard-{idx:05d}.extxyz.gz").write_bytes(b"")
