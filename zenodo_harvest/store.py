@@ -59,6 +59,14 @@ class ShardedExtxyzWriter:
 
     def _open_shard(self) -> None:
         if self._fh is not None:
+            # fsync the shard we are rotating AWAY from before closing it. A calc's
+            # frames can straddle a rotation, and flush() only fsyncs the *current*
+            # (new) shard — so without this the filled shard's tail would still sit in
+            # the OS page cache when the calc's metadata is committed, and a hard crash
+            # (power/kernel, not a clean SIGTERM) could lose frames the metadata points
+            # at (verify would then report them missing_on_disk). See flush().
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
             self._fh.close()
         self._fh = gzip.open(self._shard_path(self._shard_index), "at",
                              compresslevel=self.compresslevel)

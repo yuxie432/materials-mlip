@@ -13,7 +13,10 @@ Design notes grounded in observed API behaviour (2026-07):
   via ``ZENODO_TOKEN``.
 * The search window is capped: ``page * size`` must be <= 10000, else HTTP 400.
   To exhaust a query with more than 10k hits we recursively bisect the ``created``
-  date range (:meth:`ZenodoClient.iter_records`).
+  *datetime* range (:meth:`ZenodoClient.iter_records`) — down to sub-second if a
+  single day is dense (a bulk upload day can exceed 10k; date-only bisection cannot
+  split below a day and would silently truncate). Intervals are half-open
+  ``[start TO end}`` so recursive splits are disjoint and gapless.
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Iterator
 
 import requests
@@ -33,6 +36,11 @@ MAX_SEARCH_WINDOW = 10_000
 # Zenodo caps page size at 25 on /api/records (size>=50 -> HTTP 400). With size=25
 # the 10k window is reachable in 400 pages.
 DEFAULT_PAGE_SIZE = 25
+# Finest datetime-bisection granularity. If even a 1-second `created` window still
+# has >10k hits we truncate (essentially impossible: >10k records ingested in the
+# same second). Sub-second bisection would need `created` millisecond precision we
+# don't rely on.
+MIN_WINDOW = timedelta(seconds=1)
 
 
 def _parse_retry_after(value: str | None, default: int = 5) -> int:
@@ -185,6 +193,11 @@ class ZenodoClient:
             page += 1
             hits = self.search_page(query, page=page, size=size, sort=sort, extra=extra)["hits"]["hits"]
 
+    @staticmethod
+    def _fmt(dt: datetime) -> str:
+        """Format a datetime for a Zenodo ``created:`` range bound (no tz suffix)."""
+        return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
     def iter_records(
         self,
         query: str,
@@ -192,52 +205,67 @@ class ZenodoClient:
         end: date | None = None,
         size: int = DEFAULT_PAGE_SIZE,
         extra: dict[str, Any] | None = None,
-        should_skip: Callable[[date, date], bool] | None = None,
-        on_window_done: Callable[[date, date], None] | None = None,
+        should_skip: Callable[[datetime, datetime], bool] | None = None,
+        on_window_done: Callable[[datetime, datetime], None] | None = None,
     ) -> Iterator[dict]:
         """Exhaustively yield every record for ``query`` across all versions/dates.
 
-        Zenodo caps any single query at 10k retrievable results. To get past that
-        we recursively bisect the ``created`` date interval until every sub-window
-        has <= 10k hits, then page through each. This is the scalable path for a
-        full harvest (safe to run on the cluster; resume by partitioning dates).
+        Zenodo caps any single query at 10k retrievable results. To get past that we
+        recursively bisect the ``created`` **datetime** interval until every sub-window
+        has <= 10k hits, then page through each. Bisection goes below one day when
+        needed (down to :data:`MIN_WINDOW`), so a bulk-upload day with >10k records is
+        split by hour/minute/second rather than silently truncated (the old date-only
+        bisection could not split a single day). This is the scalable path for a full
+        harvest (safe to run on the cluster; resume by partitioning dates).
 
         ``should_skip(start, end)`` and ``on_window_done(start, end)`` are optional
-        checkpoint hooks invoked *only at leaf windows* (the ones actually paged):
-        ``should_skip`` lets a resumed caller skip a window it already completed, and
-        ``on_window_done`` is called once a leaf window has been fully yielded. NB:
-        which windows are leaves depends on the live hit counts, so bisection leaves
-        can shift between runs if counts changed — callers must match windows exactly.
+        checkpoint hooks invoked *only at leaf windows* (the ones actually paged), with
+        timezone-aware ``datetime`` bounds: ``should_skip`` lets a resumed caller skip a
+        window it already completed, and ``on_window_done`` is called once a leaf window
+        has been fully yielded. NB: which windows are leaves depends on the live hit
+        counts, so bisection leaves can shift between runs if counts changed — callers
+        must match windows exactly (compare on the datetime isoformat).
         """
-        end = end or date.today()
-        yield from self._iter_range(query, start, end, size, extra, should_skip, on_window_done)
+        start_dt = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
+        end_date = end or date.today()
+        # `end` is inclusive of the whole end-day; the recursion uses a half-open upper
+        # bound, so set it to the next midnight (exclusive) to cover all of end-day.
+        end_dt = (datetime(end_date.year, end_date.month, end_date.day, tzinfo=timezone.utc)
+                  + timedelta(days=1))
+        yield from self._iter_range(query, start_dt, end_dt, size, extra,
+                                    should_skip, on_window_done)
 
     def _iter_range(
-        self, query: str, start: date, end: date, size: int, extra: dict[str, Any] | None,
-        should_skip: Callable[[date, date], bool] | None = None,
-        on_window_done: Callable[[date, date], None] | None = None,
+        self, query: str, start: datetime, end: datetime, size: int,
+        extra: dict[str, Any] | None,
+        should_skip: Callable[[datetime, datetime], bool] | None = None,
+        on_window_done: Callable[[datetime, datetime], None] | None = None,
     ) -> Iterator[dict]:
-        ranged = f"({query}) AND created:[{start.isoformat()} TO {end.isoformat()}]"
+        # Half-open [start TO end}: inclusive start, EXCLUSIVE end. This makes the two
+        # recursive halves [start,mid) and [mid,end) disjoint AND gapless — an inclusive
+        # [A TO B] split would double-count any record created exactly at the midpoint.
+        ranged = f"({query}) AND created:[{self._fmt(start)} TO {self._fmt(end)}}}"
         total = self.count(ranged, extra)
         if total == 0:
             return
-        if total <= MAX_SEARCH_WINDOW or start >= end:  # leaf window (paged directly)
+        if total <= MAX_SEARCH_WINDOW or (end - start) <= MIN_WINDOW:  # leaf (paged directly)
             if should_skip is not None and should_skip(start, end):
                 return  # resumed: this exact window was completed in a prior run
             if total > MAX_SEARCH_WINDOW:
                 logger.warning(
-                    "single-day window %s still has %d hits; truncating at %d",
-                    start, total, MAX_SEARCH_WINDOW,
+                    "smallest window %s..%s still has %d hits (>%d); truncating — a single "
+                    "%ds bucket exceeds the search window",
+                    self._fmt(start), self._fmt(end), total, MAX_SEARCH_WINDOW,
+                    int(MIN_WINDOW.total_seconds()),
                 )
-            logger.info("harvest %s..%s : %d records", start, end, total)
+            logger.info("harvest %s..%s : %d records", self._fmt(start), self._fmt(end), total)
             yield from self.iter_window(ranged, size=size, extra=extra)
             if on_window_done is not None:
                 on_window_done(start, end)
             return
         mid = start + (end - start) / 2
         yield from self._iter_range(query, start, mid, size, extra, should_skip, on_window_done)
-        yield from self._iter_range(query, mid + timedelta(days=1), end, size, extra,
-                                    should_skip, on_window_done)
+        yield from self._iter_range(query, mid, end, size, extra, should_skip, on_window_done)
 
     # -- single record -----------------------------------------------------
 

@@ -20,6 +20,7 @@ decided what to write.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -28,8 +29,6 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-from ase import Atoms
 
 from .manifest import read_jsonl
 from .store import (
@@ -45,6 +44,43 @@ from .store import (
 logger = logging.getLogger(__name__)
 
 MERGED_MARKER = "merged.done"
+# Written into a source dir at the START of merging it and removed once its marker is
+# down. Its presence means "this source was interrupted mid-merge" and carries the
+# old->new shard mapping so a re-run resumes idempotently instead of refusing.
+MERGE_PROGRESS = ".merge-progress.json"
+
+
+def _read_progress(s: Path) -> dict | None:
+    p = s / MERGE_PROGRESS
+    if not p.is_file():
+        return None
+    try:
+        info = json.loads(p.read_text())
+        return info if isinstance(info, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_progress(s: Path, into_resolved: Path, mapping: dict[str, str]) -> None:
+    (s / MERGE_PROGRESS).write_text(
+        json.dumps({"into": str(into_resolved), "mapping": mapping}))
+
+
+def _clear_progress(s: Path) -> None:
+    (s / MERGE_PROGRESS).unlink(missing_ok=True)
+
+
+def _move_shard(src_path: Path, dst_path: Path) -> None:
+    """Move a shard into place. Prefer ``os.replace`` (atomic rename); fall back to
+    ``shutil.move`` (copy+unlink) across filesystems — per-task dirs on node-local
+    scratch and the destination on shared Lustre would otherwise raise EXDEV."""
+    try:
+        os.replace(src_path, dst_path)
+    except OSError as exc:
+        if exc.errno == errno.EXDEV:
+            shutil.move(str(src_path), str(dst_path))
+        else:
+            raise
 
 
 # --------------------------------------------------------------------------- #
@@ -95,36 +131,49 @@ def _load_metadata(dataset_dir: str | Path) -> list[dict]:
     return list(read_jsonl(mp)) if mp.is_file() else []
 
 
-def _read_all_frames(dataset_dir: str | Path) -> tuple[list[Atoms], list[str]]:
-    """Read every shard's frames leniently; also return names of truncated shards."""
-    frames: list[Atoms] = []
+def _scan_disk(dataset_dir: str | Path) -> tuple[Counter, Counter, list[str]]:
+    """Stream every shard ONCE, one shard in memory at a time.
+
+    Returns the on-disk ``frame_id`` multiset (Counter), per-element frame counts
+    (Counter; a frame counts once per element it contains), and the names of any
+    truncated shards. Memory is bounded to a single shard's frames (~frames_per_shard
+    Atoms), NOT the whole dataset — verify/merge must scale to a TB-scale dataset
+    (tens of millions of frames) without OOM, so we never materialise all frames at
+    once (the old ``_read_all_frames`` did, and would blow up a normal CSD3 node).
+    """
+    disk_counts: Counter = Counter()
+    elements: Counter = Counter()
     truncated: list[str] = []
     for shard in existing_shard_paths(dataset_dir):
-        fr, was_truncated = read_shard_frames_lenient(shard)
-        frames.extend(fr)
+        frames, was_truncated = read_shard_frames_lenient(shard)
         if was_truncated:
             truncated.append(shard.name)
-    return frames, truncated
+        for f in frames:
+            disk_counts[f.info.get("frame_id")] += 1
+            for sym in set(f.get_chemical_symbols()):
+                elements[sym] += 1
+        # `frames` (this shard's Atoms) is released before the next shard is read.
+    return disk_counts, elements, truncated
 
 
-def check_integrity(records: list[dict], frames: list[Atoms],
+def check_integrity(records: list[dict], disk_counts: Counter,
                     truncated_shards: list[str]) -> dict:
     """metadata<->shard frame_id bijection (the cheap sanity gate after every array job).
 
-    Requires each metadata ``frame_id`` to appear exactly once on disk and every
-    on-disk frame to have a metadata owner. Reports up to 10 example ids each way
-    plus full counts. A truncated shard is only ever a crashed-writer artifact
-    (parse or merge), so orphan disk frames (a frame with no metadata owner) are
-    downgraded to a warning WHEN a shard is truncated — that is the prunable tail
-    parse's next resume removes; without truncation they are a real mismatch. A
-    metadata id missing from disk (or duplicated) is always a hard failure — that
-    direction means a dangling reference / data loss, never a prunable artifact.
+    Takes the on-disk frame_id multiset (from :func:`_scan_disk`) rather than a list
+    of Atoms, so it needs only counts in memory. Requires each metadata ``frame_id``
+    to appear exactly once on disk and every on-disk frame to have a metadata owner.
+    Reports up to 10 example ids each way plus full counts. A truncated shard is only
+    ever a crashed-writer artifact (parse or merge), so orphan disk frames (a frame
+    with no metadata owner) are downgraded to a warning WHEN a shard is truncated —
+    that is the prunable tail parse's next resume removes; without truncation they are
+    a real mismatch. A metadata id missing from disk (or duplicated) is always a hard
+    failure — that direction means a dangling reference / data loss, never prunable.
     """
     meta_ids = [fid for rec in records for fid in rec.get("frame_ids", [])]
-    disk_ids = [f.info.get("frame_id") for f in frames]
     meta_counts = Counter(meta_ids)
-    disk_counts: Counter = Counter(disk_ids)
     meta_set = set(meta_ids)
+    n_disk = sum(disk_counts.values())
 
     dup_in_metadata = sorted(i for i, c in meta_counts.items() if c > 1)
     missing_on_disk = sorted(i for i in meta_set if disk_counts.get(i, 0) == 0)
@@ -137,7 +186,7 @@ def check_integrity(records: list[dict], frames: list[Atoms],
     return {
         "ok": not (hard_fail or orphan_fail),
         "n_frames_metadata": len(meta_ids),
-        "n_frames_on_disk": len(disk_ids),
+        "n_frames_on_disk": n_disk,
         "n_missing_on_disk": len(missing_on_disk),
         "missing_on_disk": missing_on_disk[:10],
         "n_duplicate_on_disk": len(dup_on_disk),
@@ -160,8 +209,9 @@ def _key(value: Any) -> str:
     return "null" if value is None else str(value)
 
 
-def _dataset_stats(records: list[dict], frames: list[Atoms]) -> dict:
-    """Curation stats in ONE pass over the frames + metadata already read for (a).
+def _dataset_stats(records: list[dict], elements: Counter) -> dict:
+    """Curation stats from the metadata records + the element Counter that the
+    streaming disk scan (:func:`_scan_disk`) already accumulated.
 
     Element/property coverage is the instrument for assembling a coherent MLIP
     training subset (filter by functional / run_type / element / license), so it is
@@ -193,11 +243,7 @@ def _dataset_stats(records: list[dict], frames: list[Atoms]) -> dict:
         tot_with_forces += int(q.get("n_frames_with_forces", 0) or 0)
         tot_with_stress += int(q.get("n_frames_with_stress", 0) or 0)
 
-    elements: Counter = Counter()
-    for f in frames:
-        for sym in set(f.get_chemical_symbols()):  # once per frame containing the element
-            elements[sym] += 1
-
+    # `elements` was accumulated during the single streaming disk scan (no re-read).
     return {
         "n_calcs": len(records),
         "frames_by_parser": dict(by_parser),
@@ -223,9 +269,9 @@ def verify_dataset(dataset_dir: str | Path) -> dict:
     non-zero exit. A truncated top shard is surfaced as a warning, not a failure.
     """
     records = _load_metadata(dataset_dir)
-    frames, truncated = _read_all_frames(dataset_dir)
-    integrity = check_integrity(records, frames, truncated)
-    stats = _dataset_stats(records, frames)
+    disk_counts, elements, truncated = _scan_disk(dataset_dir)
+    integrity = check_integrity(records, disk_counts, truncated)
+    stats = _dataset_stats(records, elements)
     stats["n_frames_metadata"] = integrity["n_frames_metadata"]
     stats["n_frames_on_disk"] = integrity["n_frames_on_disk"]
     return {"dataset_dir": str(dataset_dir), "ok": integrity["ok"],
@@ -252,10 +298,19 @@ def merge_datasets(into: str | Path, sources: list[str | Path]) -> dict:
     double-appending. An interruption therefore leaves at worst prunable orphan
     frames in the destination, never metadata pointing at absent frames.
 
+    Resumable mid-source: before moving a source's shards we journal the old->new
+    shard mapping (``.merge-progress.json``); if a run dies partway through a source
+    (some shards renamed into the destination, marker not yet written), a re-run
+    reads that journal and resumes idempotently — skipping shards already moved and
+    metadata records already appended — rather than refusing on a "missing shard"
+    that is in fact already in the destination.
+
     Refuses the WHOLE merge (returns ``ok=False``, moves/deletes nothing) if: a
     source holds a live lock, a source's metadata is unreadable, a referenced shard
-    file is missing, or a frame_id is duplicated within/across sources or already
-    present in the destination. Post-verifies the merged destination's bijection.
+    is genuinely missing (not in the source and not already moved to the destination),
+    or a frame_id is duplicated within/across sources or already present in the
+    destination (excluding a resuming source's own records). Post-verifies the merged
+    destination's bijection.
     """
     into = Path(into)
     src_dirs = [Path(s) for s in sources]
@@ -275,9 +330,32 @@ def merge_datasets(into: str | Path, sources: list[str | Path]) -> dict:
         skipped = [str(s) for s in src_dirs if (s / MERGED_MARKER).is_file()]
         pending = [s for s in src_dirs if not (s / MERGED_MARKER).is_file()]
 
+        # A source with a .merge-progress.json (naming THIS destination) was interrupted
+        # mid-merge: some of its shards are already in `into`. Load those journals so we
+        # RESUME them idempotently instead of refusing on "missing shard".
+        journals: dict[Path, dict[str, str]] = {}
+        for s in pending:
+            j = _read_progress(s)
+            if j is not None and j.get("into") == str(into_resolved):
+                journals[s] = j.get("mapping", {})
+
+        # A resuming source's records may already be in `into` (appended before the
+        # crash) — those are expected, not duplicates. Collect their calc_ids so the
+        # dedup check tolerates them and the append step skips them (idempotent).
+        dest_records = _load_metadata(into)
+        dest_calc_ids = {r.get("calc_id") for r in dest_records}
+        resuming_calc_ids: set[str] = set()
+        for s in journals:
+            if (s / "metadata.jsonl").is_file():
+                resuming_calc_ids.update(r["calc_id"] for r in read_jsonl(s / "metadata.jsonl")
+                                         if r.get("calc_id"))
+
         # 2. Pre-validate every pending source, up front, before touching anything.
+        # dest_frame_ids EXCLUDES resuming sources' own already-appended records.
         dest_frame_ids: set[str] = set()
-        for rec in _load_metadata(into):
+        for rec in dest_records:
+            if rec.get("calc_id") in resuming_calc_ids:
+                continue
             dest_frame_ids.update(rec.get("frame_ids", []))
         seen: set[str] = set()
         plans: list[tuple[Path, list[dict], list[str]]] = []
@@ -289,10 +367,13 @@ def merge_datasets(into: str | Path, sources: list[str | Path]) -> dict:
                 records = list(read_jsonl(mp))
             except (OSError, ValueError) as exc:
                 return _fail(into, f"source {s} metadata.jsonl unreadable: {exc}")
+            jmap = journals.get(s, {})
             referenced: dict[str, None] = {}
             for rec in records:
                 for name in rec.get("shards", []):
-                    if not (s / name).is_file():
+                    # OK if still in the source, OR (resuming) already moved into `into`.
+                    moved = name in jmap and (into / jmap[name]).is_file()
+                    if not (s / name).is_file() and not moved:
                         return _fail(into, f"source {s} record {rec.get('calc_id')} references "
                                            f"missing shard {name}")
                     referenced.setdefault(name, None)
@@ -305,41 +386,63 @@ def merge_datasets(into: str | Path, sources: list[str | Path]) -> dict:
                     seen.add(fid)
             plans.append((s, records, sorted(referenced, key=lambda n: _shard_index_of(Path(n)))))
 
-        # 3-5. Move shards (rename+renumber) then append metadata, per source.
+        # 3-5. Move shards then append metadata, per source. Fresh sources reserve new
+        # shard indices from a running counter; resuming sources reuse their journalled
+        # mapping. Reserve the counter past every journalled index first, so a fresh
+        # source's new names can't collide with a resuming source's not-yet-moved ones.
         start = next_shard_index(into)
-        counter = start
+        reserved_max = max((_shard_index_of(Path(n)) for m in journals.values() for n in m.values()),
+                           default=-1)
+        counter = max(start, reserved_max + 1)
         per_source: list[dict] = []
+        total_moved = 0
         with MetadataWriter(into / "metadata.jsonl") as meta_w:
             for s, records, ref_names in plans:
-                mapping: dict[str, str] = {}
+                mapping = journals.get(s)
+                if mapping is None:  # fresh source: allocate new names + journal BEFORE moving
+                    mapping = {}
+                    for name in ref_names:
+                        mapping[name] = f"shard-{counter:05d}.extxyz.gz"
+                        counter += 1
+                    _write_progress(s, into_resolved, mapping)
+                moved_now = 0
                 for name in ref_names:
-                    new_name = f"shard-{counter:05d}.extxyz.gz"
-                    counter += 1
-                    # rename only: shard gzip files are opaque, never recompressed.
-                    os.replace(s / name, into / new_name)
-                    mapping[name] = new_name
-                # metadata appended AFTER its shards are in place (see docstring).
+                    src_path, dst_path = s / name, into / mapping[name]
+                    if src_path.is_file():
+                        _move_shard(src_path, dst_path)  # opaque gzip, never recompressed
+                        moved_now += 1
+                    # else: already at dst from a partial prior run -> skip (idempotent).
+                # metadata appended AFTER its shards are in place; skip records a partial
+                # prior run already appended (idempotent).
+                appended = 0
                 for rec in records:
+                    if rec.get("calc_id") in dest_calc_ids:
+                        continue
                     rec["shards"] = [mapping[n] for n in rec.get("shards", [])]
                     meta_w.write(rec)
+                    appended += 1
                 (s / MERGED_MARKER).write_text(json.dumps({
-                    "merged_into": str(into.resolve()),
+                    "merged_into": str(into_resolved),
                     "at": datetime.now(timezone.utc).isoformat(),
                     "records": len(records), "shards_moved": len(mapping),
                 }) + "\n")
+                _clear_progress(s)  # committed -> drop the journal
+                total_moved += moved_now
                 per_source.append({"source": str(s), "records": len(records),
-                                   "shards_moved": len(mapping), "shard_map": mapping})
-                logger.info("merged %s: %d records, %d shards", s, len(records), len(mapping))
+                                   "shards_moved": len(mapping), "shards_moved_this_run": moved_now,
+                                   "records_appended_this_run": appended, "shard_map": mapping})
+                logger.info("merged %s: %d records, %d shards (%d moved, %d appended this run)",
+                            s, len(records), len(mapping), moved_now, appended)
 
         # 6. Post-verify the merged destination's bijection (delete nothing on failure).
-        frames, truncated = _read_all_frames(into)
-        integrity = check_integrity(_load_metadata(into), frames, truncated)
+        disk_counts, _elements, truncated = _scan_disk(into)
+        integrity = check_integrity(_load_metadata(into), disk_counts, truncated)
         return {
             "ok": integrity["ok"],
             "into": str(into),
             "sources_merged": [str(s) for s, _, _ in plans],
             "sources_skipped_already_merged": skipped,
-            "shards_moved": counter - start,
+            "shards_moved": total_moved,
             "records_appended": sum(len(r) for _, r, _ in plans),
             "next_shard_index_start": start,
             "per_source": per_source,

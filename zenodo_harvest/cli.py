@@ -192,7 +192,11 @@ def main(argv: list[str] | None = None) -> int:
             max_member_bytes=max_member_bytes,
         )
     elif args.cmd == "parse":
-        rejections = args.rejections or str(Path(args.dataset_dir).parent / "manifests" / "rejections.jsonl")
+        # Default the rejection log INSIDE the dataset dir, not a shared sibling: in the
+        # array-job model every task writes its own <dataset-dir>/task-i, so a shared
+        # parent/manifests/rejections.jsonl would take concurrent appends from N tasks
+        # (interleaves/corrupts on Lustre/NFS). Per-dataset-dir keeps each task's log private.
+        rejections = args.rejections or str(Path(args.dataset_dir) / "rejections.jsonl")
         try:
             summary = parse(
                 args.in_path, dataset_dir=args.dataset_dir, rejections_path=rejections,

@@ -9,7 +9,7 @@ tools here (`README.md`).
 | Question | Answer |
 |---|---|
 | Discoverable relevant **records** (rank ≥ 3) | **629** candidates (9 `vasp_direct` + 620 `archive`) |
-| …that **genuinely contain a VASP primary output** | **~73 confirmed** by zip peek; **~120–190 realistic** (incl. tar/rar/7z that need download to confirm) |
+| …that **genuinely contain a VASP primary output** | **~107** (95% band 62–175), measured by peeking zips + downloading a sample of tar/rar/7z |
 | **Raw footprint** of the 629 | **2.21 TB** (heavy-tailed — top 100 = 92%, largest single = 186 GB) |
 | **Download/transfer** to harvest | **82 GB → 1.96 TB** by per-file cap; **less with peek** (junk zips dropped pre-download) |
 | **Final `extxyz.gz` + `metadata.jsonl` dataset** | **~15–75 GB** — fits 1 TB with huge margin |
@@ -48,17 +48,28 @@ Fixed queries → **925 unique concepts** (gates dropped 75 non-open, 58 NC/ND/n
 1.38 TB, tar 537 GB, direct 28 GB, rar 24 GB, 7z 8 GB (**rar+7z ≈ 31 GB across all of
 Zenodo — now extractable, `archives` extra installed**).
 
-## Precision — how much is *actually* VASP (measured by peek)
+## Precision — how much *actually* has a parseable VASP output
 
-`triage --peek` read the central directory of every candidate `.zip`:
-- Only **~24%** of peekable-zip archives contain any vasprun/OUTCAR.
-- Only **73 records** expose a **primary output** (vasprun/OUTCAR/vaspout) confirmable
-  without downloading; their raw footprint is just **~0.29 TB**.
-- The "no-VASP" zips are genuinely non-VASP (spot-checked: ABINIT/JTH PAW files,
-  DeePMD `.raw`, structures.xyz, CSVs, cell-tracking) — not nested archives.
-- 195 records are tar/rar/7z (unpeekable) — ~24–50% may be VASP; confirmed only at fetch.
+Method: bucket the 629 relevant records by how their VASP content can be confirmed;
+bucket **sizes are exact** (from the manifest); the **VASP-content rate** per bucket is
+sampled and reported with a Wilson 95% CI. "Has VASP" here means a **primary output**
+(vasprun/OUTCAR/vaspout) — the thing parse can actually turn into frames — not merely
+an input file (POSCAR/INCAR). (My earlier "24%" counted *any* VASP file incl.
+input-only; the parseable-primary rate is lower.)
 
-⇒ realistic **parseable-VASP ≈ 120–190 records**; a full fetch+parse (no cap) nails it.
+| bucket | records | raw | how confirmed | primary-VASP rate |
+|---|---|---|---|---|
+| A direct | 9 | 34 GB | already exposed | 100% |
+| B peekable `.zip` | 437 | 1.39 TB | HTTP-Range peek (n=89) | **12%** (CI 7–21%) |
+| C unpeekable tar/rar/7z | 164 | 531 GB | **downloaded** a sample (n=26) | **27%** (CI 14–46%) |
+| giant (>20 GB, unpeekable) | 19 | 306 GB | not sampled | unknown |
+
+The peekable-zip "no-VASP" records are genuinely non-VASP (spot-checked: ABINIT/JTH
+PAW files, DeePMD `.raw`, structures.xyz, CSVs, cell-tracking) — not nested archives.
+tar/rar/7z score higher because people commonly `tar.gz` a whole VASP run directory.
+
+⇒ **parseable-VASP ≈ 107 records (95% band 62–175)** = 9 + 12%·437 + 27%·164. A full
+no-cap fetch+parse on CSD3 nails the exact number.
 
 ## Storage
 

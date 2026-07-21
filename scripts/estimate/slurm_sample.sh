@@ -5,6 +5,10 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4              # pymatgen parse benefits from a few cores
+#SBATCH --mem=16G                      # pymatgen loads a whole vasprun.xml + all ionic
+                                       # steps into RAM; give parse tasks headroom over
+                                       # the extracted-file cap (--max-member-bytes, 2GB
+                                       # default) or a long-AIMD vasprun.xml can OOM.
 #SBATCH --time=02:00:00
 #SBATCH -o sample-%j.out
 #SBATCH -e sample-%j.err

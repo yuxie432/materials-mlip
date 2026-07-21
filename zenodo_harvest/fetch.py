@@ -145,6 +145,12 @@ def download_file(
         except requests.RequestException as exc:
             tmp.unlink(missing_ok=True)
             return False, f"download_error:{type(exc).__name__}"
+        except OSError as exc:
+            # e.g. ENOSPC (disk/quota full) while writing the .part on cluster scratch.
+            # Treat as a TRANSIENT per-file failure (not a hard crash of the whole run):
+            # unlink the partial, return a non-terminal reason so a later resume retries.
+            tmp.unlink(missing_ok=True)
+            return False, f"write_error:{type(exc).__name__}"
         break  # a non-429 response streamed to completion
     if expected_md5 and _md5(tmp) != expected_md5:
         tmp.unlink(missing_ok=True)

@@ -59,6 +59,26 @@ python scripts/estimate/census.py \
 
 Answers question 1 (counts) and gives the exact transfer volume at each cap.
 
+### No-cap harvest on a bounded disk (e.g. 1 TB scratch)
+
+The final `extxyz.gz` + `metadata.jsonl` dataset is tiny (~tens of GB), so **run
+uncapped** (`fetch --max-bytes 0`) to not miss data locked in big archives. The only
+large, *transient* thing is the downloaded archive — deleted the moment its VASP files
+are extracted. To keep peak disk well under quota, **pipeline in batches** rather than
+fetching everything then parsing everything:
+
+```bash
+# per batch (or per SLURM array task on its own manifest part):
+python -m zenodo_harvest.cli fetch  --in part.jsonl --max-bytes 0 --raw-dir "$RAW"
+python -m zenodo_harvest.cli parse  --in "$MAN/fetched.jsonl" --dataset-dir "$DS" --raw-dir "$RAW"
+python -m zenodo_harvest.cli purge-raw --raw-dir "$RAW" --dataset-dir "$DS"   # reclaim
+```
+
+Peak disk ≈ (largest single archive in flight) + (extracted files not yet purged) —
+kept small by peek dropping non-VASP zips before download and by purging each batch.
+`--max-member-bytes` still guards individual extracted files (raise it above 2 GB for
+very long AIMD `vasprun.xml`).
+
 ### 3. Storage sample (fetch + parse; question 2's ratios)
 
 ```bash

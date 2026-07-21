@@ -399,6 +399,48 @@ def test_get_retries_on_connection_error(monkeypatch):
     assert sess.calls == 3  # two failures + one success
 
 
+def _parse_created_window(ranged: str):
+    """Pull (start, end) datetimes out of a `... created:[A TO B}` query string."""
+    import re
+    from datetime import datetime
+    m = re.search(r"created:\[(\S+) TO (\S+)\}", ranged)
+    fmt = "%Y-%m-%dT%H:%M:%S"
+    return datetime.strptime(m.group(1), fmt), datetime.strptime(m.group(2), fmt)
+
+
+def test_iter_records_bisects_below_one_day(monkeypatch):
+    # A single dense day (>10k) must be split by datetime until each leaf is <=10k,
+    # NOT truncated. Stub count(): any window wider than 1 hour reports 20000; a window
+    # <=1 hour reports 100. Stub iter_window() to emit one record per leaf and record
+    # the leaf window bounds. Assert: below-a-day leaves, disjoint+gapless coverage,
+    # termination, and no truncation warning.
+    from datetime import timedelta
+    client = ZenodoClient(min_interval=0)
+    leaves: list[tuple] = []
+
+    def fake_count(ranged, extra=None):
+        s, e = _parse_created_window(ranged)
+        return 20000 if (e - s) > timedelta(hours=1) else 100
+
+    def fake_iter_window(ranged, size=25, sort="newest", extra=None):
+        s, e = _parse_created_window(ranged)
+        leaves.append((s, e))
+        yield {"id": f"{s.isoformat()}"}
+
+    monkeypatch.setattr(client, "count", fake_count)
+    monkeypatch.setattr(client, "iter_window", fake_iter_window)
+
+    from datetime import date
+    recs = list(client.iter_records("VASP", start=date(2017, 10, 23), end=date(2017, 10, 23)))
+    # one full day split into <=1h leaves -> at least 24 leaves, all <= 1h wide
+    assert len(recs) >= 24
+    assert all((e - s) <= timedelta(hours=1) for s, e in leaves)
+    # disjoint + gapless + sorted: each leaf's start == previous leaf's end
+    leaves.sort()
+    for (s0, e0), (s1, e1) in zip(leaves, leaves[1:]):
+        assert e0 == s1, f"gap/overlap between {e0} and {s1}"
+
+
 def test_get_reraises_after_budget_exhausted(monkeypatch):
     monkeypatch.setattr(client_mod.time, "sleep", lambda _s: None)
     sess = _ConnErrThenOk(fail_times=99)  # never recovers

@@ -186,6 +186,46 @@ def test_merge_refuses_locked_source(tmp_path):
     assert not (src / "merged.done").exists()
 
 
+def test_merge_resumes_after_midsource_crash(tmp_path):
+    # Simulate a merge killed AFTER moving some of a source's shards into `into` but
+    # BEFORE its marker was written (the exact stuck state the old code refused with
+    # "missing shard"). A re-run must resume: skip already-moved shards, finish the
+    # rest, append metadata once, and end as a clean bijection.
+    import json as _json
+
+    from zenodo_harvest.dataset_ops import MERGE_PROGRESS
+    from zenodo_harvest.store import _shard_index_of
+
+    dest = tmp_path / "dest"
+    src = tmp_path / "src"
+    _build_calc(dest, "zenodo:1:a/vasprun.xml", ["H2O", "H2"])          # dest -> shard 0,1
+    _build_calc(src, "zenodo:2:b/vasprun.xml", ["Fe", "FeO", "Fe2O3"])  # src  -> shard 0,1
+    dest.mkdir(parents=True, exist_ok=True)
+
+    # Hand-craft the interrupted state: src shard-00000 already moved to dest as
+    # shard-00002 (its reserved new name), src shard-00001 NOT yet moved, marker absent,
+    # progress journal present, and NO source metadata appended to dest yet.
+    src_shards = [p.name for p in existing_shard_paths(src)]
+    assert src_shards == ["shard-00000.extxyz.gz", "shard-00001.extxyz.gz"]
+    start = next_shard_index(dest)  # 2
+    mapping = {"shard-00000.extxyz.gz": f"shard-{start:05d}.extxyz.gz",
+               "shard-00001.extxyz.gz": f"shard-{start+1:05d}.extxyz.gz"}
+    os.replace(src / "shard-00000.extxyz.gz", dest / mapping["shard-00000.extxyz.gz"])  # partial move
+    (src / MERGE_PROGRESS).write_text(_json.dumps({"into": str(dest.resolve()), "mapping": mapping}))
+
+    summary = merge_datasets(dest, [src])
+    assert summary["ok"] is True
+    # resumed: only the one not-yet-moved shard was moved this run
+    assert summary["per_source"][0]["shards_moved_this_run"] == 1
+    assert summary["per_source"][0]["records_appended_this_run"] == 1
+    assert not (src / MERGE_PROGRESS).exists()   # journal cleared on commit
+    assert (src / "merged.done").is_file()
+    # dest now holds a clean bijection with the source's record appended exactly once
+    recs = list(read_jsonl(dest / "metadata.jsonl"))
+    assert sum(1 for r in recs if r["calc_id"] == "zenodo:2:b/vasprun.xml") == 1
+    assert verify_dataset(dest)["ok"] is True
+
+
 def test_merge_rerun_skips_completed_source(tmp_path):
     dest = tmp_path / "dest"
     src = tmp_path / "src"
