@@ -35,12 +35,19 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   - `manifest.py` — JSONL read/append helpers + `RejectionLogger` (auditable dropped-record log).
   - `discover.py` — stage 0: keyword search → deduplicated candidate manifest (dedup by
     `conceptrecid`, newest version wins).
-  - `triage.py` — stage 1: filter candidates; optional `--peek` reads a remote `.zip` central
-    directory over HTTP Range to confirm `vasprun.xml`/`OUTCAR` without downloading the archive.
-  - `fetch.py` — stage 2: download (checksum-verified, resumable, `--max-bytes` capped) and
-    **selectively extract only VASP files** from archives; records availability of heavy files
-    (CHGCAR/WAVECAR/DOSCAR/EIGENVAL/…) without extracting them; skips `.rar`/`.7z` (no portable
-    tooling) with a logged rejection. Emits `fetched.jsonl` (one calc-unit list per record).
+  - `triage.py` — stage 1: filter candidates. `--peek` is **ON by default** — it reads a remote
+    `.zip` central directory over HTTP Range (~tens of KB) to confirm `vasprun.xml`/`OUTCAR`
+    without downloading the archive, and by default **drops** an archive record when a successful
+    peek of every archive proves it holds no VASP (fail-safe: kept if any archive is unpeekable
+    tar/rar/7z, too big, or the peek failed). `--no-peek` disables peeking; `--keep-unconfirmed`
+    peeks-to-upgrade but never drops. Peeking is ~1000× cheaper than a wasted download.
+  - `fetch.py` — stage 2: download (checksum-verified, resumable, `--max-bytes` capped;
+    `--max-bytes 0` = no cap) and **selectively extract only VASP files** from archives; the
+    archive is deleted right after extraction (persistent disk = extracted files, not archives);
+    records availability of heavy files (CHGCAR/WAVECAR/DOSCAR/EIGENVAL/…) without extracting them.
+    `.rar`/`.7z` extract when the `archives` extra (py7zr/rarfile + an `unrar`/`bsdtar` binary) is
+    installed, else a logged rejection. `--max-member-bytes` caps each extracted file. Emits
+    `fetched.jsonl` (one calc-unit list per record).
   - `parse.py` — stage 3: pymatgen `Vasprun` (primary) → per-ionic-step ASE frames; tags each
     frame with *its own* step's electronic convergence bool + magnitude (`scf_dE`), drops steps
     with no recoverable energy, records `run_type`, full INCAR/k-points/POTCAR, availability
@@ -68,7 +75,7 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   python -m zenodo_harvest.cli discover --query VASP --query OUTCAR --max-records 200 \
       --out data/manifests/candidates.jsonl
   python -m zenodo_harvest.cli triage --in data/manifests/candidates.jsonl \
-      --out data/manifests/keep.jsonl --min-rank 3 --peek
+      --out data/manifests/keep.jsonl --min-rank 3          # peek is ON by default
   python -m zenodo_harvest.cli fetch --in data/manifests/keep.jsonl --max-bytes 500000000
   python -m zenodo_harvest.cli parse --in data/manifests/fetched.jsonl
   ```

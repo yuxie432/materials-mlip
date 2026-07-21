@@ -43,7 +43,7 @@ from . import config
 from .client import ZenodoClient
 from .dataset_ops import merge_datasets, purge_raw, split_manifest, verify_dataset
 from .discover import DEFAULT_QUERIES, DEFAULT_RESOURCE_TYPES, discover
-from .fetch import fetch
+from .fetch import DEFAULT_MAX_MEMBER_BYTES, fetch
 from .parse import parse
 from .store import DatasetLockError
 from .triage import triage
@@ -73,10 +73,12 @@ def _add_triage(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--out", dest="out_path", required=True)
     p.add_argument("--min-rank", type=int, default=3,
                    help="4=vasp_direct 3=+archive 2=+processed")
-    p.add_argument("--peek", action="store_true",
-                   help="inspect remote zip central directories (no full download)")
-    p.add_argument("--require-confirmed", action="store_true",
-                   help="drop archive records that peek could not confirm")
+    p.add_argument("--no-peek", dest="peek", action="store_false",
+                   help="disable remote zip central-directory inspection "
+                        "(peek is ON by default — it is ~1000x cheaper than downloading)")
+    p.add_argument("--keep-unconfirmed", dest="require_confirmed", action="store_false",
+                   help="keep archive records even when a successful zip peek proved they "
+                        "contain no VASP (default: drop those to avoid downloading them)")
 
 
 def _add_fetch(sub: argparse._SubParsersAction) -> None:
@@ -87,7 +89,12 @@ def _add_fetch(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--rejections", default=None,
                    help="rejection log path (default: <raw-dir>/../manifests/rejections.jsonl)")
     p.add_argument("--max-bytes", type=int, default=500_000_000,
-                   help="skip any file/archive larger than this (default 500MB)")
+                   help="skip any single file/archive larger than this many bytes; 0 = no cap "
+                        "(default 500MB). Archives are deleted after extraction, so with 0 "
+                        "pipeline fetch->parse->purge-raw in batches to bound transient disk.")
+    p.add_argument("--max-member-bytes", type=int, default=DEFAULT_MAX_MEMBER_BYTES,
+                   help=f"skip any single EXTRACTED file larger than this; 0 = no cap "
+                        f"(default {DEFAULT_MAX_MEMBER_BYTES // 10**9}GB)")
     p.add_argument("--retry-rejected", action="store_true",
                    help="reprocess records previously rejected as terminal (e.g. after raising --max-bytes)")
     p.add_argument("--max-records", type=int, default=None)
@@ -175,10 +182,14 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.cmd == "fetch":
         rejections = args.rejections or str(Path(args.raw_dir).parent / "manifests" / "rejections.jsonl")
+        # 0 => no cap: max_bytes None disables the archive cap; member cap becomes ~unbounded.
+        max_bytes = None if args.max_bytes == 0 else args.max_bytes
+        max_member_bytes = args.max_member_bytes if args.max_member_bytes > 0 else (1 << 62)
         summary = fetch(
             args.in_path, out_path=args.out_path, raw_dir=args.raw_dir,
-            rejections_path=rejections, max_bytes=args.max_bytes,
+            rejections_path=rejections, max_bytes=max_bytes,
             max_records=args.max_records, retry_rejected=args.retry_rejected,
+            max_member_bytes=max_member_bytes,
         )
     elif args.cmd == "parse":
         rejections = args.rejections or str(Path(args.dataset_dir).parent / "manifests" / "rejections.jsonl")

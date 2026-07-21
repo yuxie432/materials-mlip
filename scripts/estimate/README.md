@@ -83,9 +83,10 @@ Prints transfer / staging / dataset size for each cap.
 ## Interpreting + caveats
 
 - **"Relevant" = rank ≥ 3** (`vasp_direct` + `archive`), what triage keeps by
-  default. `archive` records are only *confirmed* to hold VASP at fetch (or via
-  `triage --peek` for `.zip`), so the fetch **yield** (measured in step 3) discounts
-  archives that turn out to hold no parseable primary output.
+  default. `archive` records are only *confirmed* to hold VASP by the default zip
+  peek (or at fetch for tar/rar/7z), so the fetch **yield** (measured in step 3)
+  discounts archives that turn out to hold no parseable primary output. Measured
+  2026-07-21: only ~24% of peekable-zip archives actually contain a vasprun/OUTCAR.
 - **The per-file cap is the dominant storage lever.** Raw bytes are extremely
   heavy-tailed — a handful of multi-GB archives hold most of the volume — so the
   transfer/dataset totals swing by >10× between a 0.5 GB and an uncapped policy.

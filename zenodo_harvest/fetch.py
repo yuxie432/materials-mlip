@@ -554,6 +554,7 @@ def fetch(
     max_records: int | None = None,
     token: str | None = None,
     retry_rejected: bool = False,
+    max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES,
 ) -> dict:
     """Fetch all records in ``in_path`` (a triaged keep-list).
 
@@ -564,6 +565,11 @@ def fetch(
     reprocess previously-rejected records (e.g. after raising ``max_bytes`` or
     installing the ``archives`` extra). ``max_records`` caps records fetched *this
     run* (newly staged), not counting resumed skips.
+
+    ``max_bytes`` caps each downloaded file/archive (``None`` = no cap); the archive
+    is deleted right after its VASP files are extracted, so persistent disk is the
+    extracted files, not the archive. ``max_member_bytes`` caps each single extracted
+    file (guards against decompression bombs / a runaway multi-GB vasprun.xml).
     """
     out_path, raw_dir = Path(out_path), Path(raw_dir)
     rejections_path = Path(rejections_path)
@@ -579,7 +585,7 @@ def fetch(
             if rec["recid"] in done:
                 stats["skipped_existing"] += 1
                 continue
-            entry = fetch_record(rec, session, raw_dir, max_bytes, rej)
+            entry = fetch_record(rec, session, raw_dir, max_bytes, rej, max_member_bytes)
             if entry:
                 out.write(entry)
                 stats["fetched"] += 1

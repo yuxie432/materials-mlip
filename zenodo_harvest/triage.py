@@ -139,28 +139,95 @@ def _zip_vasp_hits(names: list[str]) -> dict[str, list[str]]:
 # Triage driver
 # ---------------------------------------------------------------------------
 
+def _peek_record(rec: dict, session: requests.Session, peek_max_bytes: int,
+                 peek_interval: float, last_peek: float,
+                 stats: dict[str, int]) -> tuple[bool, bool, float]:
+    """Peek a record's ``.zip`` archives, upgrading it in place when VASP is found.
+
+    Peeking a zip reads only its central directory over an HTTP Range request
+    (~tens of KB) — thousands of times cheaper than downloading the whole archive —
+    so it is done by default (mentor/user 2026-07-21). Returns
+    ``(confirmed, negatively_confirmed, last_peek)``:
+
+    * ``confirmed`` — a VASP file was found inside (record upgraded to ``vasp_direct``).
+    * ``negatively_confirmed`` — we obtained a COMPLETE, SUCCESSFUL peek of every
+      archive (all were ``.zip``, all listings read) and none contained any VASP file.
+      This is the only case safe to drop on: it is positive evidence of "no VASP",
+      never a failed/absent peek. False if any archive was unpeekable (tar/rar/7z),
+      any zip lacked a usable download link / exceeded ``peek_max_bytes``, or any peek
+      request failed — in all those cases we keep the record and let fetch decide.
+    """
+    files = rec.get("files", [])
+    archives = [f for f in files if f.get("ext") in ARCHIVE_EXTS]
+    has_unpeekable = any(f.get("ext") in _UNPEEKABLE_ARCHIVE_EXTS for f in archives)
+    peekable_zips = [f for f in archives if f.get("ext") == ".zip"
+                     and f.get("download") and (f.get("size") or 0) <= peek_max_bytes]
+    # a zip we cannot even attempt (no link / too big) is an evidence gap -> keep
+    unknown_zip = any(f.get("ext") == ".zip" and f not in peekable_zips for f in archives)
+
+    peek_failed = False
+    peeked_ok = 0
+    for f in peekable_zips:
+        wait = peek_interval - (time.monotonic() - last_peek)
+        if wait > 0:
+            time.sleep(wait)
+        names = peek_zip_filenames(f["download"], session)
+        last_peek = time.monotonic()
+        stats["peeked"] += 1
+        if names is None:
+            peek_failed = True
+            continue
+        peeked_ok += 1
+        hits = _zip_vasp_hits(names)
+        if hits["vasp_files"]:
+            rec["vasp_files"] = hits["vasp_files"]
+            rec["primary_vasp_files"] = hits["primary_vasp_files"]
+            rec["signals"].append(f"peek confirmed VASP files in {f['key']}")
+            rec["vasp_category"] = "vasp_direct"
+            rec["vasp_rank"] = 4
+            stats["peek_confirmed"] += 1
+            return True, False, last_peek
+
+    negatively_confirmed = (
+        not has_unpeekable and not unknown_zip and not peek_failed
+        and peeked_ok > 0 and peeked_ok == len(archives)
+    )
+    return False, negatively_confirmed, last_peek
+
+
 def triage(
     in_path: str | Path,
     out_path: str | Path,
     min_rank: int = 3,
-    peek: bool = False,
+    peek: bool = True,
     peek_max_bytes: int = 20_000_000_000,
-    require_confirmed: bool = False,
+    require_confirmed: bool = True,
     peek_interval: float = _PEEK_MIN_INTERVAL,
 ) -> dict:
     """Filter candidates to a keep-list.
+
+    Peeking is ON by default and drops archives PROVEN to hold no VASP — because a
+    zip peek costs ~tens of KB (an HTTP Range read of the central directory) while
+    blindly downloading the archive can cost hundreds of MB to many GB. Measured
+    2026-07-21: without this, a full harvest would download tens of thousands of
+    non-VASP archives (worm-tracking, genomes, GC-MS, …) before rejecting them.
 
     Parameters
     ----------
     min_rank:
         Minimum ``vasp_rank`` to keep (4=vasp_direct, 3=archive, 2=processed).
     peek:
-        Attempt remote ZIP central-directory inspection on ``archive`` records.
+        Peek remote ``.zip`` central directories on ``archive`` records (default True;
+        ``--no-peek`` disables). Recall-neutral: it only UPGRADES a record to
+        ``vasp_direct`` when VASP files are found.
     require_confirmed:
-        If True, drop an ``archive`` record that peeking could not confirm — but
-        *only* when every archive in it was peekable (``.zip``). A ``.tar``/``.tar.gz``/
-        ``.rar``/``.7z`` cannot be range-peeked yet fetch can still extract it, so
-        such records are kept (confirmed at download) rather than silently discarded.
+        Default True: DROP an archive record only when peeking gives positive evidence
+        of no VASP — every archive was a peekable ``.zip``, every listing read, and none
+        contained a VASP file (see :func:`_peek_record`). FAIL-SAFE: a record is kept if
+        any archive is unpeekable (tar/rar/7z), any zip could not be fetched/was too big,
+        or any peek request failed — fetch confirms those at download. Set False
+        (``--keep-unconfirmed``) to keep every rank>=min_rank record (peek then only
+        upgrades, never drops). Ignored when ``peek`` is False.
     peek_interval:
         Minimum seconds between successive peek requests (polite spacing; peek Range
         GETs share Zenodo's 30/min search budget, so don't burst them). Set 0 in tests.
@@ -172,39 +239,22 @@ def triage(
 
     kept = 0
     last_peek = 0.0
-    stats: dict[str, int] = {"seen": 0, "kept": 0, "peeked": 0, "peek_confirmed": 0}
+    stats: dict[str, int] = {"seen": 0, "kept": 0, "peeked": 0, "peek_confirmed": 0,
+                             "dropped_no_vasp": 0}
     with out_path.open("w") as out:
         for rec in read_jsonl(in_path):
             stats["seen"] += 1
             if rec["vasp_rank"] < min_rank:
                 continue
             confirmed = bool(rec.get("primary_vasp_files"))
+            negatively_confirmed = False
             if peek and rec["vasp_category"] == "archive" and not confirmed:
-                for f in rec["files"]:
-                    if (f.get("ext") == ".zip") and (f.get("size") or 0) <= peek_max_bytes and f.get("download"):
-                        wait = peek_interval - (time.monotonic() - last_peek)
-                        if wait > 0:
-                            time.sleep(wait)
-                        names = peek_zip_filenames(f["download"], session)
-                        last_peek = time.monotonic()
-                        stats["peeked"] += 1
-                        if names:
-                            hits = _zip_vasp_hits(names)
-                            if hits["vasp_files"]:
-                                rec["vasp_files"] = hits["vasp_files"]
-                                rec["primary_vasp_files"] = hits["primary_vasp_files"]
-                                rec["signals"].append(f"peek confirmed VASP files in {f['key']}")
-                                rec["vasp_category"] = "vasp_direct"
-                                rec["vasp_rank"] = 4
-                                confirmed = bool(hits["primary_vasp_files"])
-                                stats["peek_confirmed"] += 1
-                                break
-            if require_confirmed and rec["vasp_category"] == "archive" and not confirmed:
-                # Only drop if we actually had a chance to confirm: every archive was
-                # peekable (.zip) and came back without VASP files. If any archive is
-                # unpeekable (tar/rar/7z), keep it — fetch confirms it at download.
-                if not any(f.get("ext") in _UNPEEKABLE_ARCHIVE_EXTS for f in rec["files"]):
-                    continue
+                confirmed, negatively_confirmed, last_peek = _peek_record(
+                    rec, session, peek_max_bytes, peek_interval, last_peek, stats)
+            if (require_confirmed and peek and negatively_confirmed
+                    and rec["vasp_category"] == "archive" and not confirmed):
+                stats["dropped_no_vasp"] += 1
+                continue
             out.write(json.dumps(rec) + "\n")
             kept += 1
     stats["kept"] = kept

@@ -37,17 +37,35 @@ logger = logging.getLogger(__name__)
 # tune per harvest. Precision is recovered later in triage + parse. NB: ``q`` is
 # metadata-only (title/description/keywords), never file contents — so we also cast
 # for method/tooling terms and the code's own filenames, which uploaders often name.
+#
+# CRITICAL LESSON (measured 2026-07-21): because the default operator is OR, a query
+# with no explicit boolean is an implicit OR of every word — a precision catastrophe.
+# The old `"ab initio" molecular dynamics forces` meant `"ab initio" OR molecular OR
+# dynamics OR forces` and matched 52,886 datasets (worm-tracking, genomes, GC-MS,
+# craters…), of which VERIFIED 0/54 archives contained any VASP. Likewise the old
+# `MACE OR NequIP OR Allegro OR GAP AND training data` mixed OR/AND with bare acronyms
+# (MACE/GAP are common words) and hit 0% VASP-signal. Both are now explicit-boolean,
+# phrase-anchored forms (measured: 90% and 88% VASP-metadata-signal, resp.). RULE:
+# every multi-word intent must be a quoted phrase and/or joined with explicit AND, and
+# every acronym/framework name must be AND-anchored to a VASP/DFT term. Re-measure any
+# new query with scripts/estimate/ (count + rank>=3 + metadata-signal) before adding it.
 DEFAULT_QUERIES = [
     "VASP",
-    "vasprun.xml",
+    '"vasprun.xml"',                      # quoted: a phrase, not `vasprun OR xml`
     "OUTCAR",
     "INCAR",
     '"projector augmented wave" OR "plane wave" OR PAW',
     '"first principles" AND (energy OR forces OR relaxation OR "molecular dynamics")',
     '"density functional theory" AND (dataset OR trajectory OR forces OR relaxation)',
     '"machine learning" AND (interatomic potential OR force field) AND DFT',
-    "MACE OR NequIP OR Allegro OR GAP AND training data",
-    '"ab initio" molecular dynamics forces',
+    # framework names are strong MLIP signals but common words (MACE=mace/medical,
+    # GAP=band gap); AND-anchor them to a VASP/DFT/training term. "GAP" as a bare token
+    # is dropped (too noisy) in favour of the unambiguous full name.
+    '(MACE OR NequIP OR Allegro OR "Gaussian approximation potential") '
+    'AND (VASP OR DFT OR forces OR "training data")',
+    # ab-initio MD: the exact phrase (or the AIMD acronym) AND a VASP/output anchor —
+    # NOT the old bare-OR flood.
+    '("ab initio molecular dynamics" OR AIMD) AND (VASP OR forces OR OUTCAR)',
     'phonon AND (DFT OR VASP OR "first principles")',
     '"formation energy" AND (DFT OR VASP OR "first principles")',
 ]

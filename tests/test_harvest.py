@@ -276,6 +276,95 @@ def test_peek_retries_on_429_then_succeeds(monkeypatch):
     assert got is not None and set(got) == set(names)
 
 
+# --------------------------------------------------------------------------- #
+# triage driver — peek ON by default + FAIL-SAFE drop of proven-no-VASP zips   #
+# (peeking a zip's central directory costs ~KB; downloading it costs MB–GB, so #
+#  peek is default and a positive "no VASP" peek drops the record before fetch) #
+# --------------------------------------------------------------------------- #
+
+def _cand(recid, files, category="archive", rank=3, primary=None):
+    return {"recid": str(recid), "conceptrecid": str(recid), "vasp_category": category,
+            "vasp_rank": rank, "primary_vasp_files": primary or [], "vasp_files": [],
+            "archives": [f["key"] for f in files], "processed_files": [], "signals": [],
+            "files": files}
+
+
+def _zipfile(key, size=1000):
+    return {"key": key, "ext": ".zip", "size": size, "download": f"http://x/{key}"}
+
+
+def _write_manifest(tmp_path, cands):
+    p = tmp_path / "cands.jsonl"
+    p.write_text("".join(json.dumps(c) + "\n" for c in cands))
+    return p
+
+
+def _patch_peek(monkeypatch, mapping):
+    """Patch triage.peek_zip_filenames to return mapping[url] (list, [], or None)."""
+    monkeypatch.setattr(triage_mod, "peek_zip_filenames",
+                        lambda url, session=None, tail=65_536: mapping.get(url))
+    monkeypatch.setattr(triage_mod.time, "sleep", lambda _s: None)
+
+
+def test_triage_peek_upgrades_and_keeps_vasp_zip(tmp_path, monkeypatch):
+    _patch_peek(monkeypatch, {"http://x/d.zip": ["run/vasprun.xml", "run/OUTCAR"]})
+    src = _write_manifest(tmp_path, [_cand(1, [_zipfile("d.zip")])])
+    out = tmp_path / "keep.jsonl"
+    stats = triage_mod.triage(src, out, peek_interval=0)
+    assert stats["kept"] == 1 and stats["peek_confirmed"] == 1 and stats["dropped_no_vasp"] == 0
+    kept = json.loads(out.read_text())
+    assert kept["vasp_category"] == "vasp_direct" and kept["primary_vasp_files"]
+
+
+def test_triage_drops_zip_proven_no_vasp(tmp_path, monkeypatch):
+    # zip peeked OK, contains no VASP file at all -> positive evidence -> DROP by default.
+    _patch_peek(monkeypatch, {"http://x/d.zip": ["data/foo.csv", "readme.txt"]})
+    src = _write_manifest(tmp_path, [_cand(1, [_zipfile("d.zip")])])
+    out = tmp_path / "keep.jsonl"
+    stats = triage_mod.triage(src, out, peek_interval=0)
+    assert stats["kept"] == 0 and stats["dropped_no_vasp"] == 1
+
+
+def test_triage_failsafe_keeps_on_peek_failure(tmp_path, monkeypatch):
+    # peek returns None (throttled/ZIP64/network) -> NOT positive evidence -> KEEP.
+    _patch_peek(monkeypatch, {"http://x/d.zip": None})
+    src = _write_manifest(tmp_path, [_cand(1, [_zipfile("d.zip")])])
+    out = tmp_path / "keep.jsonl"
+    stats = triage_mod.triage(src, out, peek_interval=0)
+    assert stats["kept"] == 1 and stats["dropped_no_vasp"] == 0
+
+
+def test_triage_failsafe_keeps_when_unpeekable_archive_present(tmp_path, monkeypatch):
+    # a .tar.gz can't be range-peeked; even if the sibling zip has no VASP, keep the
+    # record (fetch confirms the tar at download) rather than dropping blind.
+    _patch_peek(monkeypatch, {"http://x/d.zip": ["notes.txt"]})
+    files = [_zipfile("d.zip"), {"key": "e.tar.gz", "ext": ".tar.gz", "size": 10,
+                                 "download": "http://x/e.tar.gz"}]
+    src = _write_manifest(tmp_path, [_cand(1, files)])
+    out = tmp_path / "keep.jsonl"
+    stats = triage_mod.triage(src, out, peek_interval=0)
+    assert stats["kept"] == 1 and stats["dropped_no_vasp"] == 0
+
+
+def test_triage_keep_unconfirmed_disables_drop(tmp_path, monkeypatch):
+    _patch_peek(monkeypatch, {"http://x/d.zip": ["data/foo.csv"]})
+    src = _write_manifest(tmp_path, [_cand(1, [_zipfile("d.zip")])])
+    out = tmp_path / "keep.jsonl"
+    stats = triage_mod.triage(src, out, require_confirmed=False, peek_interval=0)
+    assert stats["kept"] == 1 and stats["dropped_no_vasp"] == 0
+
+
+def test_triage_no_peek_keeps_all_without_network(tmp_path, monkeypatch):
+    # peek=False must not call peek_zip_filenames at all, and keeps every rank>=min.
+    def _boom(*a, **k):
+        raise AssertionError("peek must not run when peek=False")
+    monkeypatch.setattr(triage_mod, "peek_zip_filenames", _boom)
+    src = _write_manifest(tmp_path, [_cand(1, [_zipfile("d.zip")])])
+    out = tmp_path / "keep.jsonl"
+    stats = triage_mod.triage(src, out, peek=False, peek_interval=0)
+    assert stats["kept"] == 1 and stats["peeked"] == 0
+
+
 class _ConnErrThenOk:
     """Raises ConnectionError ``fail_times`` times, then returns a 200 JSON body."""
 
