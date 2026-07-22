@@ -45,8 +45,9 @@ Fixed queries → **925 unique concepts** (gates dropped 75 non-open, 58 NC/ND/n
 | `unlikely` | 224 | no VASP/archive/atomistic files |
 
 → **Relevant (rank ≥ 3) = 629**, raw **2.21 TB**. By format (uncapped download): zip
-1.38 TB, tar 537 GB, direct 28 GB, rar 24 GB, 7z 8 GB (**rar+7z ≈ 31 GB across all of
-Zenodo — now extractable, `archives` extra installed**).
+1.37 TB, tar 540 GB, **zst 108 GB**, direct 28 GB, rar 24 GB, 7z 8 GB (**rar/7z/zst all
+now extractable via the `archives` extra**). NB the `.tar.zst`/`.zst` line was previously
+**missing from the download census and un-fetchable** — see "Corrections" below.
 
 ## Precision — how much *actually* has a parseable VASP output
 
@@ -79,8 +80,8 @@ no-cap fetch+parse on CSD3 nails the exact number.
 |---|---|
 | 0.5 GB | 82 GB |
 | 2 GB | 275 GB |
-| 10 GB | 855 GB |
-| uncapped (`--max-bytes 0`) | 1.96 TB |
+| 10 GB | 864 GB |
+| uncapped (`--max-bytes 0`) | 2.06 TB |
 
 With **peek ON (now default)** the ~76% of zips proven non-VASP are dropped *before*
 download, so real transfer is well below these gross figures.
@@ -104,7 +105,40 @@ storage, and archives are deleted on extraction, so with peek-filtering + period
   extracted staging never accumulates.
 - Run the exact full census + a larger no-cap storage sample on CSD3 (`README.md`).
 
+## Corrections (2026-07-22 codebase review)
+
+A review for systematic data-miss bugs found and fixed three:
+
+1. **`.zst`/`.tar.zst` archives were silently unreachable.** `models.ARCHIVE_EXTS`
+   classified them as `archive` (so they counted toward the 629 + 2.21 TB), but
+   `fetch._is_archive` did not recognise them, so fetch downloaded nothing and rejected
+   the record as `no_vasp_files_fetched`. This lost **≥4 relevant records / ~113 GB**
+   whose names (`training_data.tar.zst`, `dft-reference-elfs-…tar.zst`,
+   `…vasp_data.z0N`, `mc_traj.tar.zst`) indicate real VASP/DFT content — and it
+   under-counted the download census by ~108 GB. **Fixed:** fetch now streams
+   `.tar.zst`/`.tzst`/bare-`.zst` through `zstandard`+`tarfile` (added to the `archives`
+   extra); split/spanned parts (`.z0N`) now emit a visible `archive_multipart_unsupported`
+   rejection instead of vanishing.
+2. **Nested-archive false negative in triage.** A peekable `.zip` containing only a
+   *nested* archive (whose members the central-directory peek can't see) and no visible
+   `vasprun`/`OUTCAR` was "negatively confirmed" and **dropped**. **Fixed:** a peeked zip
+   holding a nested archive is now an evidence gap (kept for fetch to decide).
+3. **Storage-sample size bias.** `sample_storage.py`'s budget filter walked
+   size-ascending and skipped over-budget records, dropping the entire large-size tail —
+   biasing yield and frames/record *down* (both rise with archive size). **Fixed:** the
+   sample is now thinned evenly across the size range, drops only the few largest that
+   overflow the hard budget, and reports what the budget cost.
+
 ## Caveats
 
-Recall ceiling (metadata-only); `processed_atomistic` not ingested; single-day >10k
-window truncation in exhaustive discovery; tar/rar/7z confirmable only at download.
+Recall ceiling (metadata-only); `type=dataset` filter excludes ~24% of clean
+VASP-metadata records (software/publication/other — see the recall note below);
+`processed_atomistic` (51 rec / 95 GB) not ingested; single-day >10k window truncation
+in exhaustive discovery (moot for the current small precise queries); tar/rar/7z/zst
+confirmable only at download; multi-part spanned archives not reassembled.
+
+**Bigger picture:** Zenodo is the *long tail* of DFT data (paper-attached deposits). The
+large reusable VASP corpora live in dedicated repositories — Materials Project, NOMAD,
+OQMD, AFLOW, Materials Cloud — which dwarf Zenodo by orders of magnitude. If the goal is
+dataset *volume*, adding one of those sources will move the needle far more than any
+Zenodo-side recall tweak.

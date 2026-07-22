@@ -11,7 +11,7 @@ dependencies = ["requests>=2.31"]
 parse = ["pymatgen>=2026.5.4", "ase>=3.25"]
 parquet = ["pyarrow>=15"]
 # optional archive backends; rarfile also needs an `unrar`/`bsdtar` binary on PATH
-archives = ["py7zr>=0.21", "rarfile>=4"]
+archives = ["py7zr>=0.21", "rarfile>=4", "zstandard>=0.21"]
 dev = ["ruff", "mypy", "pytest", "types-requests"]
 
 [project.scripts]

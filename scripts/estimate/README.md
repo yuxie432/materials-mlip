@@ -42,10 +42,12 @@ sbatch scripts/estimate/slurm_discover.sh          # or run in tmux on a login n
 
 Enumerates **all** default queries with recursive date-bisection past the 10k
 window. Serial + polite (~30 req/min even with a token — more cores do not help).
-**Resumable**: resubmit and it continues from the sidecar checkpoint. Expect
-~1–2 h, dominated by the one broad `"ab initio" molecular dynamics forces` query
-(OR-default → ~53k hits; the 11 precise queries together are <2k and finish in
-minutes).
+**Resumable**: resubmit and it continues from the sidecar checkpoint. With the
+current (fixed, explicit-boolean) default queries the whole enumeration is small —
+the largest single query is `VASP` at ~330 dataset hits and the full deduped census
+is <1k concepts, so a windowed (non-`--exhaustive`) run already captures everything
+and `--exhaustive` finishes in minutes. (The old bare-OR `"ab initio" molecular
+dynamics forces` query that used to flood ~53k junk hits has been removed.)
 
 Output: `…/manifests/candidates_full.jsonl` (deduplicated, classified, gated).
 

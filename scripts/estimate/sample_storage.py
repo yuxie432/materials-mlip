@@ -19,6 +19,13 @@ Reports (written to <workdir>/ratios.json):
 
 Selection is stratified across the relevant set by raw record size (deterministic,
 no RNG) so a modest sample spans small single-points through large trajectories.
+Two representativeness limits to keep in mind when reading the ratios:
+  * only records with at least one *sub-cap* downloadable file enter the sample, so a
+    record whose sole payload is a single >``--cap-gb`` archive is invisible here —
+    raise the cap to fold those in (they hold the longest trajectories);
+  * the ``--max-total-gb`` budget can force dropping the largest sampled records; the
+    run reports how many, and yield/frames/record both rise with size, so a
+    budget-truncated sample UNDER-states them. Prefer the largest budget you can afford.
 
 Usage:
     python sample_storage.py MANIFEST WORKDIR [--n 60] [--cap-gb 2] [--max-total-gb 40]
@@ -105,23 +112,44 @@ def main() -> None:
     else:
         picks = recs
 
-    # respect a total-download budget
+    # Respect a total-download budget WITHOUT biasing the sample toward small records.
+    # The old loop walked size-ascending and skipped any record that would exceed the
+    # budget -- but because picks are size-sorted, that dropped the entire large-size
+    # tail, and both frames/record and fetch yield RISE with archive size (big archives
+    # hold long trajectories + full run directories). So instead thin the evenly-strided
+    # picks down evenly across the whole size range, then drop only the few largest that
+    # still overflow the hard ceiling -- and report exactly what the budget cost.
     budget = int(args.max_total_gb * GB)
-    chosen, running = [], 0
-    for r in picks:
-        p = download_payload(r, cap)
-        if running + p > budget:
-            continue
-        chosen.append(r)
-        running += p
-    picks = chosen
+
+    def _total(sel: list[dict]) -> int:
+        return sum(download_payload(r, cap) for r in sel)
+
+    n_before = len(picks)
+    if _total(picks) > budget and picks:
+        frac = budget / _total(picks)
+        k = max(1, int(len(picks) * frac))
+        step = len(picks) / k
+        idx = sorted({int(i * step) for i in range(k)})
+        picks = [picks[i] for i in idx]
+        # enforce the hard ceiling by dropping the single largest offenders (logged)
+        while len(picks) > 1 and _total(picks) > budget:
+            j = max(range(len(picks)), key=lambda i: download_payload(picks[i], cap))
+            picks.pop(j)
+    running = _total(picks)
+    n_dropped = n_before - len(picks)
 
     keep = work / "keep_sample.jsonl"
     with keep.open("w") as fh:
         for r in picks:
             fh.write(json.dumps(r) + "\n")
-    echo(f"sample: {len(picks)} rank>=3 records; intended download ~{running/GB:.1f} GB "
-         f"(cap {args.cap_gb:g} GB/file)")
+    sizes_gb = [download_payload(r, cap) / GB for r in picks]
+    echo(f"sample: {len(picks)} rank>=3 records (dropped {n_dropped} to fit budget); "
+         f"intended download ~{running/GB:.1f} GB (cap {args.cap_gb:g} GB/file); "
+         f"per-record dl range {min(sizes_gb):.2f}-{max(sizes_gb):.2f} GB" if sizes_gb
+         else "sample: 0 records")
+    if n_dropped:
+        echo(f"  NB budget ({args.max_total_gb:g} GB) forced dropping {n_dropped} "
+             f"record(s); raise --max-total-gb for a less size-truncated sample.")
 
     raw, ds = work / "raw", work / "dataset"
     fetched, rej = work / "fetched.jsonl", work / "rejections.jsonl"

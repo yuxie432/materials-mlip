@@ -23,7 +23,7 @@ import requests
 
 from .client import _parse_retry_after
 from .manifest import read_jsonl
-from .models import ARCHIVE_EXTS, VASP_PRIMARY, _VASP_RE
+from .models import ARCHIVE_EXTS, VASP_PRIMARY, _ext, _VASP_RE
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +124,7 @@ def peek_zip_filenames(url: str, session: requests.Session | None = None, tail: 
 
 
 def _zip_vasp_hits(names: list[str]) -> dict[str, list[str]]:
-    vasp, primary = [], []
+    vasp, primary, nested = [], [], []
     for n in names:
         base = n.rsplit("/", 1)[-1]
         m = _VASP_RE.search(base)
@@ -132,7 +132,12 @@ def _zip_vasp_hits(names: list[str]) -> dict[str, list[str]]:
             vasp.append(n)
             if m.group(1).lower() in VASP_PRIMARY:
                 primary.append(n)
-    return {"vasp_files": vasp, "primary_vasp_files": primary}
+        # A nested archive (a .tar.gz/.zip/… *inside* the peeked zip) hides its own
+        # listing from the central-directory peek, so "no VASP name visible" is NOT
+        # proof of no VASP — see _peek_record, which refuses to negatively-confirm.
+        if _ext(base) in ARCHIVE_EXTS:
+            nested.append(n)
+    return {"vasp_files": vasp, "primary_vasp_files": primary, "nested_archives": nested}
 
 
 # ---------------------------------------------------------------------------
@@ -154,8 +159,10 @@ def _peek_record(rec: dict, session: requests.Session, peek_max_bytes: int,
       archive (all were ``.zip``, all listings read) and none contained any VASP file.
       This is the only case safe to drop on: it is positive evidence of "no VASP",
       never a failed/absent peek. False if any archive was unpeekable (tar/rar/7z),
-      any zip lacked a usable download link / exceeded ``peek_max_bytes``, or any peek
-      request failed — in all those cases we keep the record and let fetch decide.
+      any zip lacked a usable download link / exceeded ``peek_max_bytes``, any peek
+      request failed, or any peeked zip held a *nested* archive (whose contents the
+      central-directory peek cannot see) — in all those cases we keep the record and
+      let fetch decide.
     """
     files = rec.get("files", [])
     archives = [f for f in files if f.get("ext") in ARCHIVE_EXTS]
@@ -166,6 +173,7 @@ def _peek_record(rec: dict, session: requests.Session, peek_max_bytes: int,
     unknown_zip = any(f.get("ext") == ".zip" and f not in peekable_zips for f in archives)
 
     peek_failed = False
+    saw_nested = False
     peeked_ok = 0
     for f in peekable_zips:
         wait = peek_interval - (time.monotonic() - last_peek)
@@ -187,9 +195,11 @@ def _peek_record(rec: dict, session: requests.Session, peek_max_bytes: int,
             rec["vasp_rank"] = 4
             stats["peek_confirmed"] += 1
             return True, False, last_peek
+        if hits["nested_archives"]:
+            saw_nested = True  # peek can't see inside a nested archive -> evidence gap
 
     negatively_confirmed = (
-        not has_unpeekable and not unknown_zip and not peek_failed
+        not has_unpeekable and not unknown_zip and not peek_failed and not saw_nested
         and peeked_ok > 0 and peeked_ok == len(archives)
     )
     return False, negatively_confirmed, last_peek

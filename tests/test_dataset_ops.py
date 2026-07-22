@@ -194,7 +194,6 @@ def test_merge_resumes_after_midsource_crash(tmp_path):
     import json as _json
 
     from zenodo_harvest.dataset_ops import MERGE_PROGRESS
-    from zenodo_harvest.store import _shard_index_of
 
     dest = tmp_path / "dest"
     src = tmp_path / "src"

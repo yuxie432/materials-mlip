@@ -50,6 +50,10 @@ try:
     import rarfile  # type: ignore
 except ImportError:  # pragma: no cover - optional dep
     rarfile = None  # type: ignore
+try:
+    import zstandard  # type: ignore
+except ImportError:  # pragma: no cover - optional dep
+    zstandard = None  # type: ignore
 
 # Per-member *uncompressed* size cap: bounds disk and defuses decompression bombs
 # (the archive-level max_bytes only caps the *compressed* download). Extraction
@@ -87,6 +91,15 @@ _AVAILABILITY = {
 }
 
 _TAR_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")
+# zstd-compressed tarballs: common for large ML/DFT datasets (measured on Zenodo:
+# ~100+ GB of `.tar.zst` VASP training data). tarfile gained native `r:zst` only in
+# CPython 3.14, so we decompress via the `zstandard` lib (the `archives` extra) and
+# stream the result through tarfile — see `_extract_tar_zst`.
+_ZST_TAR_SUFFIXES = (".tar.zst", ".tzst")
+# Split/spanned archive part names (`foo.z01`, `foo.z02`, …). The stdlib cannot
+# reassemble a multi-volume zip, so these are surfaced as an explicit rejection
+# rather than silently ignored (which looked like "record had no VASP").
+_MULTIPART_RE = re.compile(r"\.(z\d{2}|r\d{2}|part\d+\.rar)$", re.IGNORECASE)
 
 
 def _session(token: str | None) -> requests.Session:
@@ -293,7 +306,51 @@ def _extract_7z(path: Path, dest: Path, member_cap: int) -> tuple[list[str], lis
     return names, extracted
 
 
-_EXTRACTORS = {"zip": _extract_zip, "tar": _extract_tar, "rar": _extract_rar, "sevenzip": _extract_7z}
+def _extract_tar_zst(path: Path, dest: Path, member_cap: int) -> tuple[list[str], list[str]]:
+    """Extract VASP files from a zstd-compressed tarball (``.tar.zst``/``.tzst``).
+
+    Streams the decompressed bytes through ``tarfile`` in streaming (``r|``) mode so
+    peak memory/disk stays ~chunk-sized regardless of the (often huge) decompressed
+    size — the same selective, cap-guarded, zip-slip-safe extraction as ``_extract_tar``.
+    """
+    extracted: list[str] = []
+    names: list[str] = []
+    dctx = zstandard.ZstdDecompressor()  # type: ignore[union-attr]
+    with path.open("rb") as fh, dctx.stream_reader(fh) as reader:
+        # streaming tar: members arrive in order; extractfile() works on the current one.
+        with tarfile.open(fileobj=reader, mode="r|") as tf:
+            for member in tf:
+                names.append(member.name)
+                if not member.isfile():
+                    continue
+                base = member.name.rsplit("/", 1)[-1]
+                if not _PARSE_RE.search(base):
+                    continue
+                out = dest / member.name
+                if not _is_within(dest, out):
+                    continue
+                if member.size > member_cap:
+                    logger.warning("skip oversized member %s (%d B) in %s", base, member.size, path.name)
+                    continue
+                src = tf.extractfile(member)
+                if src is None:
+                    continue
+                if _copy_capped(src, out, member_cap):
+                    extracted.append(member.name)
+    return names, extracted
+
+
+_EXTRACTORS = {"zip": _extract_zip, "tar": _extract_tar, "rar": _extract_rar,
+               "sevenzip": _extract_7z, "tarzst": _extract_tar_zst}
+
+# Exceptions a bad/truncated archive can raise across all backends — caught per
+# archive so one corrupt file rejects just that file, not the whole run. The zstd
+# backend adds its own error type when installed.
+_EXTRACT_ERRORS: tuple[type[BaseException], ...] = (
+    zipfile.BadZipFile, tarfile.TarError, EOFError, OSError, ValueError,
+)
+if zstandard is not None:  # pragma: no branch - trivial
+    _EXTRACT_ERRORS = (*_EXTRACT_ERRORS, zstandard.ZstdError)
 
 
 def _is_archive(name: str) -> str | None:
@@ -306,6 +363,14 @@ def _is_archive(name: str) -> str | None:
         return "rar"
     if low.endswith(".7z"):
         return "sevenzip"
+    if low.endswith(_ZST_TAR_SUFFIXES):
+        return "tarzst"
+    if low.endswith(".zst"):
+        # A bare `.zst` is ambiguous: a single compressed VASP file (``OUTCAR.zst``)
+        # stays a direct-file download (handled by _PARSE_RE below); anything else is
+        # treated as a zstd tarball (``Research_Data.zst`` etc. seen on Zenodo).
+        stem = low[:-4].rsplit("/", 1)[-1]
+        return None if _PARSE_RE.search(stem) else "tarzst"
     # A single gzipped file (e.g. OUTCAR.gz) is not an archive to unpack; it is
     # handled by the _PARSE_RE / availability branches in fetch_record.
     return None
@@ -315,7 +380,7 @@ def _archive_subdir(base: str) -> str:
     """A filesystem-safe per-archive extraction subdir (avoids cross-archive
     member-path collisions when one record ships multiple archives)."""
     stem = base
-    for suf in (*_TAR_SUFFIXES, ".zip", ".rar", ".7z"):
+    for suf in (*_TAR_SUFFIXES, *_ZST_TAR_SUFFIXES, ".zip", ".rar", ".7z", ".zst"):
         if stem.lower().endswith(suf):
             stem = stem[: -len(suf)]
             break
@@ -435,8 +500,23 @@ def fetch_record(rec: dict, session: requests.Session, raw_dir: Path,
         base = (key or "").rsplit("/", 1)[-1]
         kind = _is_archive(base)
 
-        if kind in ("rar", "sevenzip") and (
-                (kind == "rar" and rarfile is None) or (kind == "sevenzip" and py7zr is None)):
+        # A split/spanned archive part (foo.z01, foo.r01, foo.partN.rar) cannot be
+        # reassembled by the stdlib. Surface it explicitly instead of letting it fall
+        # through to the availability branch (which silently produced no VASP files and
+        # looked like "record had no VASP").
+        if kind is None and _MULTIPART_RE.search(base):
+            rej.reject("fetch", f"{recid}:{key}", "archive_multipart_unsupported",
+                       detail="split/spanned archive; not reassembled")
+            continue
+
+        # Optional-backend archives: skip cleanly (visible rejection) when the backing
+        # library isn't installed, rather than silently dropping the record's data.
+        _missing_backend = (
+            (kind == "rar" and rarfile is None)
+            or (kind == "sevenzip" and py7zr is None)
+            or (kind == "tarzst" and zstandard is None)
+        )
+        if _missing_backend:
             rej.reject("fetch", f"{recid}:{key}", "archive_unsupported",
                        format=base.rsplit(".", 1)[-1], detail="install the 'archives' extra")
             continue
@@ -455,7 +535,7 @@ def fetch_record(rec: dict, session: requests.Session, raw_dir: Path,
             extract_dir = dest / "extracted" / _archive_subdir(base)
             try:
                 names, extracted = _EXTRACTORS[kind](arc, extract_dir, max_member_bytes)
-            except (zipfile.BadZipFile, tarfile.TarError, EOFError, OSError, ValueError) as exc:
+            except _EXTRACT_ERRORS as exc:
                 rej.reject("fetch", f"{recid}:{key}", "extract_error",
                            detail=f"{type(exc).__name__}: {exc}")
                 arc.unlink(missing_ok=True)

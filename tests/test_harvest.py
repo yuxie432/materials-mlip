@@ -28,11 +28,14 @@ from zenodo_harvest import fetch as fetch_mod
 from zenodo_harvest import triage as triage_mod
 from zenodo_harvest.client import ZenodoClient, _parse_retry_after
 from zenodo_harvest.fetch import (
+    _MULTIPART_RE,
     _PARSE_RE,
     _archive_subdir,
     _extract_tar,
+    _extract_tar_zst,
     _extract_zip,
     _find_calc_units,
+    _is_archive,
     _unit_role,
     _unit_tag,
     download_file,
@@ -956,6 +959,52 @@ def test_extract_tar_skips_slip_and_oversize_keeps_good(tmp_path):
     assert not (dest / "toobig" / "vasprun.xml").exists()
     assert not (tmp_path / "evil_OUTCAR").exists()
     assert not (dest.parent / "evil_OUTCAR").exists()
+
+
+def _tar_zst_bytes(items):
+    """Build an in-memory zstd-compressed tar from ``[(name, content), ...]``."""
+    import zstandard
+    return zstandard.ZstdCompressor().compress(_tar_bytes(items))
+
+
+def test_is_archive_recognizes_zstd_tarballs_and_bare_zst():
+    assert _is_archive("training_data.tar.zst") == "tarzst"
+    assert _is_archive("run.tzst") == "tarzst"
+    assert _is_archive("Research_Data.zst") == "tarzst"      # bare .zst, non-VASP stem
+    # a single compressed VASP file stays a direct download, NOT a tarball
+    assert _is_archive("OUTCAR.zst") is None
+    assert _is_archive("vasprun.xml.zst") is None
+    # unchanged behaviour for the other formats
+    assert _is_archive("a.zip") == "zip"
+    assert _is_archive("a.tar.gz") == "tar"
+    assert _is_archive("a.7z") == "sevenzip"
+    assert _is_archive("plain.txt") is None
+
+
+def test_extract_tar_zst_roundtrip_skips_slip_and_oversize(tmp_path):
+    # Regression: `.tar.zst` archives were discovered as `archive` but fetch never
+    # unpacked them (silent data miss of ~100+ GB of VASP data on Zenodo).
+    arc = tmp_path / "a.tar.zst"
+    arc.write_bytes(_tar_zst_bytes(_EXTRACT_ITEMS))
+    dest = tmp_path / "extracted"
+    names, extracted = _extract_tar_zst(arc, dest, _MEMBER_CAP)
+    assert extracted == ["good/OUTCAR"]
+    assert (dest / "good" / "OUTCAR").read_bytes() == _GOOD
+    assert not (dest / "toobig" / "vasprun.xml").exists()     # oversized skipped
+    assert not (tmp_path / "evil_OUTCAR").exists()            # traversal target never written
+
+
+def test_archive_subdir_strips_zstd_suffixes():
+    assert _archive_subdir("training_data.tar.zst") == "training_data"
+    assert _archive_subdir("run.tzst") == "run"
+    assert _archive_subdir("Research_Data.zst") == "Research_Data"
+
+
+def test_multipart_regex_matches_split_archive_parts():
+    for name in ["vasp_data.z01", "vasp_data.z09", "data.r01", "big.part1.rar"]:
+        assert _MULTIPART_RE.search(name), name
+    for name in ["data.zip", "data.7z", "OUTCAR", "notes.z1"]:  # z1 is not a 2-digit part
+        assert _MULTIPART_RE.search(name) is None, name
 
 
 def test_archive_subdir_strips_suffix_and_sanitizes():
