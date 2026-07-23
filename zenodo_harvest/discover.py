@@ -37,48 +37,69 @@ logger = logging.getLogger(__name__)
 # tune per harvest. Precision is recovered later in triage + parse. NB: ``q`` is
 # metadata-only (title/description/keywords), never file contents — so we also cast
 # for method/tooling terms and the code's own filenames, which uploaders often name.
-#
-# CRITICAL LESSON (measured 2026-07-21): because the default operator is OR, a query
-# with no explicit boolean is an implicit OR of every word — a precision catastrophe.
-# The old `"ab initio" molecular dynamics forces` meant `"ab initio" OR molecular OR
-# dynamics OR forces` and matched 52,886 datasets (worm-tracking, genomes, GC-MS,
-# craters…), of which VERIFIED 0/54 archives contained any VASP. Likewise the old
-# `MACE OR NequIP OR Allegro OR GAP AND training data` mixed OR/AND with bare acronyms
-# (MACE/GAP are common words) and hit 0% VASP-signal. Both are now explicit-boolean,
-# phrase-anchored forms (measured: 90% and 88% VASP-metadata-signal, resp.). RULE:
-# every multi-word intent must be a quoted phrase and/or joined with explicit AND, and
-# every acronym/framework name must be AND-anchored to a VASP/DFT term. Re-measure any
-# new query with scripts/estimate/ (count + rank>=3 + metadata-signal) before adding it.
-DEFAULT_QUERIES = [
-    "VASP",
-    '"vasprun.xml"',                      # quoted: a phrase, not `vasprun OR xml`
-    "OUTCAR",
-    "INCAR",
-    '"projector augmented wave" OR "plane wave" OR PAW',
-    '"first principles" AND (energy OR forces OR relaxation OR "molecular dynamics")',
-    '"density functional theory" AND (dataset OR trajectory OR forces OR relaxation)',
-    '"machine learning" AND (interatomic potential OR force field) AND DFT',
-    # framework names are strong MLIP signals but common words (MACE=mace/medical,
-    # GAP=band gap); AND-anchor them to a VASP/DFT/training term. "GAP" as a bare token
-    # is dropped (too noisy) in favour of the unambiguous full name.
-    '(MACE OR NequIP OR Allegro OR "Gaussian approximation potential") '
-    'AND (VASP OR DFT OR forces OR "training data")',
-    # ab-initio MD: the exact phrase (or the AIMD acronym) AND a VASP/output anchor —
-    # NOT the old bare-OR flood.
-    '("ab initio molecular dynamics" OR AIMD) AND (VASP OR forces OR OUTCAR)',
-    'phonon AND (DFT OR VASP OR "first principles")',
-    '"formation energy" AND (DFT OR VASP OR "first principles")',
-]
 
-# Resource types worth scanning by default — a *quality-leaning* prior, not maximal
-# recall. Only `dataset` (curated research data) by default. Measured 2026-07-20:
-# `dataset` yields ~40% useful VASP records (60% of its archives peek-confirm VASP);
-# `other` yields only ~3.5% (77% of it is "unlikely" — no VASP/archive files at all),
-# so it was DROPPED (mentor decision). Also EXCLUDED: `software` (mostly toy/tutorial
-# runs) and `publication` (mostly PDFs; real data is re-deposited as its own dataset).
-# All three remain one `--resource-type` flag away when you want to widen. Whatever is
-# scanned, `resource_type` is recorded in the metadata so a training set can be
-# filtered/weighted by source (alongside the convergence / ENCUT / k-point tags).
+_COMPUTATION_CHUNKS = (
+    '(DFT OR GGA OR LDA OR "Hubbard U" OR "molecular dynamics" OR AIMD OR relaxation '
+    'OR "density functional theory" OR ase OR "geometry optimization" '
+    'OR forces OR "potential energy surface")',
+    '("transition state" OR "first principles" OR "first-principles" OR "ab initio" OR "ab-initio" '
+    'OR "force field" OR NEB OR "nudged elastic band" OR "energy convergence" OR "force convergence" '
+    'OR "Born-Oppenheimer" OR "self-consistent field" OR "SCF convergence")',
+)
+
+_MLIP_CHUNKS = (
+    '(MACE OR NequIP OR Allegro OR "Gaussian approximation potential" OR DeePMD OR "Deep Potential" '
+    'OR n2p2 OR SchNet OR PaiNN OR CHGNet OR M3GNet OR SevenNet OR MatterSim '
+    'OR "moment tensor potential" OR "neural network potential" OR NNP)',
+    '("machine learning potential" OR "machine-learned potential" OR "interatomic potential" '
+    'OR "machine learning interatomic potential" OR MLIP OR "atomic cluster expansion" '
+    'OR "training data" OR "training set" OR "training dataset" OR "training datasets" '
+    'OR "foundation model" OR "active learning" OR "universal potential" OR "pre-training" '
+    'OR "post-training" OR "fine-tuning")',
+)
+
+_MATERIALS_CHUNKS = (
+    '(materials OR material OR "materials science" OR "condensed matter" OR crystal OR crystalline '
+    'OR "crystal structure" OR lattice OR "unit cell" OR supercell OR polymorph OR "phase diagram" '
+    'OR "phase transition" OR amorphous)',
+    '(defect OR vacancy OR interstitial OR substitutional OR dislocation OR phonon OR exciton '
+    'OR "band gap" OR bandgap OR "band structure" OR "Brillouin zone" OR "density of states" '
+    'OR "Fermi level" OR "Fermi energy")',
+    '(doping OR dopant OR semiconductor OR insulator OR metallic OR alloy OR intermetallic '
+    'OR oxide OR nitride OR carbide OR sulfide OR selenide OR telluride OR halide)',
+    '(perovskite OR zeolite OR "grain boundary" OR "thin film" OR monolayer OR "electronic structure" '
+    'OR catalyst OR electrocatalyst OR photocatalyst OR battery OR superconductor OR surface OR slab '
+    'OR interface)',
+)
+
+DEFAULT_QUERIES = [
+    # -- 1. VASP code + its canonical file names. Every token is VASP-specific, so a bare
+    #       OR-union is precision-safe and needs no anchor.
+    'VASP OR vasprun OR vaspout OR OUTCAR OR OSZICAR OR CONTCAR OR POSCAR OR INCAR '
+    'OR KPOINTS OR POTCAR OR XDATCAR OR DOSCAR OR EIGENVAL OR PROCAR OR IBZKPT '
+    'OR CHGCAR OR WAVECAR OR LOCPOT OR ELFCAR OR PARCHG OR AECCAR',
+    # -- 2. DFT method + materials-specific functionals/terms. Specific enough to the
+    #       computational-materials domain to stand alone (bare). 
+    '"plane wave" OR "plane-wave" OR "projector augmented wave" OR pseudopotential '
+    'OR "Monkhorst-Pack" OR "k-point" OR "k-points" OR "k-mesh" OR pymatgen '
+    'OR PBE OR PBEsol OR revPBE OR RPBE OR PBE0 OR HSE06 OR HSE03 OR r2SCAN OR rSCAN '
+    'OR "meta-GGA" OR TPSS OR optB88 OR optB86b OR "vdW-DF" OR AM05 OR "SCAN+rVV10"',
+    # -- 3. Named VASP-derived corpora with DISTINCTIVE names (bare).
+    '"Materials Project" OR MPtrj OR OQMD OR AFLOW OR AFLOWLIB OR "JARVIS-DFT" '
+    'OR "Open Catalyst" OR OC20 OR OC22 OR OMat24 OR Matbench OR "2DMatPedia" OR C2DB '
+    'OR Transition1x OR "Materials Cloud"',
+    # -- 3b. Corpus names that collide with common words -> AND-anchored.
+    '(Alexandria OR NOMAD OR JARVIS OR WBM OR GNoME) '
+    'AND (DFT OR materials OR "first principles" OR "density functional")',
+]
+# -- 4. (computation) AND (materials): each computation chunk × each materials chunk
+#       (union == the full cross-product; chunked to stay under Zenodo's query limit).
+DEFAULT_QUERIES += [f'{cchunk} AND {mchunk}'
+                    for cchunk in _COMPUTATION_CHUNKS for mchunk in _MATERIALS_CHUNKS]
+# -- 5. (MLIP) AND (materials).
+DEFAULT_QUERIES += [f'{chunk_MLIP} AND {chunk_materials}' for chunk_MLIP in _MLIP_CHUNKS for chunk_materials in _MATERIALS_CHUNKS]
+
+
 DEFAULT_RESOURCE_TYPES = ("dataset",)
 
 
