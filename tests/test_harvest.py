@@ -196,7 +196,7 @@ class _FakeRangeSession:
     def __init__(self, blob: bytes):
         self.blob = blob
 
-    def get(self, url, headers=None, timeout=None):
+    def get(self, url, headers=None, timeout=None, stream=None):
         rng = (headers or {})["Range"].split("=", 1)[1]
         size = len(self.blob)
         if rng.startswith("-"):                      # suffix range: bytes=-N
@@ -239,6 +239,77 @@ def test_peek_zip_cd_outside_tail_triggers_second_range():
     assert got is not None and set(got) == set(names)
 
 
+class _UnderflowSmallFileSession:
+    """Models Zenodo's suffix-range bug for a file SMALLER than the requested tail:
+    the ``bytes=-N`` request (N >= size) gets a 206 whose ``Content-Range`` start has
+    underflowed (``size - N`` wrapped into a huge unsigned int) and whose body is
+    undeliverable (``content`` raises like a broken chunked read). A whole-file GET
+    (no Range) returns 200 with the full bytes. Verifies the small-file fallback."""
+
+    def __init__(self, blob: bytes):
+        self.blob = blob
+        self.suffix_reads = 0
+        self.whole_reads = 0
+
+    def get(self, url, headers=None, timeout=None, stream=None):
+        size = len(self.blob)
+        rng = (headers or {}).get("Range") if headers else None
+        blob = self.blob
+        if rng and rng.startswith("bytes=-"):
+            self.suffix_reads += 1
+            n = int(rng[len("bytes=-"):])
+            if n >= size:                                   # <- the underflow case
+                bad_start = (1 << 64) - (n - size)
+
+                class _Broken:
+                    status_code = 206
+                    headers = {"Content-Range": f"bytes {bad_start}-{size - 1}/{size}"}
+
+                    @property
+                    def content(self):
+                        raise requests.exceptions.ChunkedEncodingError("IncompleteRead")
+
+                    def close(self):
+                        pass
+
+                return _Broken()
+            start = size - n
+
+            class _R:
+                status_code = 206
+                content = blob[start:]
+                headers = {"Content-Range": f"bytes {start}-{size - 1}/{size}"}
+
+                def close(self):
+                    pass
+
+            return _R()
+
+        self.whole_reads += 1                               # whole-file GET (no Range)
+
+        class _Whole:
+            status_code = 200
+            content = blob
+            headers: dict = {}
+
+            def close(self):
+                pass
+
+        return _Whole()
+
+
+def test_peek_zip_small_file_uses_whole_file_fallback():
+    # A zip smaller than `tail` triggers Zenodo's suffix-range underflow; the peeker
+    # must detect it from Content-Range and re-fetch the whole (small) file.
+    names = ["run/OUTCAR", "run/POSCAR"]
+    blob = _make_zip(names)
+    assert len(blob) < 65_536                              # precondition: small file
+    sess = _UnderflowSmallFileSession(blob)
+    got = peek_zip_filenames("http://x/small.zip", sess, tail=65_536)
+    assert got is not None and set(got) == set(names)
+    assert sess.whole_reads == 1                           # took the whole-file path
+
+
 # --------------------------------------------------------------------------- #
 # Item 1 — client + zip-peek resilience (429 Retry-After, connection retry)   #
 # --------------------------------------------------------------------------- #
@@ -258,7 +329,7 @@ class _Rate429ThenRange:
         self.remaining_429 = n_429
         self._inner = _FakeRangeSession(blob)
 
-    def get(self, url, headers=None, timeout=None):
+    def get(self, url, headers=None, timeout=None, stream=None):
         if self.remaining_429 > 0:
             self.remaining_429 -= 1
 

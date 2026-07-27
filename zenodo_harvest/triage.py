@@ -58,7 +58,10 @@ def _ranged_get(session: requests.Session, url: str, range_header: str,
     after the budget is spent.
     """
     for _ in range(max_attempts):
-        r = session.get(url, headers={"Range": range_header}, timeout=60)
+        # stream=True so the caller can inspect headers (Content-Range) *before* the
+        # body is read — needed to detect Zenodo's small-file suffix-range underflow
+        # (see peek_zip_filenames) without tripping the broken body read.
+        r = session.get(url, headers={"Range": range_header}, timeout=60, stream=True)
         if r.status_code != 429:
             return r
         wait = _parse_retry_after(r.headers.get("Retry-After")) + 1
@@ -82,15 +85,38 @@ def peek_zip_filenames(url: str, session: requests.Session | None = None, tail: 
     206 for these even though it omits an ``Accept-Ranges`` header. Returns None
     if Range isn't honoured, the file isn't a plain ZIP, or it's ZIP64 in a form
     we don't parse. Best-effort by design.
+
+    Small-file guard: when the zip is *smaller* than ``tail``, Zenodo mishandles the
+    suffix range — it returns a 206 whose ``Content-Range`` start has underflowed
+    (``size - tail`` wrapped to ~2**64) and a ``Content-Length`` it cannot deliver, so
+    reading the body raises ``ChunkedEncodingError``/``IncompleteRead``. Every zip under
+    ``tail`` (64 KiB) would otherwise be dropped as an un-peekable failure (measured
+    ~15% of records — mostly small input/structure zips). When the tail body read
+    breaks we re-fetch the whole (small) file instead, which is cheap and parseable. A
+    correct server that simply returns the whole short file for an over-long suffix
+    range reads fine and needs no second request.
     """
     session = session or requests.Session()
     try:
         r = _ranged_get(session, url, f"bytes=-{tail}")  # retries 429 (see _ranged_get)
         if r is None or r.status_code != 206:
             return None
-        blob = r.content
         cr = r.headers.get("Content-Range", "")
-        size = int(cr.split("/")[-1]) if "/" in cr else len(blob)
+        size = int(cr.split("/")[-1]) if "/" in cr else None
+        try:
+            blob = r.content
+        except requests.RequestException:
+            # Zenodo's small-file suffix underflow: the 206 promises a body it cannot
+            # deliver, so the read breaks. Only a file SMALLER than the tail hits this
+            # (a real tail of a big file reads fine), so re-fetch the whole small file.
+            r.close()
+            whole = session.get(url, timeout=60)
+            if whole.status_code != 200:
+                return None
+            blob = whole.content
+            size = len(blob)
+        if size is None:
+            size = len(blob)
         blob_start = size - len(blob)  # absolute offset of blob[0] within the file
 
         idx = blob.rfind(EOCD_SIG)
