@@ -45,15 +45,51 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
     `--max-bytes 0` = no cap) and **selectively extract only VASP files** from archives; the
     archive is deleted right after extraction (persistent disk = extracted files, not archives);
     records availability of heavy files (CHGCAR/WAVECAR/DOSCAR/EIGENVAL/…) without extracting them.
-    `.rar`/`.7z` extract when the `archives` extra (py7zr/rarfile + an `unrar`/`bsdtar` binary) is
-    installed, else a logged rejection. `--max-member-bytes` caps each extracted file. Emits
-    `fetched.jsonl` (one calc-unit list per record).
+    `.rar`/`.7z`/`.tar.zst` extract when the `archives` extra (py7zr/rarfile/zstandard + an
+    `unrar`/`bsdtar` binary for rar) is installed, else a logged rejection. Emits
+    `fetched.jsonl` (one calc-unit list per record). Three independent size/pacing levers:
+    `--max-bytes` (per downloaded file), `--max-member-bytes` (per *extracted* file —
+    decompression-bomb guard), and `--max-disk-bytes`/`--max-disk-files` (**staging-budget
+    valve**: stop cleanly and resumably once the staging tree reaches a budget — the
+    mechanism that lets an *uncapped* multi-TB harvest run inside a fixed quota).
+    The valve (`StagingBudget`) charges **every ~1 MB chunk before it is written and every
+    inode as it is created**, refunding on delete — never a declared size (archive header,
+    manifest `size`, `Content-Length`), since with `--max-bytes 0` the budget is the only
+    bound on what reaches disk. Inodes count **directories too** (CSD3 `/rds` is Lustre, so
+    its 1M-file quota is an inode quota). `.7z` extracts in one py7zr call, so its charging
+    lives in a `WriterFactory` and the refusal is recorded, not raised, because an exception
+    inside py7zr's threads would be lost. On a breach: roll the record back whole → stop
+    resumably → the pacing loop reclaims → re-fetch. A refusal is classified by the
+    **record's own footprint** (so "too big for the whole budget" is deterministic under
+    `--workers N`), a space refusal never yields a *terminal* reason (no record is lost to
+    pacing), leftovers of an unrecorded record are deleted+refunded at once (`purge-raw`
+    could never reclaim them), and a parallel pass that stages nothing retries serially so
+    the loop cannot deadlock. `--workers N` downloads N records concurrently (records are
+    independent; each stages into its own `raw_dir/<recid>/`, one shared tally, thread-safe).
+    Interrupted transfers **resume over HTTP Range** (a cluster job's wallclock
+    can expire mid-pull of a >100 GB archive; resume only happens when Zenodo supplied a
+    checksum, so stale bytes are always caught). Stats report `peak_staged_bytes`/
+    `peak_staged_files`, so "did we stay inside the limits?" is answerable from the summary.
+  - `pipeline.py` — stages 2–4 **overlapped**: `run_pipeline` fetches batch *i+1* in the
+    foreground while `parse`+`purge-raw` for batch *i* runs in the background, so the
+    network is not idle during parsing (parses serialise on the dataset dir's lock). It is
+    I/O-agnostic (plain callables) so it unit-tests without the network or pymatgen. A
+    `fetch_fn` returning `False` means "batch only partly fetched" (the disk valve tripped):
+    the orchestrator drains the background parse+purge to reclaim staging and **resumes the
+    same batch** — a partly-fetched batch is never carried on and silently dropped. If it
+    still cannot complete with nothing left to drain, the run stops with a reported error
+    rather than under-fetching every later batch.
   - `parse.py` — stage 3: pymatgen `Vasprun` (primary) → per-ionic-step ASE frames; tags each
     frame with *its own* step's electronic convergence bool + magnitude (`scf_dE`), drops steps
     with no recoverable energy, records `run_type`, full INCAR/k-points/POTCAR, availability
     flags. OUTCAR-only calcs fall back to ASE's `vasp-out` reader (read from an isolated temp
     copy — ASE otherwise crashes on uploads with hash-annotated POTCAR species). Manifest paths
-    resolve against `--raw-dir`.
+    resolve against `--raw-dir`. `--max-primary-bytes` (0 = off) refuses to *attempt* a
+    primary output above a size and logs a `primary_too_large` rejection instead — pymatgen
+    holds a whole ionic trajectory in memory, so under a batch scheduler one huge
+    `vasprun.xml` is not a catchable `MemoryError` but a cgroup SIGKILL of the entire job
+    (taking the fetch progress with it). If a smaller sibling primary exists in the same
+    unit (a huge `vasprun.xml` beside a modest `OUTCAR`) it is used instead of dropping the calc.
   - `store.py` — stage 4: `ShardedExtxyzWriter` (rotating `shard-NNNNN.extxyz.gz`) +
     `MetadataWriter` (one JSONL record per calc), joined by `calc_id`/`frame_id`.
   - `dataset_ops.py` — array-job glue (stages over dataset dirs, not the network):
@@ -66,9 +102,12 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
       every array job.
     - `purge-raw` — delete `<raw-dir>/<recid>/` trees whose every calc_id is already in the
       dataset (reclaim scratch); `--dry-run` reports without deleting.
-  - `cli.py` — `python -m zenodo_harvest.cli {discover,triage,fetch,parse,split,merge-datasets,verify,purge-raw} ...`
-    (loads `.env`; `verify`/`merge-datasets` exit non-zero on an integrity failure). Parse and
-    merge take a `.parse.lock` on the dataset dir so two writers never corrupt one dir.
+  - `cli.py` — `python -m zenodo_harvest.cli {discover,triage,fetch,parse,pipeline,split,merge-datasets,verify,purge-raw} ...`
+    (loads `.env`; `verify`/`merge-datasets`/`pipeline` exit non-zero on an integrity failure).
+    Parse and merge take a `.parse.lock` on the dataset dir so two writers never corrupt one
+    dir. `pipeline` always runs `verify` and prints a JSON summary — including any
+    `fetch_error`/`process_errors` — even when a stage failed hard, so a long unattended run
+    never loses its report.
 - Manifests are JSONL under `data/manifests/`; the dataset (extxyz.gz shards + `metadata.jsonl`)
   under `data/dataset/` (all gitignored). Full trial run:
   ```
@@ -79,7 +118,18 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   python -m zenodo_harvest.cli fetch --in data/manifests/keep.jsonl --max-bytes 500000000
   python -m zenodo_harvest.cli parse --in data/manifests/fetched.jsonl
   ```
-  Full cluster harvest: add `--exhaustive` to `discover` (recursive date-partitioning past 10k).
+  Full cluster harvest (batch templates in `scripts/csd3/`): add `--exhaustive` to `discover`,
+  then run stages 2–4 as one overlapped, disk-paced command:
+  ```
+  python -m zenodo_harvest.cli pipeline --in data/manifests/keep.jsonl \
+      --parts 40 --workers 4 --max-bytes 0 --max-member-bytes 30000000000 \
+      --max-disk-bytes 800000000000 --max-disk-files 800000 --max-primary-bytes 4000000000
+  ```
+  `--max-disk-bytes` bounds the **whole** raw staging dir — it already covers both
+  concurrently-staged batches, so size it ~0.8 × quota (leaving headroom for in-flight
+  archives, which are briefly downloaded *and* extracted, plus the dataset dir on the same
+  quota). Discovery is capped server-side at 30 req/min — single-stream by design,
+  do NOT parallelise it; only `fetch` benefits from `--workers`.
   Parallel parse on the cluster (array-job model): `split` the fetched manifest into N parts,
   run N array tasks each parsing its part into its OWN `--dataset-dir`, then `merge-datasets`
   the per-task dirs into one, `verify` the merged dataset, and `purge-raw` the parsed archives:
@@ -160,6 +210,20 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
 
 - Primary development/compute environment is an HPC cluster (CSD3). Long-running harvest jobs and MLIP
   training jobs are expected to run there via the batch scheduler, not interactively.
+- **CSD3 constraints the harvest is designed around** (verified against
+  [docs.hpc.cam.ac.uk](https://docs.hpc.cam.ac.uk/), 2026-07-27):
+  - Wallclock **36 h** (SL1/SL2) / **12 h** (SL3) per job; up to 7 days only via the
+    `-long` QoS, which must be requested from support. The harvest can outlast one job,
+    so *every* stage is resumable and `scripts/csd3/20_pipeline.sh` can self-resubmit.
+  - `/rds/user/<crsid>/hpc-work` (Lustre, **not backed up**) is **1 TB and 1 million
+    files** — point `ZENODO_HARVEST_DATA` there, size `--max-disk-bytes` off the 1 TB, and
+    pace it with `--max-disk-files` (measured: the inode limit binds before the byte one).
+    `/home` is 50 GB (code only).
+  - Login nodes are capped at ~4 CPUs per user — fine for a smoke test, not the real fetch.
+  - **Open question: the docs do not say whether compute nodes have outbound internet
+    access**, which the fetch stage requires. Verify with `scripts/csd3/00_check_network.sh`
+    before submitting; if they are firewalled, use a proxy (`https_proxy`, honoured by
+    `requests`) or run only `fetch` on a login node.
 - Most work is Python + terminal based. Core libraries: `pymatgen`, `ase`, `mp-api`, and (for training)
   MACE or similar MLIP architectures.
 - Toolchain (declared in `pyproject.toml` `[dev]`): **pytest** (tests), **mypy** (types), **ruff** (lint).

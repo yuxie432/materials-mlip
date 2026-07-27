@@ -354,3 +354,167 @@ def test_purge_raw_missing_manifest_errors(tmp_path):
     with pytest.raises(FileNotFoundError):
         purge_raw(tmp_path / "raw", tmp_path / "dataset",
                   fetched=tmp_path / "nope" / "fetched.jsonl")
+
+
+# --------------------------------------------------------------------------- #
+# parse — oversized-primary guard (an unattended batch job must not be         #
+# cgroup-killed by one huge vasprun.xml, losing the whole run's progress)      #
+# --------------------------------------------------------------------------- #
+
+def _unit_and_meta(tmp_path: Path, sizes: dict[str, int]) -> tuple[dict, dict]:
+    """A calc unit on disk with the given ``{role: bytes}`` primary sizes."""
+    root = tmp_path / "raw" / "42" / "extracted" / "calc"
+    root.mkdir(parents=True, exist_ok=True)
+    names = {"vasprun": "vasprun.xml", "outcar": "OUTCAR", "vaspout": "vaspout.h5"}
+    unit = {"dir": str(root)}
+    for role, size in sizes.items():
+        p = root / names[role]
+        p.write_bytes(b"x" * size)
+        unit[role] = str(p)
+    base_meta = {"provenance": {"record_id": "42", "source": "zenodo"},
+                 "_extracted_root": str(tmp_path / "raw" / "42" / "extracted")}
+    return unit, base_meta
+
+
+def test_oversized_primaries_flags_only_the_big_ones(tmp_path):
+    from zenodo_harvest.parse import _oversized_primaries
+    unit, _ = _unit_and_meta(tmp_path, {"vasprun": 5000, "outcar": 10})
+    assert _oversized_primaries(unit, 1000) == ["vasprun"]
+    assert _oversized_primaries(unit, 100_000) == []      # under the cap
+    assert _oversized_primaries(unit, 0) == []            # 0 == guard disabled
+
+
+def test_parse_unit_rejects_when_every_primary_is_oversized(tmp_path):
+    from zenodo_harvest.manifest import RejectionLogger
+    from zenodo_harvest.parse import parse_calc_unit
+    unit, base_meta = _unit_and_meta(tmp_path, {"vasprun": 5000})
+    rej_path = tmp_path / "rej.jsonl"
+    rej = RejectionLogger(rej_path)
+    assert parse_calc_unit(unit, base_meta, {}, rej, max_primary_bytes=1000) is None
+    rej.close()
+    rows = list(read_jsonl(rej_path))
+    assert len(rows) == 1
+    assert rows[0]["reason"] == "primary_too_large" and rows[0]["roles"] == ["vasprun"]
+    # named under the calc_id a later uncapped re-run would parse, so it is traceable
+    assert rows[0]["id"] == "zenodo:42:calc/vasprun.xml"
+
+
+def test_parse_unit_falls_back_to_smaller_sibling_primary(tmp_path):
+    # A huge vasprun.xml beside a modest OUTCAR: drop the vasprun, parse the OUTCAR
+    # (rather than losing the calc entirely).
+    from zenodo_harvest.manifest import RejectionLogger
+    from zenodo_harvest.parse import parse_calc_unit
+    unit, base_meta = _unit_and_meta(tmp_path, {"vasprun": 5000, "outcar": 10})
+    seen = {}
+
+    rej = RejectionLogger(tmp_path / "rej.jsonl")
+    import zenodo_harvest.parse as parse_mod
+    orig = parse_mod._parse_outcar_ase
+
+    def spy(outcar_path, calc_id):
+        seen["outcar"] = outcar_path
+        raise RuntimeError("stop here: we only assert which path was chosen")
+
+    parse_mod._parse_outcar_ase = spy
+    try:
+        parse_calc_unit(unit, base_meta, {}, rej, max_primary_bytes=1000)
+    finally:
+        parse_mod._parse_outcar_ase = orig
+        rej.close()
+    assert seen["outcar"].endswith("OUTCAR")   # fell back to the small OUTCAR
+
+
+# --------------------------------------------------------------------------- #
+# purge-raw partial reclaim — one unparsed unit must not pin a record's whole  #
+# staging for the rest of the harvest (that accumulation can exceed the whole  #
+# disk budget, leaving the pipeline's pacing loop nothing to reclaim)          #
+# --------------------------------------------------------------------------- #
+
+def test_purge_raw_frees_parsed_units_of_a_partially_parsed_record(tmp_path):
+    raw = tmp_path / "raw"
+    manifests = tmp_path / "manifests"
+    manifests.mkdir(parents=True)
+    ds = tmp_path / "dataset"
+
+    rec, ids = _fetched_record(raw, "222", ["calc1", "calc2", "calc3"])
+    write_jsonl(manifests / "fetched.jsonl", [rec])
+    _dataset_with_calcs(ds, ids[:2])           # calc1+calc2 parsed, calc3 not
+
+    before = sum(1 for p in (raw / "222").rglob("*") if p.is_file())
+    summary = purge_raw(raw, ds, fetched=manifests / "fetched.jsonl")
+    entry = summary["per_recid"][0]
+
+    assert entry["decision"] == "kept" and entry["n_unparsed"] == 1
+    assert (raw / "222").exists()                          # record retained for the retry
+    # ...but the two parsed calcs' files are gone, so their space is reclaimed
+    assert not (raw / "222" / "extracted" / "calc1" / "OUTCAR").exists()
+    assert not (raw / "222" / "extracted" / "calc2" / "vasprun.xml").exists()
+    # ...while everything the UNPARSED calc needs survives
+    assert (raw / "222" / "extracted" / "calc3" / "OUTCAR").is_file()
+    assert (raw / "222" / "extracted" / "calc3" / "vasprun.xml").is_file()
+    after = sum(1 for p in (raw / "222").rglob("*") if p.is_file())
+    assert after < before
+    assert entry["partial_files_removed"] == before - after
+    assert entry["partial_bytes_freed"] > 0 and summary["bytes_freed"] > 0
+    assert summary["files_removed"] == before - after
+
+
+def test_purge_raw_partial_keeps_files_shared_with_an_unparsed_unit(tmp_path):
+    # A flat multi-calc directory shares untagged inputs between units. A shared file must
+    # never be freed while an unparsed unit still references it, or its re-parse breaks.
+    raw = tmp_path / "raw"
+    manifests = tmp_path / "manifests"
+    manifests.mkdir(parents=True)
+    ds = tmp_path / "dataset"
+
+    flat = raw / "333" / "extracted" / "flat"
+    flat.mkdir(parents=True)
+    for name in ("site1_OUTCAR", "site2_OUTCAR", "INCAR"):
+        (flat / name).write_text("data " * 50)
+    base = Path("333") / "extracted" / "flat"
+    units = [{"dir": str(base), "outcar": str(base / "site1_OUTCAR"), "incar": str(base / "INCAR")},
+             {"dir": str(base), "outcar": str(base / "site2_OUTCAR"), "incar": str(base / "INCAR")}]
+    rec = {"recid": "333", "provenance": {"source": "zenodo", "record_id": "333"},
+           "local_dir": "333", "n_calc_units": 2, "calc_units": units}
+    write_jsonl(manifests / "fetched.jsonl", [rec])
+    _dataset_with_calcs(ds, ["zenodo:333:flat/site1_OUTCAR"])   # only unit 1 parsed
+
+    purge_raw(raw, ds, fetched=manifests / "fetched.jsonl")
+    assert not (flat / "site1_OUTCAR").exists()   # parsed unit's own output freed
+    assert (flat / "site2_OUTCAR").is_file()      # unparsed unit intact
+    assert (flat / "INCAR").is_file()             # SHARED input preserved
+
+
+def test_purge_raw_partial_prunes_empty_dirs_and_dry_run_is_safe(tmp_path):
+    raw = tmp_path / "raw"
+    manifests = tmp_path / "manifests"
+    manifests.mkdir(parents=True)
+    ds = tmp_path / "dataset"
+    rec, ids = _fetched_record(raw, "444", ["calc1", "calc2"])
+    write_jsonl(manifests / "fetched.jsonl", [rec])
+    _dataset_with_calcs(ds, ids[:1])
+
+    dry = purge_raw(raw, ds, fetched=manifests / "fetched.jsonl", dry_run=True)
+    assert dry["per_recid"][0]["partial_files_removed"] == 2      # would free calc1's files
+    assert (raw / "444" / "extracted" / "calc1" / "OUTCAR").is_file()   # nothing deleted
+
+    real = purge_raw(raw, ds, fetched=manifests / "fetched.jsonl")
+    assert not (raw / "444" / "extracted" / "calc1").exists()     # emptied dir pruned
+    assert real["per_recid"][0]["empty_dirs_pruned"] >= 1
+    assert (raw / "444" / "extracted" / "calc2" / "OUTCAR").is_file()
+
+
+def test_purge_raw_partial_is_idempotent(tmp_path):
+    raw = tmp_path / "raw"
+    manifests = tmp_path / "manifests"
+    manifests.mkdir(parents=True)
+    ds = tmp_path / "dataset"
+    rec, ids = _fetched_record(raw, "555", ["calc1", "calc2"])
+    write_jsonl(manifests / "fetched.jsonl", [rec])
+    _dataset_with_calcs(ds, ids[:1])
+
+    first = purge_raw(raw, ds, fetched=manifests / "fetched.jsonl")
+    second = purge_raw(raw, ds, fetched=manifests / "fetched.jsonl")   # must not raise
+    assert first["bytes_freed"] > 0
+    assert second["bytes_freed"] == 0 and second["files_removed"] == 0
+    assert (raw / "555" / "extracted" / "calc2" / "OUTCAR").is_file()

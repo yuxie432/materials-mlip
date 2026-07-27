@@ -530,9 +530,57 @@ def _calc_id(unit: dict, base_meta: dict) -> str:
     return f"zenodo:{recid}:{Path(primary).relative_to(root)}"
 
 
+_PRIMARY_ROLES_ORDER = ("vasprun", "vaspout", "outcar")
+
+
+def _oversized_primaries(unit: dict, max_primary_bytes: int) -> list[str]:
+    """Primary-output roles in ``unit`` whose file exceeds ``max_primary_bytes``.
+
+    pymatgen holds a run's whole ionic trajectory in memory, so a multi-GB
+    ``vasprun.xml``/``OUTCAR`` (fetch stages these deliberately — long AIMD runs are the
+    frame-richest data) can need many times its own size in RAM. Under a batch
+    scheduler that is not a caught ``MemoryError`` but a cgroup SIGKILL of the whole
+    job, losing the fetch progress too. This lets a long unattended run cap what it
+    will attempt (0 = no cap) and log the skip instead.
+    """
+    if not max_primary_bytes:
+        return []
+    over = []
+    for role in _PRIMARY_ROLES_ORDER:
+        path = unit.get(role)
+        if not path:
+            continue
+        try:
+            if Path(path).stat().st_size > max_primary_bytes:
+                over.append(role)
+        except OSError:
+            continue  # missing/unreadable is the existing parse paths' problem, not ours
+    return over
+
+
 def parse_calc_unit(unit: dict, base_meta: dict, availability: dict,
-                    rej: RejectionLogger) -> tuple[list[Atoms], dict] | None:
-    """Parse one calc unit (a dir with vasprun.xml, vaspout.h5, and/or OUTCAR)."""
+                    rej: RejectionLogger, max_primary_bytes: int = 0) -> tuple[list[Atoms], dict] | None:
+    """Parse one calc unit (a dir with vasprun.xml, vaspout.h5, and/or OUTCAR).
+
+    ``max_primary_bytes`` (0 = no cap) skips a primary output too big to parse within
+    the job's memory — see :func:`_oversized_primaries`. A unit whose *every* primary is
+    oversized is rejected (``primary_too_large``); if a smaller sibling remains (e.g. a
+    huge vasprun.xml beside a modest OUTCAR) the oversized one is dropped from the unit
+    and the normal precedence picks the next parseable primary.
+    """
+    if max_primary_bytes:
+        over = _oversized_primaries(unit, max_primary_bytes)
+        if over:
+            trimmed = {k: v for k, v in unit.items() if k not in over}
+            if not any(trimmed.get(r) for r in _PRIMARY_ROLES_ORDER):
+                # Reject under the ORIGINAL unit's calc_id, so the audit line names the
+                # same calc a later (bigger-memory, or uncapped) re-run would parse.
+                rej.reject("parse", _calc_id(unit, base_meta), "primary_too_large",
+                           roles=over, max_primary_bytes=max_primary_bytes)
+                return None
+            logger.warning("skipping oversized primary(s) %s (> %d B) in %s; using a "
+                           "smaller sibling output", over, max_primary_bytes, unit.get("dir"))
+            unit = trimmed
     vasprun = unit.get("vasprun")
     vaspout = unit.get("vaspout")
     outcar = unit.get("outcar")
@@ -715,6 +763,7 @@ def parse(
     max_records: int | None = None,
     raw_dir: str | Path = config.RAW_DIR,
     gzip_level: int = 6,
+    max_primary_bytes: int = 0,
 ) -> dict:
     """Parse every fetched record into extxyz shards + a metadata JSONL.
 
@@ -727,6 +776,12 @@ def parse(
     ``raw_dir`` is where fetch staged the files; manifest paths are stored relative
     to it and resolved back here (see :func:`_resolve`), so relocated scratch data
     still parses. Absolute paths in older manifests pass through unchanged.
+
+    ``max_primary_bytes`` (0 = no cap) refuses to *attempt* a primary output bigger than
+    this, logging a ``primary_too_large`` rejection instead. pymatgen holds a whole ionic
+    trajectory in memory, so on a batch scheduler one huge ``vasprun.xml`` can get the
+    job cgroup-killed (taking the fetch progress with it). Set it for long unattended
+    cluster runs, sized against the job's ``--mem``; leave it 0 to attempt everything.
     """
     dataset_dir = Path(dataset_dir)
     raw_dir = Path(raw_dir)
@@ -761,7 +816,8 @@ def parse(
                     if calc_id in done_calc_ids:
                         stats["skipped_existing"] += 1
                         continue
-                    result = parse_calc_unit(unit, base_meta, rec.get("availability", {}), rej)
+                    result = parse_calc_unit(unit, base_meta, rec.get("availability", {}),
+                                             rej, max_primary_bytes)
                     if not result:
                         continue
                     frames, meta = result

@@ -11,8 +11,11 @@ Run: ``python -m pytest tests/ -q`` from the repo root.
 
 from __future__ import annotations
 
+import errno
 import io
 import json
+import os
+import shutil
 import tarfile
 import threading
 import zipfile
@@ -535,6 +538,7 @@ class _FakeStreamResp:
         self.status_code = status_code
         self._content = content
         self.headers = headers or {}
+        self.break_after: int | None = None  # bytes to yield before dying mid-stream
 
     def __enter__(self):
         return self
@@ -543,8 +547,14 @@ class _FakeStreamResp:
         return False
 
     def iter_content(self, n):
+        sent = 0
         for i in range(0, len(self._content), n):
-            yield self._content[i:i + n]
+            chunk = self._content[i:i + n]
+            if self.break_after is not None and sent + len(chunk) > self.break_after:
+                yield chunk[: self.break_after - sent]
+                raise requests.RequestException("connection dropped mid-stream")
+            yield chunk
+            sent += len(chunk)
 
 
 class _Stream429ThenOk:
@@ -555,13 +565,52 @@ class _Stream429ThenOk:
         self.remaining_429 = n_429
         self.calls = 0
 
-    def get(self, url, stream=False, timeout=None):
+    def get(self, url, stream=False, timeout=None, headers=None):
         self.calls += 1
         if self.remaining_429 > 0:
             self.remaining_429 -= 1
             return _FakeStreamResp(429, headers={"Retry-After": "0"})
         return _FakeStreamResp(200, content=self.content,
                                headers={"Content-Length": str(len(self.content))})
+
+
+def _parse_range(headers):
+    """Byte offset requested by a ``Range: bytes=N-`` header (0 if absent)."""
+    rng = (headers or {}).get("Range")
+    return int(rng.split("=", 1)[1].split("-", 1)[0]) if rng else 0
+
+
+class _RangeSession:
+    """Streaming session that honours ``Range: bytes=N-`` like Zenodo does.
+
+    Optionally truncates the first response after ``break_after`` bytes (raising a
+    ``RequestException`` mid-stream) to model a transfer killed part way — the case
+    byte-range resume exists for. Records every requested offset in ``offsets``.
+    """
+
+    def __init__(self, content: bytes, break_after: int | None = None,
+                 ignore_range: bool = False, unsatisfiable: bool = False):
+        self.content = content
+        self.break_after = break_after
+        self.ignore_range = ignore_range
+        self.unsatisfiable = unsatisfiable
+        self.offsets: list[int] = []
+
+    def get(self, url, stream=False, timeout=None, headers=None):
+        start = _parse_range(headers)
+        self.offsets.append(start)
+        if start and self.unsatisfiable:
+            return _FakeStreamResp(416)
+        if start and not self.ignore_range:
+            body = self.content[start:]
+            return _FakeStreamResp(206, content=body,
+                                   headers={"Content-Length": str(len(body))})
+        body = self.content  # fresh download, or a server that ignored the Range
+        resp = _FakeStreamResp(200, content=body,
+                               headers={"Content-Length": str(len(body))})
+        if self.break_after is not None:
+            resp.break_after, self.break_after = self.break_after, None
+        return resp
 
 
 def test_download_file_retries_on_429_then_lands(monkeypatch, tmp_path):
@@ -583,6 +632,102 @@ def test_download_file_falls_through_to_http_429(monkeypatch, tmp_path):
     ok, why = download_file(sess, "http://x/OUTCAR", dest, None)
     assert not ok and why == "http_429"
     assert sess.calls == 3  # 3 attempts, all 429
+
+
+# --------------------------------------------------------------------------- #
+# download resume — a killed transfer must not restart from byte 0            #
+# (a CSD3 job's 36h wallclock can expire mid-pull of a >100 GB archive)       #
+# --------------------------------------------------------------------------- #
+
+_RESUME_BLOB = bytes(range(256)) * 8_000          # ~2 MB, > the 1 MiB chunk size
+
+
+def test_download_resumes_from_part_file(tmp_path):
+    # First pass dies mid-stream leaving a .part; the second pass must Range-resume
+    # from exactly those bytes and land the complete, checksum-correct file.
+    expected = md5(_RESUME_BLOB).hexdigest()
+    dest = tmp_path / "big.zip"
+    sess = _RangeSession(_RESUME_BLOB, break_after=1 << 20)
+
+    ok, why = download_file(sess, "http://x/big.zip", dest, expected)
+    assert not ok and why.startswith("download_error")
+    part = dest.with_suffix(dest.suffix + ".part")
+    assert part.is_file() and 0 < part.stat().st_size < len(_RESUME_BLOB)   # partial kept
+    resumed_from = part.stat().st_size
+
+    ok, why = download_file(sess, "http://x/big.zip", dest, expected)
+    assert ok and why == "resumed"
+    assert dest.read_bytes() == _RESUME_BLOB                                # byte-exact
+    assert not part.exists()
+    assert sess.offsets == [0, resumed_from]                        # asked for the rest
+
+
+def test_download_resume_restarts_when_server_ignores_range(tmp_path):
+    # A server that answers 200 to a Range request must be handled by restarting from
+    # scratch (truncate, not append — appending would corrupt the file).
+    expected = md5(_RESUME_BLOB).hexdigest()
+    dest = tmp_path / "big.zip"
+    part = dest.with_suffix(dest.suffix + ".part")
+    part.write_bytes(b"stale-prefix")                     # leftover from an older run
+
+    sess = _RangeSession(_RESUME_BLOB, ignore_range=True)
+    ok, why = download_file(sess, "http://x/big.zip", dest, expected)
+    assert ok and why == "downloaded"
+    assert dest.read_bytes() == _RESUME_BLOB                     # no stale prefix survived
+
+
+def test_download_resume_416_means_part_already_complete(tmp_path):
+    # 416 Range Not Satisfiable => the .part already holds the whole file; the checksum
+    # confirms it and no bytes are re-transferred.
+    expected = md5(_RESUME_BLOB).hexdigest()
+    dest = tmp_path / "big.zip"
+    dest.with_suffix(dest.suffix + ".part").write_bytes(_RESUME_BLOB)
+    sess = _RangeSession(_RESUME_BLOB, unsatisfiable=True)
+
+    ok, why = download_file(sess, "http://x/big.zip", dest, expected)
+    assert ok and why == "resumed"
+    assert dest.read_bytes() == _RESUME_BLOB
+
+
+def test_download_resume_discards_wrong_bytes_via_checksum(tmp_path):
+    # A .part from a DIFFERENT (superseded) file version must never survive: resuming
+    # appends, the md5 fails, and the bad partial is deleted so the next run is clean.
+    dest = tmp_path / "big.zip"
+    part = dest.with_suffix(dest.suffix + ".part")
+    part.write_bytes(b"bytes-of-some-other-file")
+    sess = _RangeSession(_RESUME_BLOB)
+
+    ok, why = download_file(sess, "http://x/big.zip", dest, md5(_RESUME_BLOB).hexdigest())
+    assert not ok and why == "md5_mismatch"
+    assert not part.exists() and not dest.exists()
+
+
+def test_download_no_resume_without_checksum(tmp_path):
+    # With no expected md5 a bad resume would be undetectable, so resume is disabled
+    # and the partial is discarded rather than appended to.
+    dest = tmp_path / "OUTCAR"
+    part = dest.with_suffix(dest.suffix + ".part")
+    part.write_bytes(b"partial")
+    sess = _RangeSession(_RESUME_BLOB)
+
+    ok, why = download_file(sess, "http://x/OUTCAR", dest, None)
+    assert ok and why == "downloaded"
+    assert sess.offsets == [0]                 # never asked for a range
+    assert dest.read_bytes() == _RESUME_BLOB
+
+
+def test_download_resume_size_cap_counts_bytes_already_have(tmp_path):
+    # Under a 206 the Content-Length is only the REMAINDER, so the cap must be applied
+    # to have+remaining or a resumed download could sail past --max-bytes.
+    expected = md5(_RESUME_BLOB).hexdigest()
+    dest = tmp_path / "big.zip"
+    part = dest.with_suffix(dest.suffix + ".part")
+    part.write_bytes(_RESUME_BLOB[: len(_RESUME_BLOB) // 2])
+    sess = _RangeSession(_RESUME_BLOB)
+
+    ok, why = download_file(sess, "http://x/big.zip", dest, expected,
+                            max_bytes=len(_RESUME_BLOB) - 1)
+    assert not ok and why == "over_size_cap"
 
 
 # --------------------------------------------------------------------------- #
@@ -1108,7 +1253,16 @@ class _MultiFileStreamSession:
     def __init__(self, blobs):
         self.blobs = blobs
 
-    def get(self, url, stream=False, timeout=None):
+    def close(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def get(self, url, stream=False, timeout=None, headers=None):
         content = self.blobs[url]
         return _FakeStreamResp(200, content=content,
                                headers={"Content-Length": str(len(content))})
@@ -1150,43 +1304,6 @@ class _DummySession:
         pass
 
 
-def test_fetch_disk_budget_stops_cleanly(tmp_path, monkeypatch):
-    # The disk-budget valve must stop fetching once the staging tree reaches the budget,
-    # setting stopped_disk_budget, so an uncapped harvest can be paced fetch->parse->purge.
-    raw_dir = tmp_path / "raw"
-    per_record = 4 << 20  # each fetched record stages a 4 MiB file
-
-    def fake_fetch_record(rec, session, rd, max_bytes, rej, max_member_bytes=0):
-        d = Path(rd) / rec["recid"] / "extracted"
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "OUTCAR").write_bytes(b"x" * per_record)
-        return {"recid": rec["recid"], "n_calc_units": 1, "calc_units": []}
-
-    monkeypatch.setattr(fetch_mod, "_session", lambda _t: _DummySession())
-    monkeypatch.setattr(fetch_mod, "fetch_record", fake_fetch_record)
-
-    manifest = tmp_path / "keep.jsonl"
-    with manifest.open("w") as fh:
-        for i in range(10):
-            fh.write(json.dumps({"recid": str(i), "files": []}) + "\n")
-
-    stats = fetch_mod.fetch(
-        manifest, out_path=tmp_path / "fetched.jsonl", raw_dir=raw_dir,
-        rejections_path=tmp_path / "rej.jsonl", max_bytes=None,
-        max_disk_bytes=10 << 20,  # budget = 10 MiB -> stop after ~2-3 records
-    )
-    assert stats["stopped_disk_budget"] is True
-    assert 2 <= stats["fetched"] <= 4          # stopped well before all 10
-    assert stats["fetched"] < 10
-
-    # No budget -> fetches everything (valve is opt-in).
-    stats2 = fetch_mod.fetch(
-        manifest, out_path=tmp_path / "fetched2.jsonl", raw_dir=tmp_path / "raw2",
-        rejections_path=tmp_path / "rej2.jsonl", max_bytes=None,
-    )
-    assert stats2["stopped_disk_budget"] is False and stats2["fetched"] == 10
-
-
 def _write_recs(path, n, size):
     with path.open("w") as fh:
         for i in range(n):
@@ -1195,7 +1312,7 @@ def _write_recs(path, n, size):
 
 
 def _staging_fetch_record(per_record):
-    def fake(rec, session, rd, max_bytes, rej, max_member_bytes=0):
+    def fake(rec, session, rd, max_bytes, rej, max_member_bytes=0, quota=None):
         d = Path(rd) / rec["recid"] / "extracted"
         d.mkdir(parents=True, exist_ok=True)
         (d / "OUTCAR").write_bytes(b"x" * per_record)
@@ -1222,24 +1339,121 @@ def test_fetch_parallel_fetches_all(tmp_path, monkeypatch):
     assert len(list(read_jsonl(tmp_path / "rej.jsonl"))) == 10
 
 
-def test_fetch_parallel_disk_budget_bounds_and_stops(tmp_path, monkeypatch):
-    # With workers>1 the disk valve reserves each in-flight download and stops cleanly
-    # once staged bytes fill the budget (so a paced loop can parse+purge and resume).
-    S = 1 << 20
+def test_download_estimate_treats_zero_max_bytes_as_uncapped(tmp_path):
+    # `--max-bytes 0` means "no cap" everywhere else in fetch; if the disk-budget
+    # estimator instead read 0 as a literal cap, EVERY record would estimate 0 bytes and
+    # the valve would stop reserving in-flight downloads (unbounded peak disk).
+    rec = {"recid": "1", "files": [{"key": "data.zip", "size": 5_000_000_000},
+                                   {"key": "OUTCAR", "size": 1_000}]}
+    assert fetch_mod._download_estimate(rec, None) == 5_000_001_000
+    assert fetch_mod._download_estimate(rec, 0) == 5_000_001_000     # 0 == uncapped
+    assert fetch_mod._download_estimate(rec, 2_000) == 1_000         # real cap applies
+
+
+def test_fetch_parallel_max_records_does_not_overshoot(tmp_path, monkeypatch):
+    # max_records must bound what is SUBMITTED; gating on the completed count (which
+    # lags behind by up to 2*workers futures) let it overshoot badly.
     monkeypatch.setattr(fetch_mod, "_session", lambda _t: _DummySession())
-    monkeypatch.setattr(fetch_mod, "fetch_record", _staging_fetch_record(S))
+    monkeypatch.setattr(fetch_mod, "fetch_record", _staging_fetch_record(64))
     manifest = tmp_path / "keep.jsonl"
-    _write_recs(manifest, 30, S)
-    stats = fetch_mod.fetch(
-        manifest, out_path=tmp_path / "fetched.jsonl", raw_dir=tmp_path / "raw",
-        rejections_path=tmp_path / "rej.jsonl", max_bytes=None, workers=3,
-        max_disk_bytes=5 * S,
-    )
-    assert stats["stopped_disk_budget"] is True
-    assert 1 <= stats["fetched"] <= 8          # bounded well below all 30
-    # what was actually staged never blew far past the budget (+ headroom for in-flight)
-    staged = sum(p.stat().st_size for p in (tmp_path / "raw").rglob("*") if p.is_file())
-    assert staged <= 8 * S
+    _write_recs(manifest, 40, 64)
+    stats = fetch_mod.fetch(manifest, out_path=tmp_path / "fetched.jsonl",
+                            raw_dir=tmp_path / "raw", rejections_path=tmp_path / "rej.jsonl",
+                            max_bytes=None, workers=4, max_records=5)
+    assert stats["fetched"] == 5
+
+
+def _write_7z(archive, members):
+    """Build a .7z from ``{arcname: bytes}`` (helper for the 7z tests)."""
+    py7zr = pytest.importorskip("py7zr")
+    src = archive.parent / "_7zsrc"
+    src.mkdir(exist_ok=True)
+    with py7zr.SevenZipFile(archive, "w") as zf:
+        for arcname, data in members.items():
+            f = src / arcname.replace("/", "_")
+            f.write_bytes(data)
+            zf.write(f, arcname)
+
+
+def test_extract_7z_extracts_vasp_members_to_disk(tmp_path):
+    # Regression: py7zr 1.x removed the `read()` API this used, so EVERY .7z record
+    # raised AttributeError and staged nothing. Selected members must land on disk
+    # (streamed, so a huge member cannot blow up RAM) and non-VASP files stay out.
+    archive = tmp_path / "calcs.7z"
+    _write_7z(archive, {**{f"calc{i}/OUTCAR": b"o" * 1000 for i in range(4)},
+                        "calc0/notes.txt": b"ignore me"})
+    dest = tmp_path / "out"
+    names, extracted = fetch_mod._extract_7z(archive, dest, 1 << 40)
+    assert sorted(extracted) == [f"calc{i}/OUTCAR" for i in range(4)]
+    assert all((dest / n).read_bytes() == b"o" * 1000 for n in extracted)
+    assert not (dest / "calc0" / "notes.txt").exists()   # non-VASP not extracted
+    assert "calc0/notes.txt" in names                    # but still listed
+
+
+def test_extract_7z_skips_oversized_member(tmp_path):
+    archive = tmp_path / "big.7z"
+    _write_7z(archive, {"calc/OUTCAR": b"o" * 5000, "calc/INCAR": b"i" * 10})
+    dest = tmp_path / "out"
+    names, extracted = fetch_mod._extract_7z(archive, dest, 1000)  # member cap 1000 B
+    assert extracted == ["calc/INCAR"]        # oversized member skipped
+    assert not (dest / "calc" / "OUTCAR").exists()
+    assert "calc/OUTCAR" in names             # still reported for availability scanning
+
+
+def test_extract_7z_skips_zip_slip_members(tmp_path):
+    archive = tmp_path / "evil.7z"
+    _write_7z(archive, {"../escaped/OUTCAR": b"nope", "calc/OUTCAR": b"fine"})
+    dest = tmp_path / "out"
+    _names, extracted = fetch_mod._extract_7z(archive, dest, 1 << 40)
+    assert extracted == ["calc/OUTCAR"]
+    assert not (tmp_path / "escaped").exists()
+
+
+def test_fetch_record_stages_a_7z_archive(tmp_path):
+    # End-to-end: a .7z record must yield a calc unit (this silently yielded nothing,
+    # or crashed the run, with py7zr 1.x).
+    archive = tmp_path / "src.7z"
+    _write_7z(archive, {"calc/OUTCAR": b"outcar-bytes", "calc/INCAR": b"incar"})
+    blob = archive.read_bytes()
+    rec = {"recid": "777",
+           "files": [{"key": "src.7z", "download": "http://x/src.7z", "size": len(blob),
+                      "checksum": "md5:" + md5(blob).hexdigest()}]}
+    rej = RejectionLogger(tmp_path / "rej.jsonl")
+    entry = fetch_record(rec, _MultiFileStreamSession({"http://x/src.7z": blob}),
+                         tmp_path / "raw", max_bytes=None, rej=rej)
+    rej.close()
+    assert entry is not None and entry["n_calc_units"] == 1
+    assert entry["calc_units"][0]["outcar"].endswith("calc/OUTCAR")
+
+
+def test_rar_without_unrar_binary_is_a_rejection_not_a_crash(tmp_path, monkeypatch):
+    # rarfile raises at open time when no unrar/bsdtar binary exists (likely on a bare
+    # cluster node). That must reject ONE file, not abort the harvest.
+    rarfile = pytest.importorskip("rarfile")
+    blob = b"Rar!\x1a\x07\x00 not really a rar"
+
+    def boom(*a, **k):
+        raise rarfile.RarCannotExec("unrar not installed")
+
+    monkeypatch.setattr(rarfile, "RarFile", boom)
+    rec = {"recid": "888",
+           "files": [{"key": "data.rar", "download": "http://x/data.rar",
+                      "size": len(blob), "checksum": "md5:" + md5(blob).hexdigest()}]}
+    rej_path = tmp_path / "rej.jsonl"
+    rej = RejectionLogger(rej_path)
+    entry = fetch_record(rec, _MultiFileStreamSession({"http://x/data.rar": blob}),
+                         tmp_path / "raw", max_bytes=None, rej=rej)   # must not raise
+    rej.close()
+    assert entry is None
+    reasons = [r["reason"] for r in read_jsonl(rej_path)]
+    assert "extract_error" in reasons and "no_vasp_files_fetched" in reasons
+
+
+def test_extract_errors_cover_backend_api_drift():
+    # An optional backend's API/version mismatch must reject ONE archive, not abort a
+    # multi-hour harvest, so the caught-exception tuple includes AttributeError.
+    assert AttributeError in fetch_mod._EXTRACT_ERRORS
+    assert RuntimeError in fetch_mod._EXTRACT_ERRORS
 
 
 # --------------------------------------------------------------------------- #
@@ -1275,6 +1489,75 @@ def test_run_pipeline_overlaps_fetch_and_process():
     fetches = [p for kind, p in order if kind == "fetch"]
     assert fetches == parts
     assert sorted(p for kind, p in order if kind == "process") == sorted(parts)
+
+
+def test_run_pipeline_resumes_a_part_whose_fetch_hit_the_disk_budget():
+    # THE disk-budget correctness property: a fetch that stops part way (returns False)
+    # must NOT be carried on and forgotten — the orchestrator drains the outstanding
+    # parse+purge (the only thing that frees staging) and re-fetches the SAME part.
+    parts = ["p0", "p1"]
+    passes: dict[str, int] = {"p0": 0, "p1": 0}
+    processed: list[str] = []
+
+    def fetch_fn(p):
+        passes[p] += 1
+        # p0 needs two passes: the first fills the budget, then p0's own... no — the
+        # first pass of p1 is what stops, and only p0's parse+purge can free space.
+        if p == "p1" and passes[p] == 1:
+            return False
+        return True
+
+    def process_fn(p):
+        processed.append(p)
+
+    done, errors = run_pipeline(parts, fetch_fn, process_fn, after_workers=1)
+    assert not errors
+    assert passes == {"p0": 1, "p1": 2}          # p1 retried, not skipped
+    assert set(done) == {"p0", "p1"}
+    assert processed[0] == "p0"                   # p0's parse ran before p1 resumed
+    assert set(processed) == {"p0", "p1"}         # both parts processed
+
+
+def test_run_pipeline_paces_the_very_first_part_by_processing_its_own_batch():
+    # The FIRST part has no older work to drain, so a budget trip there must be paced by
+    # parsing+purging that part's own staged records and resuming it — the same
+    # fetch->parse->purge->resume loop the disk valve is designed for. (Erroring out
+    # here would fail the whole harvest on batch 0 whenever one batch exceeds the budget.)
+    fetch_passes = {"n": 0}
+    processed: list[str] = []
+
+    def fetch_fn(p):
+        fetch_passes["n"] += 1
+        return fetch_passes["n"] >= 3          # p0 needs 3 passes to drain its batch
+
+    def process_fn(p):
+        processed.append(p)
+
+    done, errors = run_pipeline(["p0"], fetch_fn, process_fn, after_workers=1)
+    assert not errors
+    assert fetch_passes["n"] == 3
+    # processed twice mid-fetch to reclaim staging, then once more at the end
+    assert processed == ["p0", "p0", "p0"]
+    assert done == ["p0"]                      # deduped despite repeated processing
+
+
+def test_run_pipeline_stops_a_part_that_never_completes():
+    # A part that cannot be completed even with repeated parse+purge cycles means the
+    # budget cannot hold a meaningful slice of one batch: report it and STOP, rather than
+    # looping forever or under-fetching every later part.
+    passes: dict[str, int] = {"p0": 0, "p1": 0, "p2": 0}
+
+    def fetch_fn(p):
+        passes[p] += 1
+        return p != "p1"                       # p1 can never complete
+
+    done, errors = run_pipeline(["p0", "p1", "p2"], fetch_fn, lambda p: None,
+                                after_workers=1, max_fetch_passes=4)
+    assert passes["p1"] == 4                   # bounded by max_fetch_passes, then gave up
+    assert passes["p2"] == 0                   # stopped: later parts not under-fetched
+    assert done == ["p0", "p1"]                # p1's partial batches were still parsed
+    assert len(errors) == 1 and errors[0][0] == "p1"
+    assert "disk budget" in str(errors[0][1])
 
 
 def test_run_pipeline_records_process_errors_without_stopping():
@@ -1328,3 +1611,762 @@ def test_cli_pipeline_wiring(tmp_path, monkeypatch):
                        "--raw-dir", str(tmp_path / "raw"), "--dataset-dir", str(tmp_path / "ds")])
     assert rc == 0
     assert calls.count("fetch") == 3 and calls.count("parse") == 3 and calls.count("purge") == 3
+
+
+def test_cli_pipeline_resumes_a_batch_stopped_by_the_disk_budget(tmp_path, monkeypatch):
+    # The end-to-end version of the disk-budget property: stage-2 fetch reporting
+    # stopped_disk_budget must make the CLI's fetch_fn return False, so the batch is
+    # re-fetched after the parse+purge frees space — never silently left half-fetched.
+    import zenodo_harvest.cli as cli_mod
+    keep = tmp_path / "keep.jsonl"
+    with keep.open("w") as fh:
+        for i in range(4):
+            fh.write(json.dumps({"recid": str(i), "files": []}) + "\n")
+    fetch_calls: list[str] = []
+    stopped_once = {"done": False}
+
+    def fake_fetch(in_path, out_path, raw_dir, **k):
+        fetch_calls.append(Path(in_path).name)
+        Path(out_path).write_text(json.dumps({"recid": "x"}) + "\n")
+        # Batch 2 stops mid-way once: batch 1's parse+purge is outstanding, so draining
+        # it frees staging and this batch can then be resumed to completion.
+        if Path(in_path).name.endswith("part-001.jsonl") and not stopped_once["done"]:
+            stopped_once["done"] = True
+            return {"fetched": 1, "stopped_disk_budget": True}
+        return {"fetched": 1, "stopped_disk_budget": False}
+
+    monkeypatch.setattr(cli_mod, "fetch", fake_fetch)
+    monkeypatch.setattr(cli_mod, "parse", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(cli_mod, "purge_raw", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(cli_mod, "verify_dataset", lambda d: {"ok": True})
+
+    rc = cli_mod.main(["pipeline", "--in", str(keep), "--parts", "2",
+                       "--raw-dir", str(tmp_path / "raw"), "--dataset-dir", str(tmp_path / "ds")])
+    assert rc == 0
+    # part-000 once, part-001 twice (stopped, then resumed) => 3 fetch calls total
+    assert len(fetch_calls) == 3
+    assert fetch_calls[1] == fetch_calls[2]      # the SAME part was retried, not skipped
+
+
+def test_cli_pipeline_reports_a_hard_fetch_failure_and_still_verifies(tmp_path, monkeypatch):
+    # A systemic fetch failure must not lose the run's report: it is recorded, the
+    # dataset is still verified, and the exit code is non-zero.
+    import zenodo_harvest.cli as cli_mod
+    keep = tmp_path / "keep.jsonl"
+    keep.write_text(json.dumps({"recid": "1", "files": []}) + "\n")
+    verified = {"n": 0}
+
+    def boom(*a, **k):
+        raise requests.RequestException("DNS is down")
+
+    def fake_verify(d):
+        verified["n"] += 1
+        return {"ok": True}
+
+    monkeypatch.setattr(cli_mod, "fetch", boom)
+    monkeypatch.setattr(cli_mod, "verify_dataset", fake_verify)
+    rc = cli_mod.main(["pipeline", "--in", str(keep), "--parts", "1",
+                       "--raw-dir", str(tmp_path / "raw"), "--dataset-dir", str(tmp_path / "ds")])
+    assert rc == 1                      # reported as a failure...
+    assert verified["n"] == 1           # ...but the dataset was still verified
+
+
+def test_is_archive_treats_misnamed_compressed_tarballs_as_tar():
+    # Bare .gz/.bz2/.xz are ambiguous. A compressed single VASP file stays a direct
+    # download; anything else is treated as a (mis-named) compressed tarball rather than
+    # being silently ignored — the same recall gap already fixed for `.zst`. Measured on
+    # Zenodo: e.g. a 17 GB `…-vasp-raw.gz` that held a tar of VASP runs.
+    assert fetch_mod._is_archive("OUTCAR.gz") is None        # single compressed VASP file
+    assert fetch_mod._is_archive("vasprun.xml.gz") is None
+    assert fetch_mod._is_archive("run1_OUTCAR.bz2") is None
+    assert fetch_mod._is_archive("photoionization-vasp-raw.gz") == "tar"
+    assert fetch_mod._is_archive("research_data.bz2") == "tar"
+    assert fetch_mod._is_archive("dataset.xz") == "tar"
+    assert fetch_mod._is_archive("archive.tar.gz") == "tar"  # explicit form unchanged
+
+
+def test_extract_tar_reads_a_misnamed_gzipped_tarball(tmp_path):
+    # tarfile auto-detects compression from CONTENT, so a gzipped tar named `.gz`
+    # extracts normally...
+    src = tmp_path / "OUTCAR"
+    src.write_bytes(b"outcar-body")
+    arc = tmp_path / "vasp-raw.gz"
+    with tarfile.open(arc, "w:gz") as tf:
+        tf.add(src, arcname="calc/OUTCAR")
+    dest = tmp_path / "out"
+    names, extracted = fetch_mod._extract_tar(arc, dest, 1 << 30)
+    assert extracted == ["calc/OUTCAR"]
+    assert (dest / "calc" / "OUTCAR").read_bytes() == b"outcar-body"
+
+
+def test_misnamed_gz_that_is_not_a_tar_is_a_clean_rejection(tmp_path):
+    # ...and a bare .gz that is NOT a tar raises TarError, which is already caught and
+    # logged as one `extract_error` rejection rather than crashing the harvest.
+    import gzip
+    blob_path = tmp_path / "plain.gz"
+    with gzip.open(blob_path, "wb") as fh:
+        fh.write(b"not a tar at all")
+    blob = blob_path.read_bytes()
+    rec = {"recid": "999",
+           "files": [{"key": "mystery_data.gz", "download": "http://x/m.gz",
+                      "size": len(blob), "checksum": "md5:" + md5(blob).hexdigest()}]}
+    rej_path = tmp_path / "rej.jsonl"
+    rej = RejectionLogger(rej_path)
+    entry = fetch_record(rec, _MultiFileStreamSession({"http://x/m.gz": blob}),
+                         tmp_path / "raw", max_bytes=None, rej=rej)   # must not raise
+    rej.close()
+    assert entry is None
+    assert "extract_error" in [r["reason"] for r in read_jsonl(rej_path)]
+
+
+# --------------------------------------------------------------------------- #
+# per-record staging quota — the disk budget must bound REALITY, not just the  #
+# pre-download estimate (compression ratios vary far more than the 6x booked)  #
+# --------------------------------------------------------------------------- #
+
+def _compressible_zip(n_members=400, member_size=1 << 20):
+    """A zip of highly-compressible members: tiny compressed, huge extracted."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i in range(n_members):
+            zf.writestr(f"calc{i}/OUTCAR", b"\0" * member_size)
+    return buf.getvalue()
+
+
+def test_disk_valve_bounds_total_staging_end_to_end(tmp_path, monkeypatch):
+    # The property that matters on the cluster: across MANY high-ratio records and
+    # parallel workers, total staged bytes stay near the budget instead of running away.
+    blob = _compressible_zip(n_members=200)
+    monkeypatch.setattr(fetch_mod, "_session",
+                        lambda _t: _MultiFileStreamSession({"http://x/d.zip": blob}))
+    manifest = tmp_path / "keep.jsonl"
+    with manifest.open("w") as fh:
+        for i in range(40):   # collectively want far more staging than the budget allows
+            fh.write(json.dumps({"recid": str(i), "files": [
+                {"key": "d.zip", "download": "http://x/d.zip", "size": len(blob),
+                 "checksum": "md5:" + md5(blob).hexdigest()}]}) + "\n")
+    budget = 16 << 20
+    stats = fetch_mod.fetch(manifest, out_path=tmp_path / "f.jsonl",
+                            raw_dir=tmp_path / "raw", rejections_path=tmp_path / "r.jsonl",
+                            max_bytes=None, max_disk_bytes=budget, workers=3)
+    staged = sum(p.stat().st_size for p in (tmp_path / "raw").rglob("*") if p.is_file())
+    # Without the per-record quota a single one of these records staged ~200 MB.
+    assert staged <= budget * 2, f"staged {staged} vs budget {budget}"
+    assert stats["stopped_disk_budget"] is True     # stopped cleanly, resumably
+    assert stats["fetched"] < 40                    # paced, not run to completion
+
+
+def test_quota_exhaustion_on_disk_is_transient_and_retryable(tmp_path, monkeypatch):
+    """Last line of defence: if the real filesystem quota is hit anyway (budget set too
+    high, or something else filled the volume), writes fail with ENOSPC/EDQUOT.
+
+    That must stay a TRANSIENT failure so a later run retries the record. Regression: the
+    per-file error was already transient, but the record then fell through to
+    ``no_vasp_files_fetched`` — a TERMINAL reason — so every affected record was
+    permanently skipped by all later runs. A disk-full episode silently shrank the harvest.
+    """
+    blob = b"outcar-bytes"
+    rec = {"recid": "1", "files": [{"key": "OUTCAR", "download": "http://x/OUTCAR",
+                                    "size": len(blob),
+                                    "checksum": "md5:" + md5(blob).hexdigest()}]}
+    rej_path = tmp_path / "rej.jsonl"
+    rej = RejectionLogger(rej_path)          # opened BEFORE the failure is injected
+
+    def edquot(self, *a, **k):
+        raise OSError(errno.EDQUOT, "Disk quota exceeded")
+
+    monkeypatch.setattr(fetch_mod.Path, "open", edquot)
+    entry = fetch_record(rec, _MultiFileStreamSession({"http://x/OUTCAR": blob}),
+                         tmp_path / "raw", max_bytes=None, rej=rej)   # must not raise
+    monkeypatch.undo()
+    rej.close()
+
+    rows = list(read_jsonl(rej_path))
+    reasons = [r["reason"] for r in rows]
+    assert entry is None
+    assert any(r.startswith("write_error") for r in reasons), reasons
+    # the RECORD-level verdict must be the retryable one, never the terminal one
+    assert fetch_mod._TRANSIENT_RECORD_REASON in reasons, reasons
+    assert "no_vasp_files_fetched" not in reasons
+    # ...so a later run does NOT skip this recid
+    assert fetch_mod._terminal_reject_recids(rej_path) == set()
+
+
+def test_record_with_genuinely_no_vasp_stays_terminal(tmp_path):
+    # The flip side: a record that really holds nothing usable must STILL be terminal, so
+    # its (often large) archive is not re-downloaded on every resume.
+    blob = _zip_bytes([("notes/readme.txt", b"no vasp here")])
+    rec = {"recid": "2", "files": [{"key": "d.zip", "download": "http://x/d.zip",
+                                    "size": len(blob),
+                                    "checksum": "md5:" + md5(blob).hexdigest()}]}
+    rej_path = tmp_path / "rej.jsonl"
+    rej = RejectionLogger(rej_path)
+    assert fetch_record(rec, _MultiFileStreamSession({"http://x/d.zip": blob}),
+                        tmp_path / "raw", max_bytes=None, rej=rej) is None
+    rej.close()
+    assert "no_vasp_files_fetched" in [r["reason"] for r in read_jsonl(rej_path)]
+    assert fetch_mod._terminal_reject_recids(rej_path) == {"2"}
+
+
+
+
+# --------------------------------------------------------------------------- #
+# StagingBudget — the disk/inode valve. Enforcement is on ACTUAL bytes and     #
+# files as they are written, so these tests deliberately sweep the compression #
+# ratio (measured on real Zenodo data: ~1x to 4.1x; synthetic: 880x) instead   #
+# of trusting any single factor.                                              #
+# --------------------------------------------------------------------------- #
+
+def _zip_with_ratio(member_bytes, n_members=20, kind="text"):
+    """A zip whose members compress predictably.
+
+    ``kind``: "incompressible" (random ~1x) | "text" (hex ~2x) | "bomb" (zeros ~1000x).
+    Returns ``(blob, uncompressed_total, ratio)``.
+    """
+    if kind == "incompressible":
+        body = os.urandom(member_bytes)
+    elif kind == "text":
+        body = os.urandom(member_bytes // 2).hex().encode()[:member_bytes]
+    else:
+        body = b"\0" * member_bytes
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i in range(n_members):
+            zf.writestr(f"calc{i}/OUTCAR", body)
+    blob = buf.getvalue()
+    total = len(body) * n_members
+    return blob, total, total / len(blob)
+
+
+def _one_record_manifest(path, blob, n_records=1, url="http://x/d.zip"):
+    with path.open("w") as fh:
+        for i in range(n_records):
+            fh.write(json.dumps({"recid": str(i), "files": [
+                {"key": "d.zip", "download": url, "size": len(blob),
+                 "checksum": "md5:" + md5(blob).hexdigest()}]}) + "\n")
+
+
+def test_staging_budget_charges_refunds_and_reports_peak():
+    b = fetch_mod.StagingBudget(max_bytes=1000, max_files=10)
+    b.begin_record()                                  # record A
+    assert b.charge(600, 3) and b.used_bytes == 600 and b.used_files == 3
+    b.begin_record()                                  # record B starts with A's 600 staged
+    with pytest.raises(fetch_mod.BudgetExceeded):     # reclaimable -> abort + roll back
+        b.charge(500, 1)
+    assert b.hit_limit == "bytes" and b.full()        # ...and the run should pause
+    b.refund(600, 3)                             # e.g. an archive deleted after extraction
+    assert b.used_bytes == 0 and b.used_files == 0
+    assert b.peak_bytes == 600 and b.peak_files == 3      # high-water mark retained
+    b.begin_record()
+    assert b.charge(900, 1)                      # space is available again
+    f = fetch_mod.StagingBudget(max_files=2)
+    f.begin_record()
+    assert f.charge(10**9, 1)
+    f.begin_record()                             # a second record, one file already staged
+    assert f.charge(10**9, 1)
+    f.begin_record()
+    with pytest.raises(fetch_mod.BudgetExceeded):
+        f.charge(1, 1)
+    assert f.hit_limit == "files"
+    off = fetch_mod.StagingBudget()
+    assert off.charge(10**12, 10**6) and not off.enabled  # opt-in: no limits, no accounting
+
+
+def test_staging_budget_flags_an_item_too_big_for_the_whole_budget():
+    # A refusal is classified by the record's OWN footprint, never by what happens to be
+    # staged beside it. This record needs more than the entire budget, so no purge can help:
+    # that must NOT look like "pause and reclaim" (the pacing loop would spin on it for
+    # ever) — charge returns False so the caller keeps what landed and moves on.
+    b = fetch_mod.StagingBudget(max_bytes=100)
+    b.begin_record()
+    assert b.charge(500, 1) is False             # -> it can never fit; truncate, don't retry
+    assert b.unfittable == 1 and b.record_was_truncated()
+    assert not b.full()                          # -> reported per item, run continues
+    b.begin_record()
+    assert b.charge(50, 1) and not b.full()      # a stale hit_limit must not trip pause
+    assert not b.record_was_truncated()          # per-record flag reset by begin_record
+    b.begin_record()                             # a NEW record; 50 staged by the previous one
+    with pytest.raises(fetch_mod.BudgetExceeded):
+        b.charge(60, 1)                          # fits alone (60<100) -> reclaimable, retry
+    assert b.full() and b.pause == "bytes"
+
+
+def test_a_refusal_is_classified_by_the_records_own_footprint_not_by_its_neighbours():
+    """The verdict must not depend on which records happen to be in flight.
+
+    The earlier rule was "was the budget empty when this record started?". Under
+    ``--workers N`` a record almost never starts against an empty budget, so a record too
+    big for the budget was classified as merely deferrable — rolled back, re-downloaded and
+    re-refused every pass. In a randomised sweep this stalled 8 of 9 records permanently.
+    """
+    b = fetch_mod.StagingBudget(max_bytes=100)
+    b.begin_record()
+    assert b.charge(30, 1)                       # another worker's record, mid-flight
+    own_a = b.own_handle()
+    b.begin_record()                             # our record (same thread, new tally)
+    assert b.charge(40, 1)                       # 70 used; ours accounts for 40
+    # 90 more would exceed the limit, and ours alone (40+90) exceeds it too -> unfittable,
+    # even though 30 bytes of somebody else's data are sitting in the budget.
+    assert b.charge(90, 1) is False
+    assert b.record_was_truncated()
+    b.refund(40, 1)                              # that record is rolled back: 30 left staged
+    # ...whereas a record that would fit alone (40+50 < 100) but not beside the neighbour's
+    # 30 is deferrable: roll it back, purge, retry.
+    b.begin_record()
+    assert b.charge(40, 1)
+    with pytest.raises(fetch_mod.BudgetExceeded):
+        b.charge(50, 1)
+    assert own_a == [30, 1]                      # per-record tallies stay independent
+
+
+@pytest.mark.parametrize("kind", ["incompressible", "text", "bomb"])
+@pytest.mark.parametrize("workers", [1, 3])
+def test_byte_limit_holds_at_any_compression_ratio(tmp_path, monkeypatch, kind, workers):
+    """THE invariant, swept across compression ratios and both code paths.
+
+    A fixed "expansion factor" cannot bound staging — the ratio is whatever the uploader's
+    compression achieved (measured 1x-4.1x on real records, 880x on a bomb). Because every
+    byte is charged as it lands, peak staged bytes must never exceed the limit for ANY of
+    these, with no tuning.
+    """
+    blob, uncompressed, ratio = _zip_with_ratio(1 << 20, n_members=40, kind=kind)
+    monkeypatch.setattr(fetch_mod, "_session",
+                        lambda _t: _MultiFileStreamSession({"http://x/d.zip": blob}))
+    manifest = tmp_path / "keep.jsonl"
+    _one_record_manifest(manifest, blob, n_records=6)
+    budget = 12 << 20                    # far less than 6 records x 40 MiB uncompressed
+    raw = tmp_path / "raw"
+    stats = fetch_mod.fetch(manifest, out_path=tmp_path / "f.jsonl", raw_dir=raw,
+                            rejections_path=tmp_path / "r.jsonl", max_bytes=None,
+                            max_disk_bytes=budget, workers=workers)
+    staged = sum(p.stat().st_size for p in raw.rglob("*") if p.is_file())
+    assert staged <= budget, f"{kind} (ratio {ratio:.0f}x, workers={workers}): {staged} > {budget}"
+    assert stats["peak_staged_bytes"] <= budget          # the run's own report agrees
+    assert stats["peak_staged_bytes"] >= staged
+
+
+@pytest.mark.parametrize("workers", [1, 3])
+def test_file_limit_holds_exactly(tmp_path, monkeypatch, workers):
+    # Inodes are charged per file as it lands, so the file limit is exact too — no
+    # in-flight overshoot window, unlike the old reservation-based scheme.
+    blob, _u, _r = _zip_with_ratio(4096, n_members=60, kind="text")
+    monkeypatch.setattr(fetch_mod, "_session",
+                        lambda _t: _MultiFileStreamSession({"http://x/d.zip": blob}))
+    manifest = tmp_path / "keep.jsonl"
+    _one_record_manifest(manifest, blob, n_records=5)
+    raw = tmp_path / "raw"
+    stats = fetch_mod.fetch(manifest, out_path=tmp_path / "f.jsonl", raw_dir=raw,
+                            rejections_path=tmp_path / "r.jsonl", max_bytes=None,
+                            max_disk_files=45, workers=workers)
+    # The quota being modelled is an INODE quota (CSD3 scratch is Lustre), so the count
+    # that must stay under the limit includes directories, not just regular files.
+    staged = sum(1 for p in raw.rglob("*") if p.is_file() or p.is_dir())
+    assert staged <= 45, f"workers={workers}: staged {staged} inodes > 45"
+    assert sum(1 for p in raw.rglob("*") if p.is_dir()) > 0   # dirs really are in play
+    assert stats["peak_staged_files"] <= 45
+    assert stats["stopped_on"] == "files" and stats["stopped_disk_budget"] is True
+
+
+def test_directories_are_charged_so_a_dir_heavy_record_cannot_blow_the_inode_quota(
+        tmp_path, monkeypatch):
+    """Each member of this archive sits in its own directory, so the real inode cost is
+    ~2x the file count. Counting only files (the earlier behaviour) let a record use about
+    twice the quota it was charged for — on CSD3 that is the silent stall the limit exists
+    to prevent, because exceeding the 1M-file quota only shows up as write errors."""
+    blob, _u, _r = _zip_with_ratio(256, n_members=40, kind="text")   # calc0..39/OUTCAR
+    monkeypatch.setattr(fetch_mod, "_session",
+                        lambda _t: _MultiFileStreamSession({"http://x/d.zip": blob}))
+    manifest = tmp_path / "keep.jsonl"
+    _one_record_manifest(manifest, blob, n_records=1)
+    raw = tmp_path / "raw"
+    limit = 30
+    stats = fetch_mod.fetch(manifest, out_path=tmp_path / "f.jsonl", raw_dir=raw,
+                            rejections_path=tmp_path / "r.jsonl", max_bytes=None,
+                            max_disk_files=limit, workers=1)
+    files = sum(1 for p in raw.rglob("*") if p.is_file())
+    dirs = sum(1 for p in raw.rglob("*") if p.is_dir())
+    assert dirs >= files                       # one directory per extracted member
+    assert files + dirs <= limit, f"{files} files + {dirs} dirs > {limit} inodes"
+    assert stats["peak_staged_files"] <= limit
+    assert stats["items_over_whole_budget"] >= 1   # reported, not silently truncated
+
+
+def _understated_manifest(path, blob, declared, key="OUTCAR", url="http://x/OUTCAR"):
+    """A manifest that declares ``declared`` bytes for a file that is really ``len(blob)``.
+
+    Models the case the budget must survive without trusting metadata: a stale or wrong
+    Zenodo ``size`` (or a server that simply sends more than it advertised). It matters in
+    production because the real harvest runs with ``--max-bytes 0`` — no per-file cap at
+    all — so the staging budget is the *only* thing bounding what lands on disk.
+    """
+    with path.open("w") as fh:
+        fh.write(json.dumps({"recid": "0", "files": [
+            {"key": key, "download": url, "size": declared,
+             "checksum": "md5:" + md5(blob).hexdigest()}]}) + "\n")
+
+
+def test_budget_is_charged_from_bytes_that_land_not_from_the_declared_size(
+        tmp_path, monkeypatch):
+    # A file whose declared size understates reality by 30000x, small enough to fit.
+    # The tally must equal what is really on disk — if it recorded the declared size, the
+    # budget would think it had almost all its room left and overrun on the next record.
+    blob = os.urandom(150_000)
+    monkeypatch.setattr(fetch_mod, "_session",
+                        lambda _t: _MultiFileStreamSession({"http://x/OUTCAR": blob}))
+    manifest = tmp_path / "keep.jsonl"
+    _understated_manifest(manifest, blob, declared=5)
+    raw = tmp_path / "raw"
+    stats = fetch_mod.fetch(manifest, out_path=tmp_path / "f.jsonl", raw_dir=raw,
+                            rejections_path=tmp_path / "r.jsonl", max_bytes=0,
+                            max_disk_bytes=1 << 20, workers=1)
+    on_disk = sum(p.stat().st_size for p in raw.rglob("*") if p.is_file())
+    assert on_disk == len(blob) and stats["fetched"] == 1
+    assert stats["staged_bytes_now"] == on_disk        # reality, not the declared 5 bytes
+    assert stats["peak_staged_bytes"] == on_disk
+
+
+def test_byte_limit_holds_when_a_file_is_far_bigger_than_it_declared(tmp_path, monkeypatch):
+    """The limit must bound what LANDS, not what was promised.
+
+    Charging the declared size up front and then writing without re-checking meant a file
+    that arrived larger than advertised wrote past the ceiling unnoticed — and with
+    ``--max-bytes 0`` (the production setting) there was no second cap to catch it. The
+    transfer must now run out of allowance part way and be discarded.
+    """
+    blob = os.urandom(4 << 20)                      # 4 MiB actually served
+    monkeypatch.setattr(fetch_mod, "_session",
+                        lambda _t: _MultiFileStreamSession({"http://x/OUTCAR": blob}))
+    manifest = tmp_path / "keep.jsonl"
+    _understated_manifest(manifest, blob, declared=1000)   # ~1 KB advertised
+    raw = tmp_path / "raw"
+    limit = 1 << 20                                 # 1 MiB budget: the 4 MiB cannot fit
+    stats = fetch_mod.fetch(manifest, out_path=tmp_path / "f.jsonl", raw_dir=raw,
+                            rejections_path=tmp_path / "r.jsonl", max_bytes=0,
+                            max_disk_bytes=limit, workers=1)
+    on_disk = sum(p.stat().st_size for p in raw.rglob("*") if p.is_file())
+    assert on_disk <= limit, f"{on_disk} B staged against a {limit} B limit"
+    assert stats["peak_staged_bytes"] <= limit
+    assert not any(p.name.endswith(".part") for p in raw.rglob("*"))  # partial discarded
+    # ...and the record stays retryable: it was refused for space, not for bad data.
+    reasons = [r["reason"] for r in read_jsonl(tmp_path / "r.jsonl")]
+    assert "disk_budget_reached" in reasons
+    assert "no_vasp_files_fetched" not in reasons     # would be terminal = permanent loss
+
+
+def test_7z_extraction_is_charged_as_it_writes_not_from_its_header(tmp_path):
+    """``.7z`` is the one backend that cannot be paced from the outside: py7zr decompresses
+    the whole selection in a single call, on its own worker threads. The charge therefore
+    happens inside the writer it is handed, per block, so the same invariant holds."""
+    archive = tmp_path / "calcs.7z"
+    _write_7z(archive, {f"calc{i}/OUTCAR": os.urandom(50_000) for i in range(8)})
+    dest = tmp_path / "out"
+    limit = 120_000                                  # room for ~2 of the 8 members
+    b = fetch_mod.StagingBudget(max_bytes=limit)
+    b.begin_record()
+    names, extracted = fetch_mod._extract_7z(archive, dest, 1 << 40, b)
+    on_disk = sum(p.stat().st_size for p in dest.rglob("*") if p.is_file())
+    assert len(names) == 8 and 0 < len(extracted) < 8      # partial, and it says so
+    assert on_disk <= limit, f"{on_disk} B extracted against a {limit} B limit"
+    assert b.used_bytes == on_disk                        # tally == reality
+    assert b.record_was_truncated()                       # reported, not silent
+    # whatever did land is intact (no half-written member kept)
+    assert all((dest / n).stat().st_size == 50_000 for n in extracted)
+
+
+def test_7z_extraction_defers_the_record_when_a_purge_could_make_room(tmp_path):
+    # Same archive, but the budget is full of ANOTHER record's data: the right response is
+    # to abort this record for a clean rollback and retry after parse+purge, not to keep a
+    # partial stage. py7zr's threads cannot raise that decision, so the factory records it
+    # and _extract_7z re-raises in the calling thread.
+    archive = tmp_path / "calcs.7z"
+    _write_7z(archive, {f"calc{i}/OUTCAR": os.urandom(50_000) for i in range(8)})
+    b = fetch_mod.StagingBudget(max_bytes=120_000)
+    b.begin_record()
+    assert b.charge(100_000, 1)          # an earlier record's staged data
+    b.begin_record()                     # this record starts with a non-zero floor
+    with pytest.raises(fetch_mod.BudgetExceeded):
+        fetch_mod._extract_7z(archive, tmp_path / "out", 1 << 40, b)
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_limits_hold_with_concurrent_workers_on_one_staging_dir(tmp_path, monkeypatch,
+                                                                workers):
+    """The real harvest runs ``--workers 4`` against one CSD3 staging dir, so the budget is
+    shared: several records are downloading and extracting at the same moment, each
+    charging the same tally. Both limits must hold at once, with every declared size wrong.
+    """
+    blob, _u, _r = _zip_with_ratio(8192, n_members=12, kind="bomb")   # 1000x expansion
+    monkeypatch.setattr(fetch_mod, "_session",
+                        lambda _t: _MultiFileStreamSession({"http://x/d.zip": blob}))
+    manifest = tmp_path / "keep.jsonl"
+    with manifest.open("w") as fh:
+        for i in range(10):
+            fh.write(json.dumps({"recid": str(i), "files": [
+                {"key": "d.zip", "download": "http://x/d.zip", "size": 7,  # nonsense size
+                 "checksum": "md5:" + md5(blob).hexdigest()}]}) + "\n")
+    raw = tmp_path / "raw"
+    max_b, max_f = 300_000, 60
+    stats = fetch_mod.fetch(manifest, out_path=tmp_path / "f.jsonl", raw_dir=raw,
+                            rejections_path=tmp_path / "r.jsonl", max_bytes=0,
+                            max_disk_bytes=max_b, max_disk_files=max_f, workers=workers)
+    on_disk = sum(p.stat().st_size for p in raw.rglob("*") if p.is_file())
+    inodes = sum(1 for p in raw.rglob("*") if p.is_file() or p.is_dir())
+    assert on_disk <= max_b, f"workers={workers}: {on_disk} B > {max_b} B"
+    assert inodes <= max_f, f"workers={workers}: {inodes} inodes > {max_f}"
+    assert stats["peak_staged_bytes"] <= max_b and stats["peak_staged_files"] <= max_f
+    # and the tally still agrees with the filesystem afterwards (no drift under threads)
+    assert (stats["staged_bytes_now"], stats["staged_files_now"]) == (on_disk, inodes)
+
+
+def test_a_record_that_cannot_fit_leaves_nothing_charged_behind(tmp_path, monkeypatch):
+    """A record refused as too big must not leave staging behind that nothing can reclaim.
+
+    ``purge-raw`` only frees trees whose calc_ids reached the dataset, so a directory left
+    by an unrecorded record holds budget for the rest of the harvest. It used to: the empty
+    directories of a refused record stayed charged, the budget was therefore never empty
+    again, and every LATER record was deferred and retried against space no purge could
+    free — 8 of 9 records permanently uncollected in a randomised sweep.
+    """
+    blob, _u, _r = _zip_with_ratio(400_000, n_members=4, kind="text")
+    monkeypatch.setattr(fetch_mod, "_session",
+                        lambda _t: _MultiFileStreamSession({"http://x/d.zip": blob}))
+    manifest = tmp_path / "keep.jsonl"
+    _one_record_manifest(manifest, blob, n_records=1)
+    raw = tmp_path / "raw"
+    stats = fetch_mod.fetch(manifest, out_path=tmp_path / "f.jsonl", raw_dir=raw,
+                            rejections_path=tmp_path / "r.jsonl", max_bytes=0,
+                            max_disk_bytes=200_000, workers=1)   # far too small for it
+    assert stats["items_over_whole_budget"] >= 1
+    assert list(raw.iterdir()) == []                     # tree removed...
+    assert stats["staged_bytes_now"] == 0                # ...and un-charged
+    assert stats["staged_files_now"] == 0
+    reasons = [r["reason"] for r in read_jsonl(tmp_path / "r.jsonl")]
+    assert "record_exceeds_disk_budget" in reasons
+    # NOT terminal: raising the budget must be enough to collect it on a later run.
+    assert not (fetch_mod._TERMINAL_REJECT_REASONS & set(reasons))
+    assert fetch_mod._terminal_reject_recids(tmp_path / "r.jsonl") == set()
+
+
+def test_a_parallel_pass_that_stages_nothing_falls_back_to_serial(tmp_path, monkeypatch):
+    """Forward progress must be guaranteed, not likely.
+
+    With several workers, records can each fit individually yet fill the budget between
+    them — then every one is rolled back and the pass stages nothing. Handing that batch
+    back to the pacing loop repeats it for ever, because there is nothing new to purge. The
+    run must notice and retry serially, where a record meets a budget the rollbacks just
+    emptied.
+    """
+    blob, _u, _r = _zip_with_ratio(300_000, n_members=3, kind="text")   # ~0.9 MB staged
+    monkeypatch.setattr(fetch_mod, "_session",
+                        lambda _t: _MultiFileStreamSession({"http://x/d.zip": blob}))
+    manifest = tmp_path / "keep.jsonl"
+    _one_record_manifest(manifest, blob, n_records=4)
+    raw = tmp_path / "raw"
+    limit = 1_300_000                     # room for one record, not for four at once
+    stats = fetch_mod.fetch(manifest, out_path=tmp_path / "f.jsonl", raw_dir=raw,
+                            rejections_path=tmp_path / "r.jsonl", max_bytes=0,
+                            max_disk_bytes=limit, workers=4)
+    on_disk = sum(p.stat().st_size for p in raw.rglob("*") if p.is_file())
+    assert on_disk <= limit and stats["peak_staged_bytes"] <= limit
+    assert stats["fetched"] >= 1, "the pass must not stage nothing and hand back a stall"
+    if stats.get("serial_fallback"):
+        assert stats["fetched"] >= 1      # the fallback is what rescued it
+
+
+def test_refused_member_is_refunded_so_the_budget_does_not_leak(tmp_path):
+    # A member abandoned part way (here: over --max-member-bytes) must give back both its
+    # bytes and its inode. A leak would shrink the budget on every archive until the
+    # harvest paced itself to a standstill with disk to spare.
+    b = fetch_mod.StagingBudget(max_bytes=1 << 20, max_files=100)
+    b.begin_record()
+    src = io.BytesIO(b"x" * 5000)
+    out = tmp_path / "sub" / "OUTCAR"
+    assert fetch_mod._copy_capped(src, out, 1000, b) == fetch_mod._COPY_OVER_CAP
+    assert not out.exists()
+    assert b.used_bytes == 0
+    assert b.used_files == 1          # only the directory it created remains charged
+    assert (tmp_path / "sub").is_dir()
+
+
+def test_archive_bytes_are_refunded_so_they_are_not_double_counted(tmp_path, monkeypatch):
+    # An archive is deleted as soon as its VASP members are extracted, so its bytes are
+    # transient. If they were never refunded, the budget would think the footprint is
+    # (archive + extracted) and pace ~2x too conservatively.
+    blob, _u, _r = _zip_with_ratio(64, n_members=2, kind="text")
+    monkeypatch.setattr(fetch_mod, "_session",
+                        lambda _t: _MultiFileStreamSession({"http://x/d.zip": blob}))
+    manifest = tmp_path / "keep.jsonl"
+    _one_record_manifest(manifest, blob, n_records=1)
+    raw = tmp_path / "raw"
+    stats = fetch_mod.fetch(manifest, out_path=tmp_path / "f.jsonl", raw_dir=raw,
+                            rejections_path=tmp_path / "r.jsonl", max_bytes=None,
+                            max_disk_bytes=1 << 30, workers=1)
+    on_disk = sum(p.stat().st_size for p in raw.rglob("*") if p.is_file())
+    # Inodes, not just regular files: on Lustre (CSD3 scratch) a directory consumes one
+    # from the same "1 million files" quota, so the tally has to include them.
+    n_inodes_on_disk = sum(1 for p in raw.rglob("*") if p.is_file() or p.is_dir())
+    assert sum(1 for p in raw.rglob("*") if p.is_dir()) > 0, "expected staged directories"
+    # the running total matches what is really there (archive refunded, members kept)
+    assert stats["staged_bytes_now"] == on_disk
+    assert stats["staged_files_now"] == n_inodes_on_disk
+    assert not (raw / "0" / "d.zip").exists()
+
+
+def test_member_too_big_for_the_budget_is_rejected_not_stalled(tmp_path, monkeypatch):
+    # A single member larger than the WHOLE budget can never be staged. It must be
+    # reported per item and the run continue — otherwise the pacing loop retries forever.
+    big, _u, _r = _zip_with_ratio(4 << 20, n_members=1, kind="text")
+    small, _u2, _r2 = _zip_with_ratio(1024, n_members=1, kind="text")
+    monkeypatch.setattr(fetch_mod, "_session", lambda _t: _MultiFileStreamSession(
+        {"http://x/big.zip": big, "http://x/small.zip": small}))
+    manifest = tmp_path / "keep.jsonl"
+    with manifest.open("w") as fh:
+        for recid, blob, url in (("1", big, "http://x/big.zip"),
+                                 ("2", small, "http://x/small.zip")):
+            fh.write(json.dumps({"recid": recid, "files": [
+                {"key": url.rsplit("/", 1)[-1], "download": url, "size": len(blob),
+                 "checksum": "md5:" + md5(blob).hexdigest()}]}) + "\n")
+    stats = fetch_mod.fetch(manifest, out_path=tmp_path / "f.jsonl",
+                            raw_dir=tmp_path / "raw", rejections_path=tmp_path / "r.jsonl",
+                            max_bytes=None, max_disk_bytes=1 << 20, workers=1)
+    reasons = [r["reason"] for r in read_jsonl(tmp_path / "r.jsonl")]
+    assert "disk_budget_reached" in reasons          # the oversized item, reported
+    assert stats["items_over_whole_budget"] >= 1
+    assert stats["fetched"] == 1                     # ...and the small record still landed
+
+
+def test_budget_deferred_record_is_rolled_back_not_left_partial(tmp_path, monkeypatch):
+    """A record cut short by the budget must leave NO trace and stay out of the manifest.
+
+    Otherwise the harvest keeps permanently-partial data: resumes skip recids already in
+    ``fetched.jsonl``, and partial files that no fetched record owns can never be reclaimed
+    by ``purge-raw`` — they would occupy the budget forever.
+    """
+    # Sized so the second record fits on its own but not beside the first: that is what
+    # makes it DEFERRABLE (a purge can make room) rather than too big for the budget.
+    filler, _u, _r = _zip_with_ratio(1 << 20, n_members=6, kind="text")     # ~6 MiB staged
+    big, _u2, _r2 = _zip_with_ratio(1 << 20, n_members=5, kind="text")      # ~5 MiB staged
+    monkeypatch.setattr(fetch_mod, "_session", lambda _t: _MultiFileStreamSession(
+        {"http://x/filler.zip": filler, "http://x/big.zip": big}))
+    manifest = tmp_path / "keep.jsonl"
+    with manifest.open("w") as fh:
+        for recid, blob, url in (("filler", filler, "http://x/filler.zip"),
+                                 ("big", big, "http://x/big.zip")):
+            fh.write(json.dumps({"recid": recid, "files": [
+                {"key": url.rsplit("/", 1)[-1], "download": url, "size": len(blob),
+                 "checksum": "md5:" + md5(blob).hexdigest()}]}) + "\n")
+    raw = tmp_path / "raw"
+    stats = fetch_mod.fetch(manifest, out_path=tmp_path / "f.jsonl", raw_dir=raw,
+                            rejections_path=tmp_path / "r.jsonl", max_bytes=None,
+                            max_disk_bytes=12 << 20, workers=1)
+    reasons = [r["reason"] for r in read_jsonl(tmp_path / "r.jsonl")]
+    assert "disk_budget_deferred" in reasons              # deferred, with a reason
+    assert not (raw / "big").exists()                     # rolled back completely
+    fetched = [r["recid"] for r in read_jsonl(tmp_path / "f.jsonl")]
+    assert "big" not in fetched                           # ...and NOT marked as done
+    assert "filler" in fetched                            # the record that did fit is kept
+    assert stats["stopped_disk_budget"] is True           # -> pipeline reclaims + resumes
+    # the budget's running total matches reality after the rollback (no leaked charge)
+    on_disk = sum(p.stat().st_size for p in raw.rglob("*") if p.is_file())
+    assert stats["staged_bytes_now"] == on_disk
+
+
+def test_closed_loop_harvests_everything_without_exceeding_the_limits(tmp_path, monkeypatch):
+    """The end-to-end property, with REAL archives at a high compression ratio.
+
+    A manifest whose uncompressed content is many times the budget must still be harvested
+    COMPLETELY, with peak staging never breaching either limit. Exercises the full loop:
+    charge-as-written -> stop cleanly -> reclaim (parse+purge stand-in) -> resume the same
+    batch -> repeat. A regression in any link shows up as lost records or a blown budget.
+    """
+    from zenodo_harvest.pipeline import run_pipeline
+
+    blob, uncompressed, ratio = _zip_with_ratio(1 << 20, n_members=8, kind="text")
+    assert ratio > 1.5                                    # genuinely compressed
+    monkeypatch.setattr(fetch_mod, "_session",
+                        lambda _t: _MultiFileStreamSession({"http://x/d.zip": blob}))
+    budget_bytes, budget_files = 20 << 20, 40
+    n_parts, per_part = 4, 5
+    parts = []
+    for pi in range(n_parts):
+        part = tmp_path / f"part-{pi}.jsonl"
+        with part.open("w") as fh:
+            for i in range(per_part):
+                fh.write(json.dumps({"recid": f"{pi}-{i}", "files": [
+                    {"key": "d.zip", "download": "http://x/d.zip", "size": len(blob),
+                     "checksum": "md5:" + md5(blob).hexdigest()}]}) + "\n")
+        parts.append(part)
+    raw = tmp_path / "raw"
+    peaks = {"bytes": 0, "files": 0}
+
+    def fetch_fn(part):
+        stats = fetch_mod.fetch(part, out_path=part.with_suffix(".fetched.jsonl"),
+                                raw_dir=raw, rejections_path=tmp_path / "rej.jsonl",
+                                max_bytes=None, max_disk_bytes=budget_bytes,
+                                max_disk_files=budget_files, workers=1)
+        peaks["bytes"] = max(peaks["bytes"], stats["peak_staged_bytes"])
+        peaks["files"] = max(peaks["files"], stats["peak_staged_files"])
+        return not stats["stopped_disk_budget"]
+
+    def process_fn(part):       # stands in for parse + purge-raw
+        for rec in read_jsonl(part.with_suffix(".fetched.jsonl")):
+            shutil.rmtree(raw / rec["recid"], ignore_errors=True)
+
+    done, errors = run_pipeline(parts, fetch_fn, process_fn, after_workers=1)
+
+    assert not errors, errors
+    assert len(done) == n_parts
+    # NOTHING lost: every record of every batch landed exactly once...
+    fetched = [r["recid"] for p in parts for r in read_jsonl(p.with_suffix(".fetched.jsonl"))]
+    assert len(fetched) == n_parts * per_part == len(set(fetched))
+    # ...while total uncompressed content far exceeded the byte budget...
+    assert uncompressed * n_parts * per_part > budget_bytes * 4
+    # ...and neither limit was ever breached.
+    assert peaks["bytes"] <= budget_bytes, f"peak {peaks['bytes']} > {budget_bytes}"
+    assert peaks["files"] <= budget_files, f"peak {peaks['files']} > {budget_files}"
+
+
+def test_record_bigger_than_the_whole_budget_does_not_livelock(tmp_path, monkeypatch):
+    """Regression for an observed livelock (live run: 48 deferral cycles, never finished).
+
+    A record whose own staging exceeds the entire budget used to fail mid-extraction with
+    "space could be freed" (the space in question being its OWN earlier members), get rolled
+    back, and be retried — re-downloading every time. It must instead be recognised as
+    unfittable: staged as far as the budget allows, kept, reported, and NOT retried.
+    """
+    # A tiny archive (so the download itself fits) whose CONTENTS far exceed the budget.
+    blob, uncompressed, _r = _zip_with_ratio(1 << 20, n_members=20, kind="bomb")
+    assert len(blob) < (1 << 20) < uncompressed
+    calls = {"n": 0}
+
+    class _CountingSession(_MultiFileStreamSession):
+        def get(self, url, **k):
+            calls["n"] += 1
+            return super().get(url, **k)
+
+    monkeypatch.setattr(fetch_mod, "_session",
+                        lambda _t: _CountingSession({"http://x/d.zip": blob}))
+    manifest = tmp_path / "keep.jsonl"
+    _one_record_manifest(manifest, blob, n_records=1)
+    budget = 6 << 20                       # only ~6 MiB: far less than the record needs
+    raw = tmp_path / "raw"
+
+    # Emulate the pacing loop: fetch, "purge" nothing (the record is the only thing), retry.
+    for attempt in range(3):
+        stats = fetch_mod.fetch(manifest, out_path=tmp_path / "f.jsonl", raw_dir=raw,
+                                rejections_path=tmp_path / "r.jsonl", max_bytes=None,
+                                max_disk_bytes=budget, workers=1)
+        if attempt == 0:
+            assert stats["fetched"] == 1               # partial stage KEPT, not rolled back
+            assert stats["items_over_whole_budget"] >= 1
+            assert stats["stopped_disk_budget"] is False   # no pointless pause/retry
+            downloads_after_first = calls["n"]
+        else:
+            # already in the manifest -> skipped entirely, nothing re-downloaded
+            assert stats["skipped_existing"] == 1
+            assert calls["n"] == downloads_after_first
+
+    staged = sum(p.stat().st_size for p in raw.rglob("*") if p.is_file())
+    assert staged <= budget                            # limit still respected
+    reasons = [r["reason"] for r in read_jsonl(tmp_path / "r.jsonl")]
+    assert "record_exceeds_disk_budget" in reasons     # and it is reported, not silent

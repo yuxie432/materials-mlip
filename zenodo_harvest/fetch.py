@@ -12,18 +12,24 @@ disk as one directory per calculation, ready for parsing. Design goals:
   interrupted harvest resumes cleanly, with no duplicate work or manifest lines
   (important on the cluster).
 * **Robust**: size-capped (archive *and* per-member uncompressed), checksum-verified,
-  zip-slip-safe, streamed (zip/tar/rar never load a whole member into RAM; 7z
-  decompresses selected members in memory — py7zr's API — bounded by the member
-  cap). `.zip`/`.tar*` use the stdlib; `.rar`/`.7z` are handled when the optional
-  `archives` extra (rarfile/py7zr) is installed, else logged as a rejection rather
-  than being fatal.
+  zip-slip-safe, and never holding a whole member in RAM (zip/tar/tar.zst/rar stream in
+  chunks; 7z extracts selected members straight to disk). `.zip`/`.tar*` use the stdlib;
+  `.rar`/`.7z`/`.tar.zst` need the optional `archives` extra (rarfile/py7zr/zstandard),
+  else they are logged as a rejection rather than being fatal.
+* **Interruptible**: a part-downloaded file resumes over HTTP Range instead of
+  restarting (a cluster job's wallclock can expire mid-transfer of a >100 GB archive).
+* **Quota-paced**: `max_disk_bytes` AND `max_disk_files` stop the run cleanly (resumably)
+  once staging fills either limit, because cluster scratch is inode-limited as well as
+  byte-limited and — measured on real records — inodes bind first.
 """
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import re
+import shutil
 import tarfile
 import threading
 import time
@@ -58,8 +64,9 @@ except ImportError:  # pragma: no cover - optional dep
     zstandard = None  # type: ignore
 
 # Per-member *uncompressed* size cap: bounds disk and defuses decompression bombs
-# (the archive-level max_bytes only caps the *compressed* download). Extraction
-# streams in chunks, so memory stays ~chunk-sized regardless of member size.
+# (the archive-level max_bytes only caps the *compressed* download). Every backend
+# writes members to disk without holding one in memory, so RAM stays ~chunk-sized
+# regardless of member size (zip/tar/tar.zst/rar stream in chunks; 7z extracts to disk).
 DEFAULT_MAX_MEMBER_BYTES = 2_000_000_000
 
 # Record-level rejection reasons that are terminal (re-running can't help): the
@@ -68,6 +75,28 @@ DEFAULT_MAX_MEMBER_BYTES = 2_000_000_000
 # re-rejected every run. Transient reasons (download_error/http_*) are NOT here, so
 # they still retry. See --retry-rejected to override.
 _TERMINAL_REJECT_REASONS = {"no_calc_units_after_extract", "no_vasp_files_fetched"}
+
+# Per-file failure reasons that say "the data may well be fine, we just couldn't get it
+# this time": rate limits, server errors, dropped connections, and — importantly on a
+# cluster — a full disk / exceeded quota (ENOSPC/EDQUOT) while writing.
+# ``disk_budget_*`` counts as "couldn't get it this time" too: a file refused because the
+# staging budget is full has nothing wrong with it, so the record must stay retryable —
+# otherwise a pacing event would leave it looking like "this record contains no VASP",
+# which is terminal and would be skipped by every future run.
+_TRANSIENT_REASON_PREFIXES = ("download_error", "write_error", "http_5", "http_429",
+                              "disk_budget")
+# Errnos that mean "out of space", not "bad data", when extraction fails mid-write.
+_OUT_OF_SPACE_ERRNOS = {errno.ENOSPC, errno.EDQUOT}
+# Non-terminal stand-in for the record-level verdicts above: used when a record produced
+# nothing but at least one failure was transient. WITHOUT this, a quota-exhaustion event
+# would make every affected record look like "contains no VASP" — a TERMINAL reason — and
+# they would be silently skipped by every later run. That is data loss from a condition
+# the harvest is otherwise designed to ride out, so it must stay retryable.
+_TRANSIENT_RECORD_REASON = "fetch_failed_transient"
+
+
+def _is_transient_reason(reason: str) -> bool:
+    return reason.startswith(_TRANSIENT_REASON_PREFIXES)
 
 # Files worth extracting for parsing / provenance. A canonical VASP stem taken as
 # a *word* — at the start of the basename or after a path/name separator — with
@@ -98,6 +127,10 @@ _TAR_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".tx
 # CPython 3.14, so we decompress via the `zstandard` lib (the `archives` extra) and
 # stream the result through tarfile — see `_extract_tar_zst`.
 _ZST_TAR_SUFFIXES = (".tar.zst", ".tzst")
+# Bare single-compression suffixes. Ambiguous by design: either ONE compressed file
+# (OUTCAR.gz) or a tarball whose uploader dropped the `.tar` (research_data.gz). See
+# _is_archive for how the two are told apart.
+_BARE_COMPRESS_SUFFIXES = (".gz", ".bz2", ".xz")
 # Split/spanned archive part names (`foo.z01`, `foo.z02`, …). The stdlib cannot
 # reassemble a multi-volume zip, so these are surfaced as an explicit rejection
 # rather than silently ignored (which looked like "record had no VASP").
@@ -120,17 +153,66 @@ def _md5(path: Path, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
-def _dir_bytes(path: Path) -> int:
-    """Total size of the files under ``path`` (0 if absent). Used by the disk-budget
-    valve to bound persistent staging (extracted VASP files awaiting parse+purge)."""
+def _dir_usage(path: Path) -> tuple[int, int]:
+    """``(bytes, inodes)`` under ``path`` (``(0, 0)`` if absent), from ONE walk.
+
+    Bytes drive the disk-budget valve (bounding persistent staging — extracted VASP
+    files awaiting parse+purge). The second number is reported alongside because cluster
+    scratch is also inode-limited (CSD3 ``/rds/user/<crsid>/hpc-work``: 1 TB **and 1
+    million files**), and a single archive of many small per-calc dirs can burn inodes
+    long before bytes — a silent stall we would otherwise only see as write errors.
+
+    **Directories are counted as well as files.** CSD3's ``/rds`` is Lustre, where the
+    "1 million files" quota is an *inode* quota and a directory consumes an inode exactly
+    like a file (the CSD3 page states the limit but not what it counts; the Lustre quota
+    model does). Real screening uploads are thousands of tiny per-calc *directories*, so
+    counting only regular files understated the quota that actually stops the job. Bytes
+    ignore directories: their own size is filesystem metadata, not payload.
+    """
     if not path.exists():
-        return 0
-    return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+        return 0, 0
+    total = count = 0
+    for p in path.rglob("*"):
+        if p.is_dir():
+            count += 1                  # a directory is an inode too (Lustre quota)
+        elif p.is_file():
+            total += p.stat().st_size
+            count += 1
+    return total, count
+
+
+def _charged_mkdir(path: Path, budget: "StagingBudget | None",
+                   own: list[int] | None = None) -> bool:
+    """``mkdir -p`` that charges the budget one inode per directory it actually creates.
+
+    Charged BEFORE creating, so a refusal leaves nothing on disk. Returns False when the
+    inode limit refuses the directories (and raises :class:`BudgetExceeded` when a purge
+    could make room, exactly like any other charge). ``own`` is only needed by callers
+    running outside the record's own thread (see :class:`_BudgetedWriterFactory`).
+    """
+    if path.is_dir():
+        return True
+    if budget is not None and budget.enabled:
+        missing = 0
+        probe = path
+        while not probe.exists() and probe.parent != probe:
+            missing += 1
+            probe = probe.parent
+        if missing and not budget.charge(0, missing, own=own):
+            return False
+    path.mkdir(parents=True, exist_ok=True)
+    return True
+
+
+def _dir_bytes(path: Path) -> int:
+    """Total size of the files under ``path`` (0 if absent)."""
+    return _dir_usage(path)[0]
 
 
 def download_file(
     session: requests.Session, url: str, dest: Path, expected_md5: str | None,
-    max_bytes: int | None = None,
+    max_bytes: int | None = None, resume: bool = True,
+    budget: "StagingBudget | None" = None,
 ) -> tuple[bool, str]:
     """Download ``url`` to ``dest``, verifying md5. Returns (ok, reason).
 
@@ -138,48 +220,125 @@ def download_file(
     place, up to 3 attempts; only once that budget is spent does it fall through to
     the ``http_429`` transient rejection (so a still-throttled file simply retries on
     the next run rather than being dropped as a hard failure).
+
+    **Byte-range resume** (``resume``, default on): a ``<dest>.part`` left by a killed
+    run is continued with ``Range: bytes=<have>-`` + an append, instead of restarting
+    from byte 0. This matters on the cluster, where the job wallclock (36 h on CSD3)
+    can expire mid-transfer of a >100 GB archive — without it every resume threw away
+    all the bytes already pulled. Safety: resume only happens when Zenodo gave us an
+    ``expected_md5``, so a stale/garbage ``.part`` (e.g. from a superseded file version)
+    is always caught by the final checksum and deleted, costing at most one wasted pass
+    rather than corrupting the staged archive. A server that ignores ``Range`` answers
+    200 and we transparently restart from scratch; a ``416`` means the ``.part`` is
+    already complete, which the checksum then confirms.
+
+    **Budget** (when given): every byte is charged to the :class:`StagingBudget` *as it is
+    written*, never from the manifest's declared ``size`` — a server (or manifest) that
+    understates a file's length cannot make the harvest write more than it counted. Bytes
+    charged here are refunded only on the paths that actually delete the partial file; a
+    ``.part`` deliberately kept for a later resume stays charged, because it stays on disk.
     """
     if dest.exists() and expected_md5 and _md5(dest) == expected_md5:
-        return True, "cached"
-    dest.parent.mkdir(parents=True, exist_ok=True)
+        return True, "cached"   # already on disk => already in the budget's baseline
+    charged_bytes = 0
+    charged_files = 0
+
+    def _take(n_bytes: int, n_files: int = 0) -> bool:
+        """Charge for bytes/inodes about to be written here (tracked so we can refund)."""
+        nonlocal charged_bytes, charged_files
+        if budget is None or budget.charge(n_bytes, n_files):
+            charged_bytes += n_bytes
+            charged_files += n_files
+            return True
+        return False
+
+    def _give_back() -> None:
+        """Refund this call's charges — only where the bytes are being deleted."""
+        nonlocal charged_bytes, charged_files
+        if budget is not None and (charged_bytes or charged_files):
+            budget.refund(charged_bytes, charged_files)
+        charged_bytes = charged_files = 0
+
+    if not _charged_mkdir(dest.parent, budget):
+        return False, "disk_budget_reached"
     tmp = dest.with_suffix(dest.suffix + ".part")
+    # Resuming without a checksum would risk silently appending to unrelated bytes.
+    can_resume = resume and expected_md5 is not None
+    outcome = "downloaded"
     for attempt in range(3):
+        have = tmp.stat().st_size if (can_resume and tmp.is_file()) else 0
+        headers = {"Range": f"bytes={have}-"} if have else {}
         try:
-            with session.get(url, stream=True, timeout=120) as r:
+            with session.get(url, stream=True, timeout=120, headers=headers) as r:
                 if r.status_code == 429 and attempt < 2:
                     wait = min(_parse_retry_after(r.headers.get("Retry-After")), 120)
                     logger.warning("download rate limited; sleeping %ss", wait)
                     time.sleep(wait)
                     continue
-                if r.status_code != 200:
+                if have and r.status_code == 416:
+                    # Range unsatisfiable => the .part already covers the whole file.
+                    # Let the md5 check below decide whether it is the right whole file.
+                    outcome = "resumed"
+                    break
+                if have and r.status_code == 206:
+                    mode, written = "ab", have   # continuing where we left off
+                    outcome = "resumed"
+                elif r.status_code == 200:
+                    mode, written = "wb", 0      # fresh (or Range ignored -> restart)
+                    if have:
+                        logger.info("server ignored Range for %s; restarting download", url)
+                        # Opening "wb" truncates the .part, so the bytes a previous run
+                        # charged for it are about to vanish: hand them back.
+                        if budget is not None:
+                            budget.refund(have, 0)
+                else:
                     return False, f"http_{r.status_code}"  # incl. http_429 after retries
                 clen = r.headers.get("Content-Length")
-                if max_bytes and clen and int(clen) > max_bytes:
+                # With a 206 the Content-Length is the REMAINING bytes, so compare the
+                # full projected size (already-have + remaining) against the cap.
+                if max_bytes and clen and written + int(clen) > max_bytes:
                     return False, "over_size_cap"
-                written = 0
-                with tmp.open("wb") as fh:
+                if not tmp.exists() and not _take(0, 1):
+                    return False, "disk_budget_reached"   # the .part is a new inode
+                with tmp.open(mode) as fh:
                     for chunk in r.iter_content(1 << 20):
-                        written += len(chunk)
-                        if max_bytes and written > max_bytes:
+                        if max_bytes and written + len(chunk) > max_bytes:
                             fh.close()
                             tmp.unlink(missing_ok=True)
+                            _give_back()
                             return False, "over_size_cap"
+                        # Charge what is ABOUT to be written, byte-exactly. Nothing
+                        # declared is trusted, so a mis-stated Content-Length or manifest
+                        # size cannot put more on disk than the budget accounted for.
+                        if not _take(len(chunk)):
+                            fh.close()
+                            tmp.unlink(missing_ok=True)
+                            _give_back()
+                            return False, "disk_budget_reached"
+                        written += len(chunk)
                         fh.write(chunk)
         except requests.RequestException as exc:
-            tmp.unlink(missing_ok=True)
+            # Keep the .part on a mid-transfer network failure: the next run resumes
+            # from these bytes (only a checksum mismatch is allowed to discard them).
+            # Kept bytes stay CHARGED — they are still occupying scratch.
+            if not can_resume:
+                tmp.unlink(missing_ok=True)
+                _give_back()
             return False, f"download_error:{type(exc).__name__}"
         except OSError as exc:
-            # e.g. ENOSPC (disk/quota full) while writing the .part on cluster scratch.
-            # Treat as a TRANSIENT per-file failure (not a hard crash of the whole run):
-            # unlink the partial, return a non-terminal reason so a later resume retries.
+            # e.g. ENOSPC / EDQUOT (disk, or the CSD3 1M-file quota) while writing the
+            # .part on cluster scratch. Treat as a TRANSIENT per-file failure (not a hard
+            # crash of the whole run) so a later resume retries it.
             tmp.unlink(missing_ok=True)
+            _give_back()
             return False, f"write_error:{type(exc).__name__}"
         break  # a non-429 response streamed to completion
     if expected_md5 and _md5(tmp) != expected_md5:
-        tmp.unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)  # wrong/stale bytes: never resume from them again
+        _give_back()
         return False, "md5_mismatch"
     tmp.replace(dest)
-    return True, "downloaded"
+    return True, outcome
 
 
 def _safe_members(names: list[str]) -> dict[str, Any]:
@@ -203,26 +362,62 @@ def _is_within(base: Path, target: Path) -> bool:
         return False
 
 
-def _copy_capped(src: Any, out: Path, cap: int) -> bool:
-    """Stream ``src`` -> ``out`` in chunks; abort (delete partial) if over ``cap``.
+# _copy_capped outcomes. "over_cap" is about THIS member (skip it, keep extracting);
+# "no_budget" is about the whole staging area (stop extracting this archive).
+_COPY_OK = "ok"
+_COPY_OVER_CAP = "over_cap"
+_COPY_NO_BUDGET = "no_budget"
+
+
+def _copy_capped(src: Any, out: Path, cap: int,
+                 budget: "StagingBudget | None" = None) -> str:
+    """Stream ``src`` -> ``out`` in chunks, charging ``budget`` for what is written.
 
     Streaming keeps peak memory ~chunk-sized regardless of the member's uncompressed
     size (the old ``src.read()`` allocated the whole member — an OOM / zip-bomb risk).
+
+    **The budget is charged per chunk, before that chunk is written**, so the archive's
+    own declared member size is never trusted: an entry whose header understates its real
+    length simply runs out of allowance part way and is aborted. That is what makes the
+    limits hold for any expansion ratio and any single-file size, rather than only for
+    archives whose metadata happens to be honest. A member that cannot be finished is
+    deleted and fully refunded — a half-file is never left behind counting against nothing.
+
+    Returns one of ``_COPY_OK`` / ``_COPY_OVER_CAP`` (member exceeds ``cap``, i.e.
+    ``--max-member-bytes``) / ``_COPY_NO_BUDGET`` (the staging limit refused it and no
+    purge could help). Raises :class:`BudgetExceeded` when a purge *could* free room, so
+    the record is rolled back and retried later.
     """
+    if not _charged_mkdir(out.parent, budget):
+        return _COPY_NO_BUDGET
+    if budget is not None and not budget.charge(0, 1):   # the member's own inode
+        return _COPY_NO_BUDGET
     written = 0
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("wb") as dst:
-        for chunk in iter(lambda: src.read(1 << 20), b""):
-            written += len(chunk)
-            if written > cap:
-                dst.close()
-                out.unlink(missing_ok=True)
-                return False
-            dst.write(chunk)
-    return True
+    complete = False
+    try:
+        with out.open("wb") as dst:
+            for chunk in iter(lambda: src.read(1 << 20), b""):
+                if written + len(chunk) > cap:
+                    return _COPY_OVER_CAP
+                if budget is not None and not budget.charge(len(chunk)):
+                    return _COPY_NO_BUDGET
+                written += len(chunk)
+                dst.write(chunk)
+        complete = True
+        return _COPY_OK
+    finally:
+        # Any exit other than a complete copy (including a raised BudgetExceeded or a
+        # write error) discards the partial file, so give back everything it was charged
+        # — bytes AND its inode. Otherwise a refused member would permanently shrink the
+        # budget for the rest of the run.
+        if not complete:
+            out.unlink(missing_ok=True)
+            if budget is not None:
+                budget.refund(written, 1)
 
 
-def _extract_zip(path: Path, dest: Path, member_cap: int) -> tuple[list[str], list[str]]:
+def _extract_zip(path: Path, dest: Path, member_cap: int,
+                 budget: "StagingBudget | None" = None) -> tuple[list[str], list[str]]:
     extracted: list[str] = []
     with zipfile.ZipFile(path) as zf:
         names = zf.namelist()
@@ -238,13 +433,22 @@ def _extract_zip(path: Path, dest: Path, member_cap: int) -> tuple[list[str], li
             if info.file_size > member_cap:  # header says it's too big -> skip pre-extract
                 logger.warning("skip oversized member %s (%d B) in %s", base, info.file_size, path.name)
                 continue
+            # Declared size is used ONLY to avoid starting a decompression that clearly
+            # cannot fit (a cheap early skip). The real accounting happens per chunk
+            # inside _copy_capped, so a header that lies changes nothing.
+            if budget is not None and not budget.check(info.file_size, 1):
+                break  # a disk/inode limit is reached — stop; the run pauses to purge
             with zf.open(info) as src:
-                if _copy_capped(src, out, member_cap):
-                    extracted.append(info.filename)
+                outcome = _copy_capped(src, out, member_cap, budget)
+            if outcome == _COPY_OK:
+                extracted.append(info.filename)
+            elif outcome == _COPY_NO_BUDGET:
+                break
     return names, extracted
 
 
-def _extract_tar(path: Path, dest: Path, member_cap: int) -> tuple[list[str], list[str]]:
+def _extract_tar(path: Path, dest: Path, member_cap: int,
+                 budget: "StagingBudget | None" = None) -> tuple[list[str], list[str]]:
     extracted: list[str] = []
     with tarfile.open(path) as tf:
         names = tf.getnames()
@@ -260,15 +464,21 @@ def _extract_tar(path: Path, dest: Path, member_cap: int) -> tuple[list[str], li
             if member.size > member_cap:
                 logger.warning("skip oversized member %s (%d B) in %s", base, member.size, path.name)
                 continue
+            if budget is not None and not budget.check(member.size, 1):
+                break
             src = tf.extractfile(member)
             if src is None:
                 continue
-            if _copy_capped(src, out, member_cap):
+            outcome = _copy_capped(src, out, member_cap, budget)
+            if outcome == _COPY_OK:
                 extracted.append(member.name)
+            elif outcome == _COPY_NO_BUDGET:
+                break
     return names, extracted
 
 
-def _extract_rar(path: Path, dest: Path, member_cap: int) -> tuple[list[str], list[str]]:
+def _extract_rar(path: Path, dest: Path, member_cap: int,
+                 budget: "StagingBudget | None" = None) -> tuple[list[str], list[str]]:
     extracted: list[str] = []
     with rarfile.RarFile(path) as rf:  # type: ignore[union-attr]
         names = rf.namelist()
@@ -281,42 +491,212 @@ def _extract_rar(path: Path, dest: Path, member_cap: int) -> tuple[list[str], li
             out = dest / info.filename
             if not _is_within(dest, out):
                 continue
-            if getattr(info, "file_size", 0) > member_cap:
+            size = getattr(info, "file_size", 0) or 0
+            if size > member_cap:
                 logger.warning("skip oversized member %s in %s", base, path.name)
                 continue
+            if budget is not None and not budget.check(size, 1):
+                break
             with rf.open(info) as src:
-                if _copy_capped(src, out, member_cap):
-                    extracted.append(info.filename)
+                outcome = _copy_capped(src, out, member_cap, budget)
+            if outcome == _COPY_OK:
+                extracted.append(info.filename)
+            elif outcome == _COPY_NO_BUDGET:
+                break
     return names, extracted
 
 
-def _extract_7z(path: Path, dest: Path, member_cap: int) -> tuple[list[str], list[str]]:
-    extracted: list[str] = []
+class _BudgetedMemberWriter:
+    """A file-like sink for ONE py7zr member: writes to disk, charging as it goes.
+
+    py7zr hands each member a writer object (``py7zr.io.Py7zIO``) and calls ``write``
+    with each decompressed block, so this is the ``.7z`` equivalent of
+    :func:`_copy_capped`'s per-chunk charge. ``out=None`` makes it a sink that swallows
+    bytes without writing them — used once something has gone over a limit, so py7zr can
+    finish its CRC bookkeeping while nothing more lands on disk.
+    """
+
+    def __init__(self, factory: "_BudgetedWriterFactory", out: Path | None, name: str):
+        self._factory = factory
+        self._out = out
+        self._name = name
+        self._fh = out.open("wb") if out is not None else None
+        self._written = 0
+        self._dropped = out is None
+
+    def write(self, s: bytes | bytearray) -> int:
+        n = len(s)
+        if self._dropped:
+            return n                       # deliberately discarded; report it as written
+        if self._written + n > self._factory.cap:
+            logger.warning("skip oversized member %s in %s", self._name, self._factory.label)
+            self._drop()
+            return n
+        if not self._factory.take(n):      # charge BEFORE the bytes land
+            self._drop()
+            return n
+        self._written += n
+        assert self._fh is not None
+        self._fh.write(s)
+        return n
+
+    def _drop(self) -> None:
+        """Abandon this member: close, delete, and refund everything it was charged."""
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+        if self._out is not None:
+            self._out.unlink(missing_ok=True)
+        self._factory.give_back(self._written, 1)
+        self._written = 0
+        self._dropped = True
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+            self._factory.extracted.append(self._name)
+
+    # --- the rest of the Py7zIO protocol; py7zr seeks to 0 and may query the size ---
+    def read(self, size: int | None = None) -> bytes:
+        return b""
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        return offset      # a write-only sink: nothing to rewind
+
+    def flush(self) -> None:
+        if self._fh is not None:
+            self._fh.flush()
+
+    def size(self) -> int:
+        return self._written
+
+
+class _BudgetedWriterFactory:
+    """py7zr ``WriterFactory`` that keeps a ``.7z`` extraction inside the staging budget.
+
+    The other backends can check the budget between members because they drive the loop.
+    py7zr does not: one ``extract()`` call decompresses everything, possibly on worker
+    threads. So the check moves into the writer (see :class:`_BudgetedMemberWriter`), and
+    a refusal is recorded here rather than raised — an exception thrown inside py7zr's
+    threads would be lost, and the classification (defer vs. never-fits) depends on a
+    per-record snapshot that only the calling thread holds. :func:`_extract_7z` inspects
+    :attr:`abort` after ``extract()`` returns and re-raises in the right thread.
+    """
+
+    def __init__(self, dest: Path, cap: int, budget: "StagingBudget | None",
+                 own: list[int], label: str):
+        self.dest = dest
+        self.cap = cap
+        self.budget = budget
+        self.own = own              # the record's own-usage tally; classifies a refusal
+        self.label = label          # archive name, for log lines
+        self.extracted: list[str] = []
+        self.abort = ""             # "" | "defer" (purge can help) | "unfittable"
+        self.deferred: BudgetExceeded | None = None
+        self._writers: list[_BudgetedMemberWriter] = []
+        self._lock = threading.Lock()
+
+    def take(self, n_bytes: int, n_files: int = 0) -> bool:
+        if self.budget is None:
+            return True
+        try:
+            if self.budget.charge(n_bytes, n_files, own=self.own):
+                return True
+            with self._lock:
+                self.abort = self.abort or "unfittable"
+        except BudgetExceeded as exc:
+            with self._lock:
+                self.abort, self.deferred = "defer", exc
+        return False
+
+    def give_back(self, n_bytes: int, n_files: int = 0) -> None:
+        if self.budget is not None and (n_bytes or n_files):
+            self.budget.refund(n_bytes, n_files, own=self.own)
+
+    def create(self, filename: str) -> Any:
+        """Called by py7zr once per member, just before it is decompressed."""
+        out = Path(filename)
+        try:
+            name = out.relative_to(self.dest).as_posix()
+        except ValueError:
+            name = out.name
+        usable = not self.abort and _is_within(self.dest, out) and self._parents(out.parent)
+        writer = _BudgetedMemberWriter(
+            self, out if usable and self.take(0, 1) else None, name)
+        self._writers.append(writer)
+        return writer
+
+    def _parents(self, path: Path) -> bool:
+        try:
+            ok = _charged_mkdir(path, self.budget, own=self.own)
+        except BudgetExceeded as exc:
+            with self._lock:
+                self.abort, self.deferred = "defer", exc
+            return False
+        if not ok:
+            with self._lock:
+                self.abort = self.abort or "unfittable"
+        return ok
+
+    def close_all(self) -> None:
+        """Close any writer py7zr abandoned (it skips ``close()`` on a CRC error)."""
+        for w in self._writers:
+            w.close()
+
+
+def _extract_7z(path: Path, dest: Path, member_cap: int,
+                budget: "StagingBudget | None" = None) -> tuple[list[str], list[str]]:
+    """Selectively extract VASP files from a ``.7z``.
+
+    Uses py7zr's ``extract(path=, targets=, factory=)``: the factory streams each member
+    to disk through :class:`_BudgetedMemberWriter`, which charges the staging budget for
+    every block *before* it is written. So the ``.7z`` path holds the same invariant as
+    the others — nothing lands that was not counted, whatever the header claims — while
+    peak memory stays block-sized. (The older ``read(targets)`` API returned in-memory
+    ``BytesIO`` objects holding the SUM of the selected members, an OOM risk, and py7zr
+    1.x removed it: calling it raised ``AttributeError`` and no ``.7z`` record could be
+    staged at all.)
+
+    Targets are pre-filtered on the header (VASP-relevant name, inside ``dest``, under the
+    member cap) purely to avoid pointless decompression; the header is never the authority.
+    """
     with py7zr.SevenZipFile(path, "r") as zf:  # type: ignore[union-attr]
         infos = zf.list()
         names = [i.filename for i in infos]
         sizes = {i.filename: getattr(i, "uncompressed", 0) or 0 for i in infos}
-        targets = [
-            n for n in names
-            if not n.endswith("/")
-            and _PARSE_RE.search(n.rsplit("/", 1)[-1])
-            and _is_within(dest, dest / n)
-            and sizes.get(n, 0) <= member_cap
-        ]
-        if not targets:
-            return names, extracted
-        for name, bio in zf.read(targets).items():  # py7zr decompresses selected members
-            out = dest / name
-            out.parent.mkdir(parents=True, exist_ok=True)
-            data = bio.read()
-            if len(data) > member_cap:
+        targets = []
+        for n in names:
+            if (n.endswith("/") or not _PARSE_RE.search(n.rsplit("/", 1)[-1])
+                    or not _is_within(dest, dest / n)):
                 continue
-            out.write_bytes(data)
-            extracted.append(name)
-    return names, extracted
+            if sizes.get(n, 0) > member_cap:
+                logger.warning("skip oversized member %s (%d B) in %s",
+                               n, sizes.get(n, 0), path.name)
+                continue
+            # Cheap early skip only: if the declared size already cannot fit, don't start.
+            if budget is not None and not budget.check(sizes.get(n, 0) or 0, 1):
+                break
+            targets.append(n)
+        if not targets:
+            return names, []
+        if not _charged_mkdir(dest, budget):
+            return names, []
+        own = budget.own_handle() if budget is not None else [0, 0]
+        factory = _BudgetedWriterFactory(dest, member_cap, budget, own, path.name)
+        try:
+            zf.extract(path=dest, targets=targets, factory=factory)
+        finally:
+            factory.close_all()
+    if factory.abort == "defer" and factory.deferred is not None:
+        raise factory.deferred          # roll the record back and retry after a purge
+    if factory.abort == "unfittable" and budget is not None:
+        budget.mark_truncated()         # cannot ever fit; keep what landed, report it
+    return names, factory.extracted
 
 
-def _extract_tar_zst(path: Path, dest: Path, member_cap: int) -> tuple[list[str], list[str]]:
+def _extract_tar_zst(path: Path, dest: Path, member_cap: int,
+                     budget: "StagingBudget | None" = None) -> tuple[list[str], list[str]]:
     """Extract VASP files from a zstd-compressed tarball (``.tar.zst``/``.tzst``).
 
     Streams the decompressed bytes through ``tarfile`` in streaming (``r|``) mode so
@@ -342,11 +722,16 @@ def _extract_tar_zst(path: Path, dest: Path, member_cap: int) -> tuple[list[str]
                 if member.size > member_cap:
                     logger.warning("skip oversized member %s (%d B) in %s", base, member.size, path.name)
                     continue
+                if budget is not None and not budget.check(member.size, 1):
+                    break
                 src = tf.extractfile(member)
                 if src is None:
                     continue
-                if _copy_capped(src, out, member_cap):
+                outcome = _copy_capped(src, out, member_cap, budget)
+                if outcome == _COPY_OK:
                     extracted.append(member.name)
+                elif outcome == _COPY_NO_BUDGET:
+                    break
     return names, extracted
 
 
@@ -354,13 +739,21 @@ _EXTRACTORS = {"zip": _extract_zip, "tar": _extract_tar, "rar": _extract_rar,
                "sevenzip": _extract_7z, "tarzst": _extract_tar_zst}
 
 # Exceptions a bad/truncated archive can raise across all backends — caught per
-# archive so one corrupt file rejects just that file, not the whole run. The zstd
-# backend adds its own error type when installed.
+# archive so one corrupt file rejects just that file, not the whole run. The optional
+# backends add their own error types when installed. RuntimeError/AttributeError are
+# included because these are third-party libraries whose APIs drift between versions
+# (py7zr 1.x removed the `read()` this module once used): an API mismatch must reject
+# ONE archive, not abort a multi-hour harvest.
 _EXTRACT_ERRORS: tuple[type[BaseException], ...] = (
     zipfile.BadZipFile, tarfile.TarError, EOFError, OSError, ValueError,
+    RuntimeError, AttributeError,
 )
 if zstandard is not None:  # pragma: no branch - trivial
     _EXTRACT_ERRORS = (*_EXTRACT_ERRORS, zstandard.ZstdError)
+if py7zr is not None:  # pragma: no branch - trivial
+    _EXTRACT_ERRORS = (*_EXTRACT_ERRORS, py7zr.exceptions.ArchiveError)
+if rarfile is not None:  # pragma: no branch - trivial
+    _EXTRACT_ERRORS = (*_EXTRACT_ERRORS, rarfile.Error)
 
 
 def _is_archive(name: str) -> str | None:
@@ -381,8 +774,17 @@ def _is_archive(name: str) -> str | None:
         # treated as a zstd tarball (``Research_Data.zst`` etc. seen on Zenodo).
         stem = low[:-4].rsplit("/", 1)[-1]
         return None if _PARSE_RE.search(stem) else "tarzst"
-    # A single gzipped file (e.g. OUTCAR.gz) is not an archive to unpack; it is
-    # handled by the _PARSE_RE / availability branches in fetch_record.
+    if low.endswith(_BARE_COMPRESS_SUFFIXES):
+        # Same ambiguity for bare `.gz`/`.bz2`/`.xz`. ``OUTCAR.gz`` is a single compressed
+        # VASP file and stays a direct download (_PARSE_RE branch, and parse decompresses
+        # it). Anything else is very often a MISNAMED compressed tarball — measured on
+        # Zenodo, e.g. a 17 GB `…-vasp-raw.gz` — which we previously fell through to the
+        # availability branch, downloading nothing and reporting the record as holding no
+        # VASP. Treat it as a tar: ``tarfile.open`` transparently auto-detects
+        # gzip/bzip2/xz from the CONTENT, not the name, and a file that is not a tar
+        # raises ``TarError`` (in _EXTRACT_ERRORS) -> one clean `extract_error` rejection.
+        stem = low.rsplit(".", 1)[0].rsplit("/", 1)[-1]
+        return None if _PARSE_RE.search(stem) else "tar"
     return None
 
 
@@ -390,7 +792,8 @@ def _archive_subdir(base: str) -> str:
     """A filesystem-safe per-archive extraction subdir (avoids cross-archive
     member-path collisions when one record ships multiple archives)."""
     stem = base
-    for suf in (*_TAR_SUFFIXES, *_ZST_TAR_SUFFIXES, ".zip", ".rar", ".7z", ".zst"):
+    for suf in (*_TAR_SUFFIXES, *_ZST_TAR_SUFFIXES, ".zip", ".rar", ".7z", ".zst",
+                *_BARE_COMPRESS_SUFFIXES):
         if stem.lower().endswith(suf):
             stem = stem[: -len(suf)]
             break
@@ -494,16 +897,149 @@ def _find_calc_units(root: Path) -> list[dict[str, str]]:
     return units
 
 
+def _worth_keeping(dest: Path, transient: bool, truncated: bool) -> bool:
+    """Whether to leave an unrecorded record's staging tree on disk for the next run.
+
+    Worth keeping only when the failure was transient AND something reusable actually
+    landed: verified files and ``.part`` remnants let a resume skip the re-download. A
+    tree kept for no reason holds budget nothing can reclaim (see :func:`_discard_stage`),
+    and a record already known not to fit will not be helped by resuming it.
+    """
+    if truncated or not transient or not dest.exists():
+        return False
+    return any(p.is_file() for p in dest.rglob("*"))
+
+
+def _discard_stage(dest: Path, budget: "StagingBudget | None") -> tuple[int, int]:
+    """Delete a record's staging tree and refund it. Returns ``(bytes, inodes)`` freed.
+
+    Used whenever a record will NOT be written to ``fetched.jsonl``. Anything it left
+    behind is unreachable: ``purge-raw`` only reclaims trees whose calc_ids reached the
+    dataset, so an unlisted leftover would hold budget for the rest of the harvest. That
+    is not merely untidy — it is a stall. A record refused as "too big for the whole
+    budget" used to leave its empty directories charged, which made the budget non-empty
+    when the *next* record started; a non-empty budget means "a purge could free room", so
+    every following record was deferred and retried forever against space nothing could
+    reclaim. (Observed in a randomised sweep: 8 of 9 records never collected.)
+    """
+    if not dest.exists():
+        return 0, 0
+    freed_bytes, freed_inodes = _dir_usage(dest)
+    if dest.is_dir():
+        freed_inodes += 1                      # the record dir itself
+    shutil.rmtree(dest, ignore_errors=True)
+    if budget is not None:
+        budget.refund(freed_bytes, freed_inodes)
+    return freed_bytes, freed_inodes
+
+
 def fetch_record(rec: dict, session: requests.Session, raw_dir: Path,
                  max_bytes: int | None, rej: RejectionLogger,
-                 max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES) -> dict | None:
-    """Download + stage one record. Returns a fetched-manifest entry or None."""
+                 max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES,
+                 budget: "StagingBudget | None" = None) -> dict | None:
+    """Download + stage one record. Returns a fetched-manifest entry or None.
+
+    ``budget`` (see :class:`StagingBudget`) is charged for every byte and file actually
+    written, and refunded when an archive is deleted after extraction. When a limit is
+    reached the record keeps whatever already landed (partial calc units still parse) and
+    a ``disk_budget_reached`` rejection is logged, so the truncation is auditable and the
+    caller can stop cleanly and let the pacing loop parse+purge.
+    """
     recid = rec["recid"]
     dest = raw_dir / recid
     availability = {k: False for k in _AVAILABILITY}
     availability_files: dict[str, str] = {}
     got_any = False
+    transient = False   # any "couldn't get it THIS time" failure (see _is_transient_reason)
 
+    if budget is not None:
+        budget.begin_record()
+    try:
+        got_any, transient = _stage_record_files(
+            rec, recid, dest, session, max_bytes, rej, max_member_bytes, budget,
+            availability, availability_files)
+    except BudgetExceeded as exc:
+        # A limit was reached part way through this record. Roll it back entirely — a
+        # record is staged whole or not at all — refund what it had taken, and leave it
+        # OUT of the fetched manifest so a later pass (after parse+purge frees room)
+        # re-fetches it complete. Recording a truncated record instead would make the
+        # partial data permanent, since resumes skip recids already in the manifest.
+        rolled_bytes, rolled_files = _dir_usage(dest)
+        if dest.is_dir():
+            rolled_files += 1   # rmtree also removes the record dir, itself a charged inode
+        shutil.rmtree(dest, ignore_errors=True)
+        if budget is not None:
+            budget.refund(rolled_bytes, rolled_files)
+        rej.reject("fetch", recid, "disk_budget_deferred", detail=str(exc),
+                   rolled_back_bytes=rolled_bytes, rolled_back_files=rolled_files)
+        logger.info("record %s deferred (%s); rolled back %d B / %d files",
+                    recid, exc, rolled_bytes, rolled_files)
+        return None
+
+    # A record refused by the budget must NEVER end up with a terminal verdict. It has
+    # nothing wrong with it — the budget was simply too small for it — so it has to stay
+    # collectable once the budget is raised. Without this, an inode/byte limit that refused
+    # a record's very first member left it looking like "this record contains no VASP",
+    # which resumes skip forever: silent, permanent data loss.
+    truncated = budget is not None and budget.record_was_truncated()
+    if truncated:
+        logger.warning("record %s does not fit in the whole staging budget", recid)
+
+    def _budget_detail(kept: bool) -> str:
+        return ("record does not fit in --max-disk-bytes/--max-disk-files even when the "
+                "budget is empty; " + ("staged as much as fitted" if kept else
+                                       "nothing could be staged") +
+                ". Raise the budget (and remove this recid from fetched.jsonl) to collect "
+                "the rest — this reason is NOT terminal, so it is retried on the next run.")
+
+    if not got_any:
+        # Only call it "no VASP here" (terminal) when nothing transient and no budget
+        # refusal got in the way — otherwise the record must stay retryable.
+        if truncated:
+            reason = "record_exceeds_disk_budget"
+        else:
+            reason = _TRANSIENT_RECORD_REASON if transient else "no_vasp_files_fetched"
+        if not _worth_keeping(dest, transient, truncated):
+            _discard_stage(dest, budget)
+        rej.reject("fetch", recid, reason,
+                   transient=(transient or truncated) or None,
+                   detail=_budget_detail(kept=False) if truncated else None)
+        return None
+    if truncated:
+        # The record cannot fit in the whole budget, so it was staged as far as the budget
+        # allowed rather than retried forever. Keep what landed — a partial screening record
+        # is still hundreds of usable calcs — but say so loudly.
+        rej.reject("fetch", recid, "record_exceeds_disk_budget",
+                   detail=_budget_detail(kept=True))
+
+    units = _find_calc_units(dest / "extracted")
+    if not units:
+        if truncated:
+            reason = "record_exceeds_disk_budget"
+        else:
+            reason = (_TRANSIENT_RECORD_REASON if transient
+                      else "no_calc_units_after_extract")
+        if not _worth_keeping(dest, transient, truncated):
+            _discard_stage(dest, budget)
+        rej.reject("fetch", recid, reason,
+                   transient=(transient or truncated) or None,
+                   detail=_budget_detail(kept=False) if truncated else None)
+        return None
+    return _fetched_entry(rec, recid, dest, raw_dir, units, availability, availability_files)
+
+
+def _stage_record_files(
+    rec: dict, recid: str, dest: Path, session: requests.Session,
+    max_bytes: int | None, rej: RejectionLogger, max_member_bytes: int,
+    budget: "StagingBudget | None", availability: dict, availability_files: dict,
+) -> tuple[bool, bool]:
+    """Download + extract one record's files. Returns ``(got_any, transient)``.
+
+    Raises :class:`BudgetExceeded` if a disk/inode limit is reached part way, which
+    :func:`fetch_record` turns into a full rollback of this record.
+    """
+    got_any = False
+    transient = False
     for f in rec["files"]:
         key, url, size = f["key"], f.get("download"), f.get("size") or 0
         cksum = (f.get("checksum") or "").split(":", 1)[-1] or None
@@ -536,40 +1072,65 @@ def fetch_record(rec: dict, session: requests.Session, raw_dir: Path,
                 rej.reject("fetch", f"{recid}:{key}", "over_size_cap", size=size)
                 continue
             arc = dest / base
-            ok, why = download_file(session, url, arc, cksum, max_bytes)
+            # An archive occupies disk while it is downloaded and extracted, so it is
+            # charged too — and refunded below, since it is deleted straight afterwards.
+            # The declared size is only a pre-check ("don't even start"); download_file
+            # charges the bytes it actually receives.
+            if budget is not None and not budget.check(size, 1):
+                rej.reject("fetch", f"{recid}:{key}", "disk_budget_reached",
+                           size=size, limit=budget.hit_limit)
+                transient = True   # refused for space, not because the data is unusable
+                continue
+            ok, why = download_file(session, url, arc, cksum, max_bytes, budget=budget)
             if not ok:
                 rej.reject("fetch", f"{recid}:{key}", why, size=size)
+                transient = transient or _is_transient_reason(why)
                 continue
+            arc_bytes = arc.stat().st_size   # what really landed, not what was advertised
             # Extract into a per-archive subdir so identical member paths across
             # multiple archives in one record can't overwrite each other.
             extract_dir = dest / "extracted" / _archive_subdir(base)
             try:
-                names, extracted = _EXTRACTORS[kind](arc, extract_dir, max_member_bytes)
+                names, extracted = _EXTRACTORS[kind](arc, extract_dir, max_member_bytes,
+                                                     budget)
             except _EXTRACT_ERRORS as exc:
                 rej.reject("fetch", f"{recid}:{key}", "extract_error",
                            detail=f"{type(exc).__name__}: {exc}")
+                # A write that failed for lack of space is transient, not bad data.
+                if isinstance(exc, OSError) and exc.errno in _OUT_OF_SPACE_ERRNOS:
+                    transient = True
                 arc.unlink(missing_ok=True)
+                if budget is not None:
+                    budget.refund(arc_bytes, 1)
                 continue
             info = _safe_members(names)
             for k, v in info["availability"].items():
                 availability[k] = availability[k] or v
             availability_files.update(info["availability_files"])
             arc.unlink(missing_ok=True)  # drop the archive; keep only extracted VASP files
+            if budget is not None:
+                budget.refund(arc_bytes, 1)  # transient bytes, not staged footprint
             got_any = got_any or bool(extracted)
 
         elif _PARSE_RE.search(base):  # directly-exposed VASP file
             if max_bytes and size > max_bytes:
                 rej.reject("fetch", f"{recid}:{key}", "over_size_cap", size=size)
                 continue
+            if budget is not None and not budget.check(size, 1):
+                rej.reject("fetch", f"{recid}:{key}", "disk_budget_reached",
+                           size=size, limit=budget.hit_limit)
+                transient = True   # refused for space, not because the data is unusable
+                continue
             out = dest / "extracted" / key
             if not _is_within(dest / "extracted", out):
                 rej.reject("fetch", f"{recid}:{key}", "unsafe_path")  # path traversal guard
                 continue
-            ok, why = download_file(session, url, out, cksum, max_bytes)
+            ok, why = download_file(session, url, out, cksum, max_bytes, budget=budget)
             if ok:
                 got_any = True
             else:
                 rej.reject("fetch", f"{recid}:{key}", why, size=size)
+                transient = transient or _is_transient_reason(why)
 
         else:  # heavy / irrelevant direct file -> availability only
             for akind, rx in _AVAILABILITY.items():
@@ -577,15 +1138,12 @@ def fetch_record(rec: dict, session: requests.Session, raw_dir: Path,
                     availability[akind] = True
                     availability_files.setdefault(akind, key)
 
-    if not got_any:
-        rej.reject("fetch", recid, "no_vasp_files_fetched")
-        return None
+    return got_any, transient
 
-    units = _find_calc_units(dest / "extracted")
-    if not units:
-        rej.reject("fetch", recid, "no_calc_units_after_extract")
-        return None
 
+def _fetched_entry(rec: dict, recid: str, dest: Path, raw_dir: Path, units: list[dict],
+                   availability: dict, availability_files: dict) -> dict:
+    """Build the fetched-manifest entry for a staged record."""
     # Store paths RELATIVE to raw_dir. Absolute paths break the manifest as soon as
     # staged data is moved between cluster scratch areas; parse resolves these back
     # against its --raw-dir. calc_id keys off the primary path relative to
@@ -643,69 +1201,220 @@ def _terminal_reject_recids(rejections_path: Path) -> set[str]:
 
 def _download_estimate(rec: dict, max_bytes: int | None) -> int:
     """Bytes fetch would transfer for one record (archives + direct VASP files under
-    the cap) — the disk-budget valve's reservation for that record's transient download."""
+    the cap) — the disk-budget valve's reservation for that record's transient download.
+
+    ``max_bytes`` falsy (``None`` *or* ``0``) means "no cap", matching how every other
+    size check in this module reads it — the CLI maps ``--max-bytes 0`` to ``None``, but
+    a literal ``0`` reaching here must not make every record estimate 0 bytes and so
+    silently disable the valve's in-flight reservation.
+    """
     tot = 0
     for f in rec.get("files", []):
         base = (f.get("key") or "").rsplit("/", 1)[-1]
         size = f.get("size") or 0
         if (_is_archive(base) is not None or bool(_PARSE_RE.search(base))) and (
-                max_bytes is None or size <= max_bytes):
+                not max_bytes or size <= max_bytes):
             tot += size
     return tot
 
 
-class _DiskBudget:
-    """Bounds (staged extracted bytes + in-flight download bytes) across parallel
-    fetch workers, so peak disk stays under ``limit``.
+class BudgetExceeded(Exception):
+    """Raised by :meth:`StagingBudget.charge` when a limit is reached by data that a
+    ``parse``+``purge-raw`` COULD reclaim.
 
-    ``reserve(need)`` blocks until the record's estimated download fits under the
-    budget, then reserves it; returns False instead when the budget is full of
-    *already-staged* files that only an external ``parse``+``purge-raw`` can free —
-    the signal for fetch to stop cleanly (resumable) so the paced loop can reclaim.
-    A single record larger than the whole budget is admitted alone (forward progress)
-    only when nothing else has been admitted yet this run. ``settle`` is called when a
-    worker finishes: it releases the reservation and folds the record's actual staged
-    size into the committed total. ``None`` limit = unlimited (never blocks/stops).
+    It aborts the record being staged so :func:`fetch_record` can roll that record back
+    and defer it: a record must be staged whole or not at all. Staging it *partially* and
+    recording it in ``fetched.jsonl`` would make the partial data permanent (later runs
+    skip recids already listed there), and leaving partial files behind un-listed would
+    occupy budget that ``purge-raw`` — which only knows about fetched records — could
+    never reclaim. Deliberately NOT a subclass of any exception in ``_EXTRACT_ERRORS``,
+    so it passes straight through the per-archive error handling.
     """
 
-    def __init__(self, limit: int | None, baseline: int):
-        self.limit = limit
-        self.committed = baseline      # staged bytes already on disk (resume-aware)
-        self.reserved = 0              # estimated in-flight download bytes
-        self.progressed = False        # has any record been admitted this run?
-        self._cond = threading.Condition()
 
-    def reserve(self, need: int) -> bool:
-        if self.limit is None:
+class StagingBudget:
+    """Live, exact accounting of what the harvest has staged — the disk/inode valve.
+
+    **Why not an estimate.** An earlier design booked a record's expected staging up front
+    as ``download_size x <a fixed expansion factor>``. That cannot work: the expansion is
+    whatever the uploader's compression happened to achieve. Measured on real Zenodo data
+    it ranged from ~1x (already-compressed payloads) through 4.1x (a 3.86 GB zip of
+    vasprun.xml staging 15.9 GB) to 880x (a synthetic zip of highly compressible text).
+    Any single factor is badly wrong somewhere: too low and the budget is silently
+    overrun, too high and the harvest paces itself to a crawl.
+
+    So nothing is predicted. Every byte and every file is charged **as it is written**,
+    against the real limits, and refunded when it is removed:
+
+    * ``charge`` before/while writing — returns False when the write would breach a limit,
+      which makes the caller stop that archive/download cleanly;
+    * ``refund`` when a staged file is deleted again (an archive is unlinked as soon as its
+      VASP members are extracted, so its bytes are transient, not part of the footprint).
+
+    The result is an exact invariant — ``used <= limit`` at all times, for any compression
+    ratio, with no tuning constant. ``peak_bytes``/``peak_files`` record the high-water
+    mark so a run can *report* how close it came instead of being audited from outside.
+
+    Thread-safe: ``fetch --workers N`` stages several records concurrently.
+    """
+
+    def __init__(self, max_bytes: int | None = None, max_files: int | None = None,
+                 used_bytes: int = 0, used_files: int = 0):
+        self.max_bytes = max_bytes
+        self.max_files = max_files
+        # Resume-aware starting point: whatever a previous (unpurged) run left staged.
+        self.used_bytes = used_bytes
+        self.used_files = used_files
+        self.peak_bytes = used_bytes
+        self.peak_files = used_files
+        self.hit_limit = ""       # "bytes" | "files" — last limit touched (diagnostic)
+        # Set only when a limit was reached by data a purge CAN reclaim; that is the
+        # signal to stop the run cleanly. Kept separate from hit_limit so a single
+        # too-big-for-anything item cannot masquerade as "pause and reclaim".
+        self.pause = ""
+        self.unfittable = 0       # items no purge could ever make room for
+        self._lock = threading.Lock()
+        # Per-record context (thread-local: workers stage different records at once).
+        # `own` is how much of the tally the record being staged is itself responsible for,
+        # which is how a refusal gets classified — see charge().
+        self._tls = threading.local()
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_bytes is not None or self.max_files is not None
+
+    def begin_record(self) -> None:
+        """Start a record's own-usage tally (call once per record, per thread)."""
+        self._tls.own = [0, 0]
+        self._tls.truncated = False
+
+    def record_was_truncated(self) -> bool:
+        """Whether the record this thread just staged hit a limit it can never fit in."""
+        return bool(getattr(self._tls, "truncated", False))
+
+    def mark_truncated(self) -> None:
+        """Flag the current record as not-fitting from another thread's refusal."""
+        self._tls.truncated = True
+
+    def own_handle(self) -> list[int]:
+        """This record's own-usage tally, to pass to :meth:`charge` from a worker thread."""
+        own = getattr(self._tls, "own", None)
+        if own is None:
+            own = self._tls.own = [0, 0]
+        return own  # type: ignore[no-any-return]
+
+    def check(self, n_bytes: int, n_files: int = 0,
+              own: list[int] | None = None) -> bool:
+        """Would ``n_bytes``/``n_files`` fit? Same verdict as :meth:`charge`, no accounting.
+
+        Used with a *declared* size (an archive header, a manifest entry) purely to skip
+        work that clearly cannot fit — never as the accounting itself, which is always
+        done against bytes as they are written. Being conservative here is harmless: an
+        over-stated size only defers a record that would then be retried.
+        """
+        return self._fits(n_bytes, n_files, own, commit=False)
+
+    def charge(self, n_bytes: int, n_files: int = 0,
+               own: list[int] | None = None) -> bool:
+        """Account ``n_bytes``/``n_files`` about to be written.
+
+        Returns True when it fits. Two distinct failure modes:
+
+        * the record could fit on its own, so a ``parse``+``purge-raw`` can make room ->
+          sets :attr:`pause` and raises :class:`BudgetExceeded`, and the record is rolled
+          back whole and re-fetched later;
+        * the record's OWN footprint already exceeds the limit, so no purge could ever help
+          -> returns False; the caller skips that item, keeps what landed, and the run goes
+          on. Without this split the pacing loop would retry an unstageable record forever.
+
+        ``own`` overrides the per-record tally for callers on a different thread from the
+        one that called :meth:`begin_record` (py7zr's extraction workers).
+        """
+        return self._fits(n_bytes, n_files, own, commit=True)
+
+    def _fits(self, n_bytes: int, n_files: int, own: list[int] | None,
+              commit: bool) -> bool:
+        if not self.enabled:
             return True
-        with self._cond:
-            while True:
-                if self.committed + self.reserved + need <= self.limit:
-                    self.reserved += need
-                    self.progressed = True
-                    return True
-                if self.reserved > 0:
-                    self._cond.wait()          # an in-flight download will free space
-                    continue
-                if not self.progressed:         # guarantee progress: admit one alone
-                    self.reserved += need
-                    self.progressed = True
-                    return True
-                return False                    # staged-full -> stop; caller parses+purges
+        own = own if own is not None else getattr(self._tls, "own", None)
+        with self._lock:
+            over = ""
+            if self.max_bytes is not None and self.used_bytes + n_bytes > self.max_bytes:
+                over = "bytes"
+            elif self.max_files is not None and self.used_files + n_files > self.max_files:
+                over = "files"
+            if over:
+                self.hit_limit = over
+                # Classify the refusal by the record's OWN footprint, not by what happens
+                # to be staged alongside it:
+                #
+                # * own + this > limit  -> the record cannot be staged even against an
+                #   empty budget (note this includes its transient peak: an archive is on
+                #   disk while its members are being extracted). Retrying after a purge
+                #   would fail identically and re-download it every time — an observed
+                #   livelock. So return False: staging stops here, what landed is KEPT, the
+                #   record is reported, and the run carries on.
+                # * otherwise -> the budget is full of OTHER records' data, which a
+                #   parse+purge really can reclaim. Abort for a clean rollback and retry.
+                #
+                # Deciding this from the record's own usage (rather than from "was the
+                # budget empty when I started?") keeps the verdict deterministic under
+                # `--workers N`, where a record almost never starts against an empty
+                # budget and would otherwise be deferred for ever.
+                own_bytes, own_files = own if own is not None else (0, 0)
+                cannot_ever_fit = (
+                    (over == "bytes" and self.max_bytes is not None
+                     and own_bytes + n_bytes > self.max_bytes)
+                    or (over == "files" and self.max_files is not None
+                        and own_files + n_files > self.max_files))
+                if cannot_ever_fit:
+                    # Bookkeeping, not accounting: a refusal is a refusal whether it came
+                    # from a real charge or from a pre-check that skipped the work.
+                    self.unfittable += 1
+                    self._tls.truncated = True
+                    return False
+                # Set even for a non-committing check: raising means a record is being
+                # deferred, which IS the signal to stop and let the pacing loop reclaim.
+                self.pause = over
+                raise BudgetExceeded(
+                    f"{over} limit reached (used {self.used_bytes} B / {self.used_files} "
+                    f"files); parse+purge to reclaim, then resume")
+            if commit:
+                self.used_bytes += n_bytes
+                self.used_files += n_files
+                self.peak_bytes = max(self.peak_bytes, self.used_bytes)
+                self.peak_files = max(self.peak_files, self.used_files)
+                if own is not None:
+                    own[0] += n_bytes
+                    own[1] += n_files
+            return True
 
-    def settle(self, need: int, actual: int) -> None:
-        if self.limit is None:
+    def refund(self, n_bytes: int, n_files: int = 0,
+               own: list[int] | None = None) -> None:
+        """Give back space for staged data that has just been deleted."""
+        if not self.enabled:
             return
-        with self._cond:
-            self.reserved -= need
-            self.committed += actual
-            self._cond.notify_all()
+        own = own if own is not None else getattr(self._tls, "own", None)
+        with self._lock:
+            self.used_bytes = max(0, self.used_bytes - n_bytes)
+            self.used_files = max(0, self.used_files - n_files)
+            if own is not None:
+                own[0] = max(0, own[0] - n_bytes)
+                own[1] = max(0, own[1] - n_files)
+
+    def full(self) -> bool:
+        """Whether the run should stop cleanly so the pacing loop can parse+purge."""
+        return bool(self.pause)
+
+    def stats(self) -> dict:
+        return {"peak_staged_bytes": self.peak_bytes, "peak_staged_files": self.peak_files,
+                "staged_bytes_now": self.used_bytes, "staged_files_now": self.used_files}
 
 
 def _fetch_parallel(
     records: Any, done: set[str], raw_dir: Path, max_bytes: int | None,
     rej: RejectionLogger, max_member_bytes: int, token: str | None,
-    max_records: int | None, budget: _DiskBudget, out: JsonlWriter, stats: dict,
+    max_records: int | None, budget: StagingBudget, out: JsonlWriter, stats: dict,
     workers: int,
 ) -> None:
     """Record-level parallel fetch. Records are independent (each stages into its own
@@ -733,17 +1442,18 @@ def _fetch_parallel(
 
     locked_rej = _LockedRej()
 
-    def _process(rec: dict, need: int) -> tuple[dict, dict | None]:
-        entry = None
+    def _process(rec: dict) -> tuple[dict, dict | None]:
+        # The budget is charged inside fetch_record as bytes/files actually land, so
+        # workers need no reservation and no post-hoc settling — the accounting is exact
+        # and shared (StagingBudget is thread-safe).
         try:
             entry = fetch_record(rec, _session_for_thread(), raw_dir, max_bytes,
-                                 locked_rej, max_member_bytes)  # type: ignore[arg-type]
+                                 locked_rej, max_member_bytes,  # type: ignore[arg-type]
+                                 budget)
             return rec, entry
-        except Exception:  # never let a worker die without settling (would deadlock reserve)
+        except Exception:
             logger.exception("fetch worker crashed on %s", rec.get("recid"))
             return rec, None
-        finally:
-            budget.settle(need, _dir_bytes(raw_dir / rec["recid"]))
 
     def _handle(fut: Any) -> None:
         rec, entry = fut.result()
@@ -753,6 +1463,7 @@ def _fetch_parallel(
             stats["calc_units"] += entry["n_calc_units"]
 
     inflight: set = set()
+    submitted = 0
     try:
         with ThreadPoolExecutor(max_workers=workers) as ex:
             for rec in records:
@@ -760,14 +1471,20 @@ def _fetch_parallel(
                 if rec["recid"] in done:
                     stats["skipped_existing"] += 1
                     continue
-                if max_records and stats["fetched"] >= max_records:
+                # Count SUBMITTED records, not completed ones: stats["fetched"] only
+                # advances when a future is harvested, so gating on it would overshoot
+                # `max_records` by however many are still in flight.
+                if max_records and submitted >= max_records:
                     break
-                need = _download_estimate(rec, max_bytes)
-                if not budget.reserve(need):
+                # Stop between records once a limit has been reached by reclaimable data.
+                if budget.full():
                     stats["stopped_disk_budget"] = True
-                    logger.info("disk budget reached; stopping — parse+purge then resume")
+                    stats["stopped_on"] = budget.hit_limit
+                    logger.info("disk budget (%s) reached; stopping — parse+purge then "
+                                "resume", budget.hit_limit)
                     break
-                inflight.add(ex.submit(_process, rec, need))
+                inflight.add(ex.submit(_process, rec))
+                submitted += 1
                 if len(inflight) >= workers * 2:   # drain to bound memory + refresh stats
                     finished, inflight = wait(inflight, return_when=FIRST_COMPLETED)
                     for f in finished:
@@ -790,6 +1507,7 @@ def fetch(
     retry_rejected: bool = False,
     max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES,
     max_disk_bytes: int | None = None,
+    max_disk_files: int | None = None,
     workers: int = 1,
 ) -> dict:
     """Fetch all records in ``in_path`` (a triaged keep-list).
@@ -812,9 +1530,32 @@ def fetch(
     it reaches the budget, setting ``stopped_disk_budget`` in the returned stats. Because
     fetch is resumable, the intended use is an uncapped (``max_bytes=0``) harvest paced in
     place: loop ``fetch (stops at budget) -> parse -> purge-raw -> fetch (resume) -> ...``
-    so persistent staging never exceeds the budget. NB the check is made *before* a record
-    downloads, so leave headroom for one in-flight archive (the largest relevant record is
-    a few hundred GB) — e.g. set the budget to ~0.8 * quota.
+    so persistent staging never exceeds the budget.
+
+    **Sizing it.** The budget bounds the ENTIRE ``raw_dir``, so it needs no per-batch
+    division — `pipeline`'s two concurrently-staged batches are both inside this one
+    number. Enforcement is exact (every byte charged as written, see
+    :class:`StagingBudget`), so the only headroom the budget itself does not cover is:
+
+    * the dataset dir (extxyz.gz shards + metadata) if it shares the same quota
+      (est. 15-75 GB for a full Zenodo harvest);
+    * filesystem overhead / other users of the volume.
+
+    ~0.8 x quota is a sensible setting for a 1 TB quota.
+
+    ``max_disk_files`` is the same valve for **inodes**, and on CSD3 it is the binding one:
+    ``hpc-work`` allows 1 TB *and* 1M files, while extracted VASP trees measured ~270 KiB
+    mean / 7.6 KiB median per file (screening uploads are thousands of tiny per-calc dirs),
+    so 1M files can be reached around ~0.3 TB. Without it, hitting the inode quota shows up
+    only as per-file EDQUOT write errors, which fetch treats as transient — the harvest
+    would quietly under-collect rather than pause for a purge.
+
+    Both limits are enforced on ACTUAL usage rather than any predicted decompression
+    expansion: measured ratios on real Zenodo records span ~1x to 4.1x (and a synthetic
+    zip reached 880x), so no fixed factor is safe. A file that cannot fit even in an empty
+    budget is rejected individually (``disk_budget_reached``, counted as
+    ``items_over_whole_budget``) instead of stopping the run, so the pacing loop can never
+    spin on it.
 
     ``workers`` (default 1) runs that many record downloads concurrently via a thread
     pool — records are independent (each stages into its own ``raw_dir/<recid>/``), and
@@ -822,7 +1563,12 @@ def fetch(
     ``workers>1`` the disk valve reserves each record's estimated download up front so
     peak disk (staged + all in-flight downloads) still respects ``max_disk_bytes``; keep
     ``workers`` small (~4) to stay well within Zenodo's global 100 req/min, 5000 req/hour
-    authenticated limits. ``max_records`` may overshoot by up to ``workers`` in this mode.
+    authenticated limits.
+
+    The returned stats include the run's own high-water marks — ``peak_staged_bytes`` and
+    ``peak_staged_files`` — plus ``staged_bytes_now``/``staged_files_now`` and
+    ``items_over_whole_budget``. Cluster scratch is inode-limited as well as byte-limited
+    (CSD3 ``hpc-work``: 1 TB **and 1M files**), so both are reported.
     """
     out_path, raw_dir = Path(out_path), Path(raw_dir)
     rejections_path = Path(rejections_path)
@@ -830,45 +1576,88 @@ def fetch(
     if not retry_rejected:
         done |= _terminal_reject_recids(rejections_path)
     rej = RejectionLogger(rejections_path)
-    stats = {"records": 0, "fetched": 0, "skipped_existing": 0, "calc_units": 0,
-             "stopped_disk_budget": False}
+    stats: dict[str, Any] = {"records": 0, "fetched": 0, "skipped_existing": 0,
+                             "calc_units": 0, "stopped_disk_budget": False,
+                             "stopped_on": ""}
     token = token or os.environ.get("ZENODO_TOKEN")
 
+    # ONE walk of the staging tree seeds the budget with whatever a previous, not-yet-purged
+    # run left behind (resume-aware). From here on the accounting is incremental and exact:
+    # every byte/file is charged as it is written and refunded when deleted, so no estimate
+    # of compression expansion is involved anywhere.
+    # Create the staging root FIRST: it is the accounting root (a walk of it never counts
+    # the root itself), so leaving it to be created on demand would charge one inode that
+    # no later measurement of the tree can see, and the tally would drift from reality.
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    base_bytes, base_files = (_dir_usage(raw_dir) if (max_disk_bytes or max_disk_files)
+                              else (0, 0))
+    budget = StagingBudget(max_disk_bytes, max_disk_files, base_bytes, base_files)
+
+    def _serial(count_records: bool) -> None:
+        with _session(token) as session, JsonlWriter(out_path) as out:
+            for rec in read_jsonl(in_path):
+                if count_records:
+                    stats["records"] += 1
+                if rec["recid"] in done:
+                    if count_records:
+                        stats["skipped_existing"] += 1
+                    continue
+                # Stop between records once a limit is reached by data a purge can reclaim.
+                # (A record too big for the WHOLE budget does not stop the run — it is
+                # reported individually, so the pacing loop cannot spin on it forever.)
+                if budget.full():
+                    stats["stopped_disk_budget"] = True
+                    stats["stopped_on"] = budget.hit_limit
+                    logger.info("disk budget (%s) reached (staged %d B / %d files); "
+                                "stopping — parse+purge then resume", budget.hit_limit,
+                                budget.used_bytes, budget.used_files)
+                    break
+                entry = fetch_record(rec, session, raw_dir, max_bytes, rej,
+                                     max_member_bytes, budget)
+                if entry:
+                    out.write(entry)
+                    stats["fetched"] += 1
+                    stats["calc_units"] += entry["n_calc_units"]
+                    done.add(rec["recid"])
+                if max_records and stats["fetched"] >= max_records:
+                    break
+
     if workers > 1:
-        budget = _DiskBudget(max_disk_bytes, _dir_bytes(raw_dir) if max_disk_bytes else 0)
         with JsonlWriter(out_path) as out:
             _fetch_parallel(read_jsonl(in_path), done, raw_dir, max_bytes, rej,
                             max_member_bytes, token, max_records, budget, out, stats,
                             workers)
-        rej.close()
-        stats["rejections"] = rej.n
-        logger.info("fetch: %s", stats)
-        return {"out_path": str(out_path), **stats}
+        # Guaranteed forward progress. If a whole parallel pass staged NOTHING and stopped
+        # on the budget, then the records in flight each fitted individually but filled the
+        # budget between them, and every one of them was rolled back. Handing the same
+        # batch back to the pacing loop would repeat that for ever (there is nothing new to
+        # purge), so retry serially: alone against a budget the rollbacks have just
+        # emptied, a record either stages or is recognised as too big for the budget at
+        # all. Either way the harvest moves, and no record is dropped.
+        if stats["fetched"] == 0 and budget.full():
+            logger.warning("parallel pass staged nothing (%s limit); retrying serially so "
+                           "the harvest cannot stall", budget.hit_limit)
+            stats["serial_fallback"] = True
+            # Clear the pause so the fallback can run; the authoritative post-loop check
+            # below re-derives whether the run really ended on the budget.
+            budget.pause = ""
+            stats["stopped_disk_budget"], stats["stopped_on"] = False, ""
+            _serial(count_records=False)
+    else:
+        _serial(count_records=True)
 
-    # Baseline staging size (resume-aware: prior parts may already sit in raw_dir); we
-    # then track growth incrementally per fetched record to keep this O(files/record).
-    disk_used = _dir_bytes(raw_dir) if max_disk_bytes else 0
-    with _session(token) as session, JsonlWriter(out_path) as out:
-        for rec in read_jsonl(in_path):
-            stats["records"] += 1
-            if rec["recid"] in done:
-                stats["skipped_existing"] += 1
-                continue
-            if max_disk_bytes and disk_used >= max_disk_bytes:
-                stats["stopped_disk_budget"] = True
-                logger.info("disk budget %d reached (staged %d); stopping — parse+purge "
-                            "then resume", max_disk_bytes, disk_used)
-                break
-            entry = fetch_record(rec, session, raw_dir, max_bytes, rej, max_member_bytes)
-            if entry:
-                out.write(entry)
-                stats["fetched"] += 1
-                stats["calc_units"] += entry["n_calc_units"]
-                if max_disk_bytes:  # account for the files this record just staged
-                    disk_used += _dir_bytes(raw_dir / rec["recid"])
-            if max_records and stats["fetched"] >= max_records:
-                break
     rej.close()
     stats["rejections"] = rej.n
+    # Authoritative check, AFTER all workers have finished: a limit can be reached by a
+    # worker after the main loop made its last admission decision (or by the very last
+    # record), and the flag is what tells `pipeline` to reclaim and resume this part —
+    # records deferred by the budget are absent from the manifest, so they are re-fetched.
+    if budget.full():
+        stats["stopped_disk_budget"] = True
+        stats["stopped_on"] = budget.pause
+    # The run reports its own high-water mark, so "did we stay inside the limits?" is
+    # answerable from the summary rather than needing external monitoring.
+    stats.update(budget.stats())
+    stats["items_over_whole_budget"] = budget.unfittable
     logger.info("fetch: %s", stats)
     return {"out_path": str(out_path), **stats}

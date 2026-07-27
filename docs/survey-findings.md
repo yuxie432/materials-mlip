@@ -2,7 +2,7 @@
 
 Estimate produced with the harvest scripts, verified against the live Zenodo API.
 Numbers below use the **fixed** default queries (see "Query fix"). Reproduce with the
-tools here (`README.md`).
+measurement tools in [`scripts/estimate/`](../scripts/estimate/README.md).
 
 ## TL;DR (across ALL of Zenodo, current scripts)
 
@@ -239,10 +239,13 @@ a deliberate recall/bandwidth trade for the mentor to weigh.
    Zenodo suffix-range offset underflow (`IncompleteRead`); ~15% of zip records were
    silently un-peekable. Now falls back to a whole-file GET on the broken read. This is
    what made the peek-aware census above reliable.
-2. **`fetch --max-disk-bytes`** — disk-budget valve; stops cleanly (resumable) when staging
-   fills, for paced fetch→parse→purge→resume.
-3. **`fetch --workers N` (default 4)** — parallel record downloads with a `_DiskBudget` that
-   reserves each in-flight download so peak disk still respects the budget. ~single-stream
+2. **`fetch --max-disk-bytes` / `--max-disk-files`** — the staging budget (bytes *and*
+   inodes), enforced on actual usage: every byte/file is charged as written and refunded on
+   delete, so no decompression-ratio estimate is involved (measured expansion here spans ~1×
+   to 4.1× on real records). On breach the record is rolled back whole and fetch stops
+   cleanly, for paced fetch→parse→purge→resume.
+3. **`fetch --workers N` (default 4)** — parallel record downloads sharing that budget
+   (thread-safe), so peak disk respects it regardless of concurrency. ~single-stream
    20–35 h → ~3–6 h for the multi-TB pull. (Zenodo global limits 100 req/min, 5000 req/hour
    authenticated; 30/min is search-only; CSD3 login nodes cap test runs at 4 CPUs.)
 4. **`pipeline` command** (`pipeline.py`) — overlaps fetch(batch i+1) with parse+purge(batch

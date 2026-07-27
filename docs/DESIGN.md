@@ -192,7 +192,10 @@ Proposed metadata record (one per calculation; frames reference it):
   "calc_parameters": {                       // store ALL of it — as important as the physics
     "code": "vasp", "code_version": "6.4.2",
     "functional": "PBE", "run_type": "GGA+U",   // pymatgen Vasprun.run_type
-    "hubbard_u": {"Fe": 4.0}, "vdw": null,
+    // hubbard_u holds the RAW INCAR LDAU arrays (faithful to the file; the per-species
+    // mapping needs POTCAR order, which is recorded separately in potcar_symbols):
+    "hubbard_u": {"LDAUTYPE": 2, "LDAUL": [2, -1], "LDAUU": [4.0, 0.0], "LDAUJ": [0.0, 0.0]},
+    "vdw": null,
     "encut": 520, "ediff": 1e-6, "ismear": -5, "sigma": 0.05,
     "kpoints": {"scheme": "Monkhorst", "grid": [8,8,8]},
     "potcar_spec": [{"titel": "PAW_PBE Fe_pv 06Sep2000", "hash": null}],
@@ -292,9 +295,48 @@ resolves them against `--raw-dir` (legacy absolute paths still pass through).
   and `purge-raw` deletes each `<raw-dir>/<recid>/` tree whose every calc_id has
   landed in the dataset, reclaiming scratch (units still awaiting a parse re-try are
   kept).
+- The `pipeline` command collapses stages 2–4 into one overlapped, disk-paced run:
+  `fetch` for batch *i+1* overlaps `parse`+`purge-raw` for batch *i*, with `--workers`
+  concurrent downloads inside each fetch. A batch stopped by the disk valve is resumed
+  after the background parse+purge reclaims staging, never skipped. This is the
+  recommended shape for a single long CSD3 job; the `split`/array/`merge` flow remains
+  the way to throw many cores at parsing an already-fetched manifest.
 - Keep one `requests.Session`, honour `Retry-After`, use a token; harvest is
   I/O-bound so a modest array (or async) saturates the rate limit safely.
 - Parsing is CPU-bound and embarrassingly parallel (one task per archive).
+- **Cluster limits shape the design** (CSD3, verified 2026-07-27): a 36 h (SL3: 12 h)
+  wallclock means the harvest spans several jobs → every stage resumes, and downloads
+  resume mid-file over HTTP Range. Scratch is 1 TB *and 1 million files*, and both bind:
+  measured extracted VASP trees run ~7.6 KiB median per file, so 1M inodes can be reached
+  near 0.3 TB. `/rds` is Lustre, so that quota counts **inodes** — directories included,
+  which is why the harvest charges for every directory it creates, not only for files.
+  Batch templates: `scripts/csd3/`.
+- **The staging budget is enforced on actual usage, not on a predicted decompression
+  ratio and not on any declared size.** Measured expansion of a download into staged files
+  spans ~1x (already-compressed payloads) to 4.1x (a 3.86 GB zip → 15.9 GB of vasprun.xml),
+  and 880x for a synthetic archive. So each ~1 MB chunk is charged *before* it is written and
+  refunded on delete (`fetch.StagingBudget`), giving `staged <= limit` for any archive, any
+  expansion ratio and any single-file size. Archive headers / manifest sizes / `Content-Length`
+  are used only as a cheap "don't even start" pre-check (`StagingBudget.check`) — never as
+  the accounting, because the production run is uncapped (`--max-bytes 0`) and would
+  otherwise be bounded by whatever the metadata claimed. `.7z` decompresses in one library
+  call, so its charge lives in a `py7zr` `WriterFactory` (`_BudgetedWriterFactory`); the
+  refusal is recorded rather than raised, because an exception inside py7zr's own threads
+  would be lost.
+  Breach → roll the record back whole → stop resumably → `parse` + `purge-raw` reclaim →
+  re-fetch the same batch. That loop is what lets a ~2 TB harvest run inside a fixed quota;
+  `purge-raw` also frees the parsed units of a *partially* parsed record, so one unparsable
+  unit cannot pin a record's whole tree for the rest of the run.
+- **Three properties keep that loop from spinning** (each one was an observed stall):
+  (a) a refusal is classified by the record's *own* footprint — including its transient
+  archive-plus-extracted peak — so "too big for the budget at all" is a deterministic verdict
+  under `--workers N`, not a guess from whether the budget happened to be empty;
+  (b) whatever an *unrecorded* record left staged is deleted and refunded immediately, since
+  `purge-raw` only reclaims trees that reached the dataset and a leftover would hold budget
+  for the rest of the harvest; (c) a parallel pass that stages nothing falls back to a serial
+  pass, so concurrent records that each fit but collectively do not cannot deadlock the loop.
+  A space refusal never produces a *terminal* rejection reason, so no record is lost to
+  pacing — raising the budget is always sufficient to collect it.
 - Only the final `extxyz.gz` shards + Parquet metadata are kept long-term; raw
   archives can be staged in scratch and deleted after parsing (all gitignored) —
   `purge-raw` does exactly this, deleting only recids whose calcs are all parsed.

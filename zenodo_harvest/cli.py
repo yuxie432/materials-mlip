@@ -99,7 +99,17 @@ def _add_fetch(sub: argparse._SubParsersAction) -> None:
                    help="disk-budget valve: stop cleanly (resumable) once the raw staging "
                         "dir reaches this many bytes; 0 = no limit. Use with an uncapped "
                         "harvest paced as fetch->parse->purge-raw->fetch to bound peak disk. "
-                        "Leave headroom for one in-flight archive (e.g. ~0.8*quota).")
+                        "Enforced on ACTUAL bytes as they are written (no decompression-ratio "
+                        "guess), so it is a hard bound on the whole raw dir; leave headroom "
+                        "only for the dataset dir if it shares the quota — e.g. ~0.8*quota "
+                        "(800000000000 for a 1 TB quota).")
+    p.add_argument("--max-disk-files", type=int, default=0,
+                   help="inode-budget valve: stop cleanly (resumable) once the raw staging "
+                        "dir holds this many files; 0 = no limit. On CSD3 hpc-work (1 TB AND "
+                        "1M files) this binds BEFORE the byte budget — measured extracted "
+                        "VASP data runs ~270KiB mean/7.6KiB median per file, so 1M files "
+                        "can arrive near 0.3 TB. Enforced exactly, as files are written. "
+                        "Suggest ~800000 for a 1M-file quota.")
     p.add_argument("--retry-rejected", action="store_true",
                    help="reprocess records previously rejected as terminal (e.g. after raising --max-bytes)")
     p.add_argument("--workers", type=int, default=4,
@@ -120,6 +130,11 @@ def _add_parse(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--frames-per-shard", type=int, default=10_000)
     p.add_argument("--gzip-level", type=int, default=6,
                    help="gzip compression level 1-9 for shards (1=fast/large, 9=small/slow, default 6)")
+    p.add_argument("--max-primary-bytes", type=int, default=0,
+                   help="skip (log 'primary_too_large') any vasprun.xml/vaspout.h5/OUTCAR "
+                        "bigger than this; 0 = no cap. pymatgen holds a whole trajectory "
+                        "in RAM, so on a batch job one huge output can get the whole job "
+                        "cgroup-killed — set this for long unattended runs, sized to --mem.")
     p.add_argument("--max-records", type=int, default=None)
 
 
@@ -166,9 +181,18 @@ def _add_pipeline(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--max-member-bytes", type=int, default=DEFAULT_MAX_MEMBER_BYTES,
                    help=f"cap on each extracted file; 0 = no cap (default {DEFAULT_MAX_MEMBER_BYTES // 10**9}GB)")
     p.add_argument("--max-disk-bytes", type=int, default=0,
-                   help="per-batch fetch disk budget; 0 = no limit. Two batches' staging can "
-                        "coexist (fetch i+1 while parse i), so set to ~0.4*quota.")
+                   help="disk budget for the whole raw staging dir; 0 = no limit. It already "
+                        "covers both concurrently-staged batches (the valve measures the whole "
+                        "dir), so size it ~0.8*quota — 800000000000 for a 1 TB quota.")
+    p.add_argument("--max-disk-files", type=int, default=0,
+                   help="inode budget for the whole raw staging dir; 0 = no limit. On CSD3 "
+                        "this binds before bytes (1M-file quota vs ~0.3 TB of small "
+                        "extracted files) — suggest ~800000 for a 1M-file quota.")
     p.add_argument("--workers", type=int, default=4, help="concurrent downloads per batch (default 4)")
+    p.add_argument("--max-primary-bytes", type=int, default=0,
+                   help="parse guard: skip any single vasprun.xml/vaspout.h5/OUTCAR larger "
+                        "than this (0 = no cap). Recommended on a batch job so one huge "
+                        "output cannot get the whole job cgroup-killed mid-harvest.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -222,6 +246,7 @@ def main(argv: list[str] | None = None) -> int:
             max_records=args.max_records, retry_rejected=args.retry_rejected,
             max_member_bytes=max_member_bytes,
             max_disk_bytes=(args.max_disk_bytes or None),
+            max_disk_files=(args.max_disk_files or None),
             workers=args.workers,
         )
     elif args.cmd == "parse":
@@ -235,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.in_path, dataset_dir=args.dataset_dir, rejections_path=rejections,
                 frames_per_shard=args.frames_per_shard, max_records=args.max_records,
                 raw_dir=args.raw_dir, gzip_level=args.gzip_level,
+                max_primary_bytes=args.max_primary_bytes,
             )
         except DatasetLockError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
@@ -266,37 +292,53 @@ def main(argv: list[str] | None = None) -> int:
         max_bytes = None if args.max_bytes == 0 else args.max_bytes
         max_member_bytes = args.max_member_bytes if args.max_member_bytes > 0 else (1 << 62)
         max_disk_bytes = args.max_disk_bytes or None
+        max_disk_files = args.max_disk_files or None
         fetch_rej = str(raw_dir.parent / "manifests" / "rejections.jsonl")
         parse_rej = str(ds_dir / "rejections.jsonl")
 
         def _fetched_path(part: Path) -> Path:
             return part.with_name(part.stem + ".fetched.jsonl")
 
-        def fetch_fn(part: Path) -> None:
-            fetch(str(part), out_path=str(_fetched_path(part)), raw_dir=str(raw_dir),
-                  rejections_path=fetch_rej, max_bytes=max_bytes,
-                  max_member_bytes=max_member_bytes, max_disk_bytes=max_disk_bytes,
-                  workers=args.workers)
+        def fetch_fn(part: Path) -> bool:
+            """Fetch one batch. Returns False if the disk-budget valve stopped it part
+            way, so run_pipeline drains the background parse+purge and resumes THIS
+            part instead of carrying on and silently dropping its remaining records."""
+            summary = fetch(str(part), out_path=str(_fetched_path(part)),
+                            raw_dir=str(raw_dir), rejections_path=fetch_rej,
+                            max_bytes=max_bytes, max_member_bytes=max_member_bytes,
+                            max_disk_bytes=max_disk_bytes, max_disk_files=max_disk_files,
+                            workers=args.workers)
+            return not summary.get("stopped_disk_budget", False)
 
         def process_fn(part: Path) -> None:
             fetched = str(_fetched_path(part))
             parse(fetched, dataset_dir=str(ds_dir), rejections_path=parse_rej,
-                  raw_dir=str(raw_dir))
+                  raw_dir=str(raw_dir), max_primary_bytes=args.max_primary_bytes)
             purge_raw(str(raw_dir), str(ds_dir), fetched=fetched)
 
+        fetch_error: str | None = None
+        done_parts: list[Path] = []
+        errors: list[tuple[Path, Exception]] = []
         try:
             done_parts, errors = run_pipeline(part_paths, fetch_fn, process_fn,
                                               after_workers=1)
         except DatasetLockError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
+        except Exception as exc:
+            # A foreground fetch failed hard (systemic: auth, DNS, a full filesystem).
+            # Don't lose the run's report — record it, still verify what did land, and
+            # exit non-zero. Everything staged/parsed so far is resumable.
+            logging.getLogger(__name__).exception("pipeline fetch failed")
+            fetch_error = f"{type(exc).__name__}: {exc}"
         verify = verify_dataset(str(ds_dir))
         summary = {
             "parts": len(part_paths),
             "parts_done": len(done_parts),
+            "fetch_error": fetch_error,
             "process_errors": [{"part": str(p), "error": str(e)} for p, e in errors],
             "verify": verify,
-            "ok": not errors and verify.get("ok", True),
+            "ok": not errors and fetch_error is None and verify.get("ok", True),
         }
     else:  # pragma: no cover
         parser.error(f"unknown command {args.cmd}")

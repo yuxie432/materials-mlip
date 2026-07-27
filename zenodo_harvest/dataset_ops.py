@@ -464,18 +464,76 @@ def _tree_size(root: Path) -> int:
     return sum(p.stat().st_size for p in root.rglob("*") if p.is_file())
 
 
+def _free_parsed_unit_files(units: list[dict], expected: list[str], parsed: set,
+                            raw_dir: Path, resolve: Any, dry_run: bool) -> tuple[int, int]:
+    """Delete the files of a record's PARSED calc units, keeping the unparsed ones'.
+
+    Without this, one unparsed unit pins a record's whole staged tree for the rest of the
+    run: `purge_raw` is otherwise all-or-nothing per recid, and units rejected at parse
+    never reach metadata, so their record is kept forever. Over a full harvest that
+    retained staging accumulates monotonically and can exceed the disk budget on its own —
+    at which point the pacing loop has nothing left to reclaim and the harvest stalls.
+
+    Only files whose OWN calc is already in the dataset are removed, and never a file that
+    an unparsed unit also references (a flat multi-calc directory shares untagged inputs),
+    so a later parse re-try of the rejected units still has everything it needs.
+    Returns ``(bytes_freed, files_removed)``.
+    """
+    keep: set[Path] = set()
+    drop: set[Path] = set()
+    for unit, calc_id in zip(units, expected):
+        paths = {resolve(raw_dir, v) for k, v in unit.items() if k != "dir"}
+        (drop if calc_id in parsed else keep).update(paths)
+
+    freed = removed = 0
+    for path in sorted(drop - keep):
+        if not _strictly_within(raw_dir, path) or not path.is_file():
+            continue
+        freed += path.stat().st_size
+        removed += 1
+        if not dry_run:
+            path.unlink(missing_ok=True)
+    return freed, removed
+
+
+def _prune_empty_dirs(root: Path, raw_dir: Path) -> int:
+    """Remove now-empty directories under ``root`` (bottom-up), keeping ``root`` itself.
+
+    Empty directories still consume inodes, and the file-count budget is the binding
+    limit on CSD3 scratch — a screening record can leave thousands of empty per-calc dirs
+    behind after its files are freed."""
+    if not root.is_dir() or not _strictly_within(raw_dir, root):
+        return 0
+    pruned = 0
+    for d in sorted((p for p in root.rglob("*") if p.is_dir()),
+                    key=lambda p: len(p.parts), reverse=True):
+        try:
+            if _strictly_within(raw_dir, d) and not any(d.iterdir()):
+                d.rmdir()
+                pruned += 1
+        except OSError:  # raced/permission — leave it, it is only inode housekeeping
+            continue
+    return pruned
+
+
 def purge_raw(raw_dir: str | Path, dataset_dir: str | Path,
               fetched: str | Path | None = None, dry_run: bool = False) -> dict:
-    """Delete ``<raw-dir>/<recid>/`` for records whose every calc is in the dataset.
+    """Reclaim raw staging for calcs that are already in the dataset.
 
-    Cluster scratch is scarce (CLAUDE.md); once a record's calcs are parsed into the
-    dataset its raw extracted tree is dead weight. A recid is purgeable iff ALL its
-    expected calc_ids (derived exactly as parse derives them, via the imported
-    :func:`parse._calc_id`/:func:`parse._resolve`) appear in the dataset's
-    metadata.jsonl. Units rejected at parse live in rejections.jsonl, NOT metadata,
-    so their calc_id stays "unparsed" here and the recid is KEPT — deliberate: parse
-    re-tries rejected units on resume, so deleting their raw files would block a
-    post-fix recovery. ``dry_run`` reports identically but deletes nothing.
+    Cluster scratch is scarce (CLAUDE.md); once a calc is parsed into the dataset its raw
+    extracted files are dead weight. A calc counts as parsed iff its calc_id (derived
+    exactly as parse derives it, via the imported :func:`parse._calc_id`/
+    :func:`parse._resolve`) appears in the dataset's metadata.jsonl.
+
+    * A recid whose EVERY unit is parsed has its whole ``<raw-dir>/<recid>/`` tree deleted.
+    * A recid with some unparsed units is **kept**, but the files of its parsed units are
+      still freed (:func:`_free_parsed_unit_files`) and emptied directories pruned. Units
+      rejected at parse never reach metadata, so without this one bad unit would pin the
+      record's entire tree for the whole run and retained staging would accumulate past
+      the disk budget — leaving the pacing loop nothing to reclaim. Files an unparsed unit
+      needs are never touched, so a post-fix parse re-try still works.
+
+    ``dry_run`` reports identically but deletes nothing.
     """
     from .parse import _calc_id, _resolve  # lazy: only purging needs parse's heavy deps
 
@@ -488,7 +546,7 @@ def purge_raw(raw_dir: str | Path, dataset_dir: str | Path,
     fetched_records = list(read_jsonl(fetched_path))  # read fully BEFORE any deletion
 
     per_recid: list[dict] = []
-    n_purged = n_kept = bytes_freed = 0
+    n_purged = n_kept = bytes_freed = files_removed = 0
     for rec in fetched_records:
         recid = rec["recid"]
         base_meta = {"provenance": rec["provenance"],
@@ -503,6 +561,16 @@ def purge_raw(raw_dir: str | Path, dataset_dir: str | Path,
         if not purgeable:
             entry.update(decision="kept",
                          reason="unparsed_calc_units" if expected else "no_calc_units")
+            # Still reclaim the parsed units' files so one bad unit cannot pin the whole
+            # record's staging for the rest of the harvest (see _free_parsed_unit_files).
+            if expected and _strictly_within(raw_dir, target):
+                freed, removed = _free_parsed_unit_files(
+                    rec.get("calc_units", []), expected, parsed, raw_dir, _resolve, dry_run)
+                pruned = 0 if dry_run else _prune_empty_dirs(target, raw_dir)
+                entry.update(partial_bytes_freed=freed, partial_files_removed=removed,
+                             empty_dirs_pruned=pruned)
+                bytes_freed += freed
+                files_removed += removed
             n_kept += 1
         elif not _strictly_within(raw_dir, target):
             # never rmtree a path that resolves outside raw-dir (legacy absolute
@@ -514,14 +582,20 @@ def purge_raw(raw_dir: str | Path, dataset_dir: str | Path,
             n_purged += 1
         else:
             size = _tree_size(target)
-            entry.update(decision="purged", bytes_freed=size, target=str(target))
+            n_files = sum(1 for p in target.rglob("*") if p.is_file())
+            entry.update(decision="purged", bytes_freed=size, files_removed=n_files,
+                         target=str(target))
             if not dry_run:
                 shutil.rmtree(target)
             bytes_freed += size
+            files_removed += n_files
             n_purged += 1
         per_recid.append(entry)
 
     return {"ok": True, "raw_dir": str(raw_dir), "dataset_dir": str(dataset_dir),
             "fetched": str(fetched_path), "dry_run": dry_run,
             "recids_total": len(fetched_records), "recids_purged": n_purged,
-            "recids_kept": n_kept, "bytes_freed": bytes_freed, "per_recid": per_recid}
+            "recids_kept": n_kept, "bytes_freed": bytes_freed,
+            # files_removed matters as much as bytes: the inode quota is the binding limit
+            # on CSD3 scratch, so the pacing loop needs to see inodes reclaimed too.
+            "files_removed": files_removed, "per_recid": per_recid}
