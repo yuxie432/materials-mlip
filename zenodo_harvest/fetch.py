@@ -25,8 +25,10 @@ import logging
 import os
 import re
 import tarfile
+import threading
 import time
 import zipfile
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from hashlib import md5
 from pathlib import Path
 from typing import Any
@@ -639,6 +641,144 @@ def _terminal_reject_recids(rejections_path: Path) -> set[str]:
     return out
 
 
+def _download_estimate(rec: dict, max_bytes: int | None) -> int:
+    """Bytes fetch would transfer for one record (archives + direct VASP files under
+    the cap) — the disk-budget valve's reservation for that record's transient download."""
+    tot = 0
+    for f in rec.get("files", []):
+        base = (f.get("key") or "").rsplit("/", 1)[-1]
+        size = f.get("size") or 0
+        if (_is_archive(base) is not None or bool(_PARSE_RE.search(base))) and (
+                max_bytes is None or size <= max_bytes):
+            tot += size
+    return tot
+
+
+class _DiskBudget:
+    """Bounds (staged extracted bytes + in-flight download bytes) across parallel
+    fetch workers, so peak disk stays under ``limit``.
+
+    ``reserve(need)`` blocks until the record's estimated download fits under the
+    budget, then reserves it; returns False instead when the budget is full of
+    *already-staged* files that only an external ``parse``+``purge-raw`` can free —
+    the signal for fetch to stop cleanly (resumable) so the paced loop can reclaim.
+    A single record larger than the whole budget is admitted alone (forward progress)
+    only when nothing else has been admitted yet this run. ``settle`` is called when a
+    worker finishes: it releases the reservation and folds the record's actual staged
+    size into the committed total. ``None`` limit = unlimited (never blocks/stops).
+    """
+
+    def __init__(self, limit: int | None, baseline: int):
+        self.limit = limit
+        self.committed = baseline      # staged bytes already on disk (resume-aware)
+        self.reserved = 0              # estimated in-flight download bytes
+        self.progressed = False        # has any record been admitted this run?
+        self._cond = threading.Condition()
+
+    def reserve(self, need: int) -> bool:
+        if self.limit is None:
+            return True
+        with self._cond:
+            while True:
+                if self.committed + self.reserved + need <= self.limit:
+                    self.reserved += need
+                    self.progressed = True
+                    return True
+                if self.reserved > 0:
+                    self._cond.wait()          # an in-flight download will free space
+                    continue
+                if not self.progressed:         # guarantee progress: admit one alone
+                    self.reserved += need
+                    self.progressed = True
+                    return True
+                return False                    # staged-full -> stop; caller parses+purges
+
+    def settle(self, need: int, actual: int) -> None:
+        if self.limit is None:
+            return
+        with self._cond:
+            self.reserved -= need
+            self.committed += actual
+            self._cond.notify_all()
+
+
+def _fetch_parallel(
+    records: Any, done: set[str], raw_dir: Path, max_bytes: int | None,
+    rej: RejectionLogger, max_member_bytes: int, token: str | None,
+    max_records: int | None, budget: _DiskBudget, out: JsonlWriter, stats: dict,
+    workers: int,
+) -> None:
+    """Record-level parallel fetch. Records are independent (each stages into its own
+    ``raw_dir/<recid>/``), so a thread pool of ``workers`` overlaps their downloads.
+    Only ``rej`` is shared into worker threads (guarded by a lock); ``out``/``stats``
+    are touched solely by this (main) thread as futures complete, so they need no lock."""
+    tls = threading.local()
+    sessions: list[requests.Session] = []
+    sess_lock = threading.Lock()
+    rej_lock = threading.Lock()
+
+    def _session_for_thread() -> requests.Session:
+        s = getattr(tls, "s", None)
+        if s is None:
+            s = _session(token)
+            tls.s = s
+            with sess_lock:
+                sessions.append(s)
+        return s
+
+    class _LockedRej:
+        def reject(self, *a: Any, **k: Any) -> None:
+            with rej_lock:
+                rej.reject(*a, **k)
+
+    locked_rej = _LockedRej()
+
+    def _process(rec: dict, need: int) -> tuple[dict, dict | None]:
+        entry = None
+        try:
+            entry = fetch_record(rec, _session_for_thread(), raw_dir, max_bytes,
+                                 locked_rej, max_member_bytes)  # type: ignore[arg-type]
+            return rec, entry
+        except Exception:  # never let a worker die without settling (would deadlock reserve)
+            logger.exception("fetch worker crashed on %s", rec.get("recid"))
+            return rec, None
+        finally:
+            budget.settle(need, _dir_bytes(raw_dir / rec["recid"]))
+
+    def _handle(fut: Any) -> None:
+        rec, entry = fut.result()
+        if entry:
+            out.write(entry)
+            stats["fetched"] += 1
+            stats["calc_units"] += entry["n_calc_units"]
+
+    inflight: set = set()
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for rec in records:
+                stats["records"] += 1
+                if rec["recid"] in done:
+                    stats["skipped_existing"] += 1
+                    continue
+                if max_records and stats["fetched"] >= max_records:
+                    break
+                need = _download_estimate(rec, max_bytes)
+                if not budget.reserve(need):
+                    stats["stopped_disk_budget"] = True
+                    logger.info("disk budget reached; stopping — parse+purge then resume")
+                    break
+                inflight.add(ex.submit(_process, rec, need))
+                if len(inflight) >= workers * 2:   # drain to bound memory + refresh stats
+                    finished, inflight = wait(inflight, return_when=FIRST_COMPLETED)
+                    for f in finished:
+                        _handle(f)
+            for f in wait(inflight)[0]:            # drain the rest
+                _handle(f)
+    finally:
+        for s in sessions:
+            s.close()
+
+
 def fetch(
     in_path: str | Path,
     out_path: str | Path = config.MANIFEST_DIR / "fetched.jsonl",
@@ -650,6 +790,7 @@ def fetch(
     retry_rejected: bool = False,
     max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES,
     max_disk_bytes: int | None = None,
+    workers: int = 1,
 ) -> dict:
     """Fetch all records in ``in_path`` (a triaged keep-list).
 
@@ -674,6 +815,14 @@ def fetch(
     so persistent staging never exceeds the budget. NB the check is made *before* a record
     downloads, so leave headroom for one in-flight archive (the largest relevant record is
     a few hundred GB) — e.g. set the budget to ~0.8 * quota.
+
+    ``workers`` (default 1) runs that many record downloads concurrently via a thread
+    pool — records are independent (each stages into its own ``raw_dir/<recid>/``), and
+    downloads are I/O-bound, so this is the main throughput lever for a big harvest. With
+    ``workers>1`` the disk valve reserves each record's estimated download up front so
+    peak disk (staged + all in-flight downloads) still respects ``max_disk_bytes``; keep
+    ``workers`` small (~4) to stay well within Zenodo's global 100 req/min, 5000 req/hour
+    authenticated limits. ``max_records`` may overshoot by up to ``workers`` in this mode.
     """
     out_path, raw_dir = Path(out_path), Path(raw_dir)
     rejections_path = Path(rejections_path)
@@ -683,11 +832,23 @@ def fetch(
     rej = RejectionLogger(rejections_path)
     stats = {"records": 0, "fetched": 0, "skipped_existing": 0, "calc_units": 0,
              "stopped_disk_budget": False}
+    token = token or os.environ.get("ZENODO_TOKEN")
+
+    if workers > 1:
+        budget = _DiskBudget(max_disk_bytes, _dir_bytes(raw_dir) if max_disk_bytes else 0)
+        with JsonlWriter(out_path) as out:
+            _fetch_parallel(read_jsonl(in_path), done, raw_dir, max_bytes, rej,
+                            max_member_bytes, token, max_records, budget, out, stats,
+                            workers)
+        rej.close()
+        stats["rejections"] = rej.n
+        logger.info("fetch: %s", stats)
+        return {"out_path": str(out_path), **stats}
+
     # Baseline staging size (resume-aware: prior parts may already sit in raw_dir); we
     # then track growth incrementally per fetched record to keep this O(files/record).
     disk_used = _dir_bytes(raw_dir) if max_disk_bytes else 0
-    with _session(token or os.environ.get("ZENODO_TOKEN")) as session, \
-            JsonlWriter(out_path) as out:
+    with _session(token) as session, JsonlWriter(out_path) as out:
         for rec in read_jsonl(in_path):
             stats["records"] += 1
             if rec["recid"] in done:

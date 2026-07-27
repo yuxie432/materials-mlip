@@ -102,6 +102,10 @@ def _add_fetch(sub: argparse._SubParsersAction) -> None:
                         "Leave headroom for one in-flight archive (e.g. ~0.8*quota).")
     p.add_argument("--retry-rejected", action="store_true",
                    help="reprocess records previously rejected as terminal (e.g. after raising --max-bytes)")
+    p.add_argument("--workers", type=int, default=4,
+                   help="concurrent record downloads (default 4). Records are independent; "
+                        "keep small to respect Zenodo's 100 req/min, 5000 req/hour limits. "
+                        "The disk valve still bounds peak disk across all in-flight downloads.")
     p.add_argument("--max-records", type=int, default=None)
 
 
@@ -146,6 +150,27 @@ def _add_purge_raw(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--dry-run", action="store_true", help="report only; delete nothing")
 
 
+def _add_pipeline(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("pipeline", help="stage 2-4 overlapped: fetch(i+1) || parse+purge(i), "
+                                        "disk-paced (bounds peak staging under a quota)")
+    p.add_argument("--in", dest="in_path", required=True, help="triaged keep-list JSONL")
+    p.add_argument("--parts", type=int, required=True,
+                   help="split the keep-list into this many batches (each fetched, parsed, "
+                        "purged in turn; fetch of batch i+1 overlaps parse+purge of batch i)")
+    p.add_argument("--raw-dir", default=str(config.RAW_DIR))
+    p.add_argument("--dataset-dir", default=str(config.DATASET_DIR))
+    p.add_argument("--parts-dir", default=None,
+                   help="dir for the split part manifests (default: <in>.pipeline_parts/)")
+    p.add_argument("--max-bytes", type=int, default=0,
+                   help="per-file download cap; 0 = no cap (default: uncapped for the harvest)")
+    p.add_argument("--max-member-bytes", type=int, default=DEFAULT_MAX_MEMBER_BYTES,
+                   help=f"cap on each extracted file; 0 = no cap (default {DEFAULT_MAX_MEMBER_BYTES // 10**9}GB)")
+    p.add_argument("--max-disk-bytes", type=int, default=0,
+                   help="per-batch fetch disk budget; 0 = no limit. Two batches' staging can "
+                        "coexist (fetch i+1 while parse i), so set to ~0.4*quota.")
+    p.add_argument("--workers", type=int, default=4, help="concurrent downloads per batch (default 4)")
+
+
 def main(argv: list[str] | None = None) -> int:
     config.load_dotenv()  # pick up ZENODO_TOKEN from .env if present
     parser = argparse.ArgumentParser(prog="zenodo_harvest", description=__doc__,
@@ -160,6 +185,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_merge(sub)
     _add_verify(sub)
     _add_purge_raw(sub)
+    _add_pipeline(sub)
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -196,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
             max_records=args.max_records, retry_rejected=args.retry_rejected,
             max_member_bytes=max_member_bytes,
             max_disk_bytes=(args.max_disk_bytes or None),
+            workers=args.workers,
         )
     elif args.cmd == "parse":
         # Default the rejection log INSIDE the dataset dir, not a shared sibling: in the
@@ -230,6 +257,47 @@ def main(argv: list[str] | None = None) -> int:
         except FileNotFoundError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
+    elif args.cmd == "pipeline":
+        from .pipeline import run_pipeline
+        raw_dir, ds_dir = Path(args.raw_dir), Path(args.dataset_dir)
+        parts_dir = Path(args.parts_dir or str(Path(args.in_path).with_suffix("")) + ".pipeline_parts")
+        split_info = split_manifest(args.in_path, args.parts, parts_dir)
+        part_paths = [Path(pw["path"]) for pw in split_info["parts_written"] if pw["lines"] > 0]
+        max_bytes = None if args.max_bytes == 0 else args.max_bytes
+        max_member_bytes = args.max_member_bytes if args.max_member_bytes > 0 else (1 << 62)
+        max_disk_bytes = args.max_disk_bytes or None
+        fetch_rej = str(raw_dir.parent / "manifests" / "rejections.jsonl")
+        parse_rej = str(ds_dir / "rejections.jsonl")
+
+        def _fetched_path(part: Path) -> Path:
+            return part.with_name(part.stem + ".fetched.jsonl")
+
+        def fetch_fn(part: Path) -> None:
+            fetch(str(part), out_path=str(_fetched_path(part)), raw_dir=str(raw_dir),
+                  rejections_path=fetch_rej, max_bytes=max_bytes,
+                  max_member_bytes=max_member_bytes, max_disk_bytes=max_disk_bytes,
+                  workers=args.workers)
+
+        def process_fn(part: Path) -> None:
+            fetched = str(_fetched_path(part))
+            parse(fetched, dataset_dir=str(ds_dir), rejections_path=parse_rej,
+                  raw_dir=str(raw_dir))
+            purge_raw(str(raw_dir), str(ds_dir), fetched=fetched)
+
+        try:
+            done_parts, errors = run_pipeline(part_paths, fetch_fn, process_fn,
+                                              after_workers=1)
+        except DatasetLockError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        verify = verify_dataset(str(ds_dir))
+        summary = {
+            "parts": len(part_paths),
+            "parts_done": len(done_parts),
+            "process_errors": [{"part": str(p), "error": str(e)} for p, e in errors],
+            "verify": verify,
+            "ok": not errors and verify.get("ok", True),
+        }
     else:  # pragma: no cover
         parser.error(f"unknown command {args.cmd}")
 

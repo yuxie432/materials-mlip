@@ -14,6 +14,7 @@ from __future__ import annotations
 import io
 import json
 import tarfile
+import threading
 import zipfile
 from datetime import date
 from hashlib import md5
@@ -49,6 +50,7 @@ from zenodo_harvest.models import (
     _ext,
     classify_files,
 )
+from zenodo_harvest.pipeline import run_pipeline
 from zenodo_harvest.triage import peek_zip_filenames
 
 
@@ -1144,6 +1146,9 @@ class _DummySession:
     def __exit__(self, *a):
         return False
 
+    def close(self):
+        pass
+
 
 def test_fetch_disk_budget_stops_cleanly(tmp_path, monkeypatch):
     # The disk-budget valve must stop fetching once the staging tree reaches the budget,
@@ -1180,3 +1185,146 @@ def test_fetch_disk_budget_stops_cleanly(tmp_path, monkeypatch):
         rejections_path=tmp_path / "rej2.jsonl", max_bytes=None,
     )
     assert stats2["stopped_disk_budget"] is False and stats2["fetched"] == 10
+
+
+def _write_recs(path, n, size):
+    with path.open("w") as fh:
+        for i in range(n):
+            fh.write(json.dumps({"recid": str(i),
+                                 "files": [{"key": "a.zip", "size": size, "download": "u"}]}) + "\n")
+
+
+def _staging_fetch_record(per_record):
+    def fake(rec, session, rd, max_bytes, rej, max_member_bytes=0):
+        d = Path(rd) / rec["recid"] / "extracted"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "OUTCAR").write_bytes(b"x" * per_record)
+        rej.reject("fetch", rec["recid"] + ":note", "parallel_probe")  # exercise shared rej
+        return {"recid": rec["recid"], "n_calc_units": 1, "calc_units": []}
+    return fake
+
+
+def test_fetch_parallel_fetches_all(tmp_path, monkeypatch):
+    # workers>1 must fetch every independent record exactly once, with thread-safe
+    # writes to the output manifest and the (shared) rejection log.
+    monkeypatch.setattr(fetch_mod, "_session", lambda _t: _DummySession())
+    monkeypatch.setattr(fetch_mod, "fetch_record", _staging_fetch_record(1024))
+    manifest = tmp_path / "keep.jsonl"
+    _write_recs(manifest, 10, 1024)
+    stats = fetch_mod.fetch(
+        manifest, out_path=tmp_path / "fetched.jsonl", raw_dir=tmp_path / "raw",
+        rejections_path=tmp_path / "rej.jsonl", max_bytes=None, workers=4,
+    )
+    assert stats["fetched"] == 10 and stats["stopped_disk_budget"] is False
+    lines = list(read_jsonl(tmp_path / "fetched.jsonl"))
+    assert len(lines) == 10 and {ln["recid"] for ln in lines} == {str(i) for i in range(10)}
+    # rejection log stayed uncorrupted under concurrent appends (all 10 lines parse)
+    assert len(list(read_jsonl(tmp_path / "rej.jsonl"))) == 10
+
+
+def test_fetch_parallel_disk_budget_bounds_and_stops(tmp_path, monkeypatch):
+    # With workers>1 the disk valve reserves each in-flight download and stops cleanly
+    # once staged bytes fill the budget (so a paced loop can parse+purge and resume).
+    S = 1 << 20
+    monkeypatch.setattr(fetch_mod, "_session", lambda _t: _DummySession())
+    monkeypatch.setattr(fetch_mod, "fetch_record", _staging_fetch_record(S))
+    manifest = tmp_path / "keep.jsonl"
+    _write_recs(manifest, 30, S)
+    stats = fetch_mod.fetch(
+        manifest, out_path=tmp_path / "fetched.jsonl", raw_dir=tmp_path / "raw",
+        rejections_path=tmp_path / "rej.jsonl", max_bytes=None, workers=3,
+        max_disk_bytes=5 * S,
+    )
+    assert stats["stopped_disk_budget"] is True
+    assert 1 <= stats["fetched"] <= 8          # bounded well below all 30
+    # what was actually staged never blew far past the budget (+ headroom for in-flight)
+    staged = sum(p.stat().st_size for p in (tmp_path / "raw").rglob("*") if p.is_file())
+    assert staged <= 8 * S
+
+
+# --------------------------------------------------------------------------- #
+# pipeline — overlap fetch(i+1) with parse+purge(i)                           #
+# --------------------------------------------------------------------------- #
+
+def test_run_pipeline_overlaps_fetch_and_process():
+    # Deterministic overlap proof (no sleeps): process(i) blocks until fetch(i+1) has
+    # STARTED. If the orchestrator serialised the stages, process(i) would never be
+    # unblocked and the wait would time out -> test fails. Overlap => it proceeds.
+    parts = ["p0", "p1", "p2", "p3"]
+    fetch_started = {p: threading.Event() for p in parts}
+    order: list[tuple[str, str]] = []
+    lock = threading.Lock()
+
+    def fetch_fn(p):
+        with lock:
+            order.append(("fetch", p))
+        fetch_started[p].set()
+
+    def process_fn(p):
+        i = parts.index(p)
+        if i + 1 < len(parts):  # a next part exists -> its fetch must overlap this process
+            assert fetch_started[parts[i + 1]].wait(timeout=10), f"no overlap after {p}"
+        with lock:
+            order.append(("process", p))
+        return p
+
+    done, errors = run_pipeline(parts, fetch_fn, process_fn, after_workers=1)
+    assert not errors
+    assert set(done) == set(parts)
+    # every part was fetched, in order, and every part was processed
+    fetches = [p for kind, p in order if kind == "fetch"]
+    assert fetches == parts
+    assert sorted(p for kind, p in order if kind == "process") == sorted(parts)
+
+
+def test_run_pipeline_records_process_errors_without_stopping():
+    # A failing background process is recorded (not swallowed, not fatal); other parts
+    # still complete.
+    parts = ["a", "b", "c"]
+
+    def fetch_fn(p):
+        pass
+
+    def process_fn(p):
+        if p == "b":
+            raise RuntimeError("parse boom")
+        return p
+
+    done, errors = run_pipeline(parts, fetch_fn, process_fn, after_workers=1)
+    assert set(done) == {"a", "c"}
+    assert len(errors) == 1 and errors[0][0] == "b"
+    assert isinstance(errors[0][1], RuntimeError)
+
+
+def test_cli_pipeline_wiring(tmp_path, monkeypatch):
+    # End-to-end wiring of the `pipeline` CLI command (split -> fetch -> parse -> purge
+    # -> verify) with the heavy stages faked, so a signature mismatch would fail here.
+    import zenodo_harvest.cli as cli_mod
+    keep = tmp_path / "keep.jsonl"
+    with keep.open("w") as fh:
+        for i in range(5):
+            fh.write(json.dumps({"recid": str(i), "files": []}) + "\n")
+    calls: list[str] = []
+
+    def fake_fetch(in_path, out_path, raw_dir, **k):
+        calls.append("fetch")
+        Path(out_path).write_text(json.dumps({"recid": "x"}) + "\n")
+        return {"fetched": 1, "stopped_disk_budget": False}
+
+    def fake_parse(in_path, dataset_dir, **k):
+        calls.append("parse")
+        return {"ok": True}
+
+    def fake_purge(raw_dir, dataset_dir, **k):
+        calls.append("purge")
+        return {"ok": True}
+
+    monkeypatch.setattr(cli_mod, "fetch", fake_fetch)
+    monkeypatch.setattr(cli_mod, "parse", fake_parse)
+    monkeypatch.setattr(cli_mod, "purge_raw", fake_purge)
+    monkeypatch.setattr(cli_mod, "verify_dataset", lambda d: {"ok": True})
+
+    rc = cli_mod.main(["pipeline", "--in", str(keep), "--parts", "3",
+                       "--raw-dir", str(tmp_path / "raw"), "--dataset-dir", str(tmp_path / "ds")])
+    assert rc == 0
+    assert calls.count("fetch") == 3 and calls.count("parse") == 3 and calls.count("purge") == 3
