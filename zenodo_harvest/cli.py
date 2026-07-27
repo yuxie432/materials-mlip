@@ -95,6 +95,11 @@ def _add_fetch(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--max-member-bytes", type=int, default=DEFAULT_MAX_MEMBER_BYTES,
                    help=f"skip any single EXTRACTED file larger than this; 0 = no cap "
                         f"(default {DEFAULT_MAX_MEMBER_BYTES // 10**9}GB)")
+    p.add_argument("--max-disk-bytes", type=int, default=0,
+                   help="disk-budget valve: stop cleanly (resumable) once the raw staging "
+                        "dir reaches this many bytes; 0 = no limit. Use with an uncapped "
+                        "harvest paced as fetch->parse->purge-raw->fetch to bound peak disk. "
+                        "Leave headroom for one in-flight archive (e.g. ~0.8*quota).")
     p.add_argument("--retry-rejected", action="store_true",
                    help="reprocess records previously rejected as terminal (e.g. after raising --max-bytes)")
     p.add_argument("--max-records", type=int, default=None)
@@ -190,6 +195,7 @@ def main(argv: list[str] | None = None) -> int:
             rejections_path=rejections, max_bytes=max_bytes,
             max_records=args.max_records, retry_rejected=args.retry_rejected,
             max_member_bytes=max_member_bytes,
+            max_disk_bytes=(args.max_disk_bytes or None),
         )
     elif args.cmd == "parse":
         # Default the rejection log INSIDE the dataset dir, not a shared sibling: in the

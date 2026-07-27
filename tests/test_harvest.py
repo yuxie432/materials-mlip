@@ -1135,3 +1135,48 @@ def test_fetch_record_two_zips_same_member_yield_two_units(tmp_path):
     # the two OUTCARs live under distinct per-archive subdirs (relative to raw_dir)
     outcar_dirs = sorted(Path(u["outcar"]).parent.parent.name for u in entry["calc_units"])
     assert outcar_dirs == ["a", "b"]
+
+
+class _DummySession:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_fetch_disk_budget_stops_cleanly(tmp_path, monkeypatch):
+    # The disk-budget valve must stop fetching once the staging tree reaches the budget,
+    # setting stopped_disk_budget, so an uncapped harvest can be paced fetch->parse->purge.
+    raw_dir = tmp_path / "raw"
+    per_record = 4 << 20  # each fetched record stages a 4 MiB file
+
+    def fake_fetch_record(rec, session, rd, max_bytes, rej, max_member_bytes=0):
+        d = Path(rd) / rec["recid"] / "extracted"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "OUTCAR").write_bytes(b"x" * per_record)
+        return {"recid": rec["recid"], "n_calc_units": 1, "calc_units": []}
+
+    monkeypatch.setattr(fetch_mod, "_session", lambda _t: _DummySession())
+    monkeypatch.setattr(fetch_mod, "fetch_record", fake_fetch_record)
+
+    manifest = tmp_path / "keep.jsonl"
+    with manifest.open("w") as fh:
+        for i in range(10):
+            fh.write(json.dumps({"recid": str(i), "files": []}) + "\n")
+
+    stats = fetch_mod.fetch(
+        manifest, out_path=tmp_path / "fetched.jsonl", raw_dir=raw_dir,
+        rejections_path=tmp_path / "rej.jsonl", max_bytes=None,
+        max_disk_bytes=10 << 20,  # budget = 10 MiB -> stop after ~2-3 records
+    )
+    assert stats["stopped_disk_budget"] is True
+    assert 2 <= stats["fetched"] <= 4          # stopped well before all 10
+    assert stats["fetched"] < 10
+
+    # No budget -> fetches everything (valve is opt-in).
+    stats2 = fetch_mod.fetch(
+        manifest, out_path=tmp_path / "fetched2.jsonl", raw_dir=tmp_path / "raw2",
+        rejections_path=tmp_path / "rej2.jsonl", max_bytes=None,
+    )
+    assert stats2["stopped_disk_budget"] is False and stats2["fetched"] == 10

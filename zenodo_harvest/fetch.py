@@ -118,6 +118,14 @@ def _md5(path: Path, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
+def _dir_bytes(path: Path) -> int:
+    """Total size of the files under ``path`` (0 if absent). Used by the disk-budget
+    valve to bound persistent staging (extracted VASP files awaiting parse+purge)."""
+    if not path.exists():
+        return 0
+    return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+
+
 def download_file(
     session: requests.Session, url: str, dest: Path, expected_md5: str | None,
     max_bytes: int | None = None,
@@ -641,6 +649,7 @@ def fetch(
     token: str | None = None,
     retry_rejected: bool = False,
     max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES,
+    max_disk_bytes: int | None = None,
 ) -> dict:
     """Fetch all records in ``in_path`` (a triaged keep-list).
 
@@ -656,6 +665,15 @@ def fetch(
     is deleted right after its VASP files are extracted, so persistent disk is the
     extracted files, not the archive. ``max_member_bytes`` caps each single extracted
     file (guards against decompression bombs / a runaway multi-GB vasprun.xml).
+
+    ``max_disk_bytes`` (``None`` = no limit) is a **disk-budget valve**: before starting
+    each new record, fetch measures the staging tree (``raw_dir``) and stops cleanly once
+    it reaches the budget, setting ``stopped_disk_budget`` in the returned stats. Because
+    fetch is resumable, the intended use is an uncapped (``max_bytes=0``) harvest paced in
+    place: loop ``fetch (stops at budget) -> parse -> purge-raw -> fetch (resume) -> ...``
+    so persistent staging never exceeds the budget. NB the check is made *before* a record
+    downloads, so leave headroom for one in-flight archive (the largest relevant record is
+    a few hundred GB) — e.g. set the budget to ~0.8 * quota.
     """
     out_path, raw_dir = Path(out_path), Path(raw_dir)
     rejections_path = Path(rejections_path)
@@ -663,7 +681,11 @@ def fetch(
     if not retry_rejected:
         done |= _terminal_reject_recids(rejections_path)
     rej = RejectionLogger(rejections_path)
-    stats = {"records": 0, "fetched": 0, "skipped_existing": 0, "calc_units": 0}
+    stats = {"records": 0, "fetched": 0, "skipped_existing": 0, "calc_units": 0,
+             "stopped_disk_budget": False}
+    # Baseline staging size (resume-aware: prior parts may already sit in raw_dir); we
+    # then track growth incrementally per fetched record to keep this O(files/record).
+    disk_used = _dir_bytes(raw_dir) if max_disk_bytes else 0
     with _session(token or os.environ.get("ZENODO_TOKEN")) as session, \
             JsonlWriter(out_path) as out:
         for rec in read_jsonl(in_path):
@@ -671,11 +693,18 @@ def fetch(
             if rec["recid"] in done:
                 stats["skipped_existing"] += 1
                 continue
+            if max_disk_bytes and disk_used >= max_disk_bytes:
+                stats["stopped_disk_budget"] = True
+                logger.info("disk budget %d reached (staged %d); stopping — parse+purge "
+                            "then resume", max_disk_bytes, disk_used)
+                break
             entry = fetch_record(rec, session, raw_dir, max_bytes, rej, max_member_bytes)
             if entry:
                 out.write(entry)
                 stats["fetched"] += 1
                 stats["calc_units"] += entry["n_calc_units"]
+                if max_disk_bytes:  # account for the files this record just staged
+                    disk_used += _dir_bytes(raw_dir / rec["recid"])
             if max_records and stats["fetched"] >= max_records:
                 break
     rej.close()
