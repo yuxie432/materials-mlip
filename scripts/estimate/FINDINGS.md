@@ -142,3 +142,108 @@ large reusable VASP corpora live in dedicated repositories — Materials Project
 OQMD, AFLOW, Materials Cloud — which dwarf Zenodo by orders of magnitude. If the goal is
 dataset *volume*, adding one of those sources will move the needle far more than any
 Zenodo-side recall tweak.
+
+---
+
+# SECOND SURVEY — expanded keywords + all resource types (measured 2026-07-24/27)
+
+Re-run after the query set was **expanded** (`discover.py`: 20 queries built from
+computation×materials and MLIP×materials chunk cross-products, vs the 13 focused queries
+above) and extended to survey **all four Zenodo resource types**. Method identical
+(discover → census → triage-peek sample with Wilson 95% CIs → bucket-C sample download →
+one fetch+parse ratios sample). This section is ADDITIVE — the 2026-07-21 numbers above
+stand as the previous baseline.
+
+## Effect of expanding the keywords (`dataset` only, old vs new)
+
+| Metric | OLD (focused) | NEW (expanded) | change |
+|---|---|---|---|
+| Unique concepts | 925 | 3,596 | ×3.9 |
+| Relevant (rank≥3) | 629 | 2,391 | ×3.8 |
+| Raw footprint | 2.21 TB | 13.62 TB | ×6.2 |
+| Gross transfer (uncapped) | 2.06 TB | 12.17 TB | ×5.9 |
+| **B-rate** (primary in peekable zips) | 12% | **5.3%** | ~halved |
+| **C-rate** (primary in other archives) | 27% | **25%** | ≈same |
+| **Est. records w/ VASP primary** | ≈107 | **≈270** | ×2.5 |
+| Precision (primary ÷ relevant) | ~17% | ~11% | ↓ |
+
+**Verdict:** the expansion is a genuine recall win (~2.5× more parseable-VASP records) but
+costs ~6× the I/O and roughly halves the peekable-zip hit-rate — the extra generic anchors
+(`materials`/`crystal`/`DFT`/`phonon`/…) pull in a large low-precision tail. C-rate is
+keyword-independent (people still tar whole run dirs). Keep the expansion; lean harder on
+peek-filtering + the license/access gates to control the download bill.
+
+## Per-resource-type results (gates ON; disjoint sets)
+
+| | dataset | publication | software | other |
+|---|---|---|---|---|
+| Unique concepts | 3,596 | 14,527 | 1,003 | 285 |
+| — `unlikely` (junk) | 1,021 | 13,711 | 132 | 169 |
+| Gates dropped (access/license) | 355 / 404 | 1,145 / 2,666 | 43 / 68 | 15 / 42 |
+| **Relevant (rank≥3)** | **2,391** | **733** | **865** | **115** |
+| A — direct | 13 | 1 | 1 | 4 |
+| B — peekable-zip | 1,715 | 600 | 775 | 95 |
+|  ↳ B primary-rate (CI) | 5.3% (3.0–9.0) | 5.1% (2.7–9.4) | 6.4% (3.6–11.1) | 3.8% (1.3–10.6) |
+| C — other archive | 663 | 132 | 89 | 16 |
+|  ↳ C yield (sample) | 25% (6/24) | 12.5% (3/24) | 16.7% (4/24) | 0% (0/11) |
+| **≈ records w/ VASP primary** | **≈270** | **≈48** | **≈66** | **≈8** |
+| Raw footprint | 13.62 TB | 1.30 TB | 323 GB | 192 GB |
+
+Combined (all 4): **4,104 relevant, 15.4 TB raw, ≈392 records with a parseable VASP
+primary** (~234–759). Necessity for the harvest: **software** = clear win (best useful
+records per byte); **publication** = low-yield but +48 real records (expensive discovery,
+94% PDFs — worth it for recall, gates+peek bound the cost); **other** = optional (≈8
+records; cheap to include). `resource_type` is recorded end-to-end (fetch→parse→metadata),
+so sources can be weighted/filtered at train time.
+
+## Peek-aware transfer (the transfer that actually has to be DOWNLOADED)
+
+`census.py` sums *all* archive bytes, but `triage --peek` DROPS zips it proves hold no
+VASP before any download. The real transfer = census of the **peek-kept** set. Measured by
+running the real `triage --peek` over all `dataset` zip records then censusing the keep-list
+(1,268 kept of 2,404; **1,136 dropped**):
+
+| per-file cap | gross transfer | **peek-aware transfer** | saved by peek |
+|---|---|---|---|
+| 0.5 GB | 336 GB | **176 GB** | 48% |
+| 2 GB | 1.47 TB | **829 GB** | 45% |
+| 10 GB | 5.51 TB | **4.51 TB** | 18% |
+| **uncapped** | 12.17 TB | **11.17 TB** | **8%** |
+
+**Key finding (counter-intuitive):** peek drops ~47% of records but only ~8% of *uncapped*
+bytes — the dropped negatives are overwhelmingly **small** (kept-set median jumps 247 MB →
+1.27 GB). The byte mass lives in (a) large zips peek keeps (nested/ZIP64/confirmed) and (b)
+non-peekable tar/7z/zst/rar (**4.65 TB, all kept, cannot be Range-peeked**). So peek's
+byte-saving is large only under a per-file **cap** (≈45–48% at ≤2 GB), because the dropped
+small negatives are mostly sub-cap. **Implication:** if the uncapped ~11 TB transfer is too
+much, a 2 GB cap cuts it to ~0.83 TB peek-aware while losing only the longest trajectories —
+a deliberate recall/bandwidth trade for the mentor to weigh.
+
+## `dataset` summary (peek-aware transfer; the headline table)
+
+| quantity | value |
+|---|---|
+| Relevant records (rank≥3) | 2,391 |
+| — directly-exposed VASP (A) | 13 |
+| — peekable-zip archives (B) | 1,715 (~5.3% have a primary → ≈91) |
+| — other archives (C, tar/rar/7z/zst) | 663 (~25% have a primary → ≈166) |
+| **Est. records with a parseable VASP primary** | **≈270 (range ~165–520)** |
+| Raw footprint (all relevant) | 13.62 TB |
+| **Transfer to download (peek-aware), uncapped** | **≈11.2 TB** |
+| Transfer (peek-aware) @2 GB / @10 GB cap | 0.83 TB / 4.51 TB |
+| Final `extxyz.gz` dataset (rough, thin sample) | order 1–100 GB — **fits 1 TB easily** |
+
+## Code changes made this session (all: 99 tests + mypy + ruff green)
+
+1. **Peek small-file underflow FIX** (`triage.py`) — zips < the 64 KiB Range tail hit a
+   Zenodo suffix-range offset underflow (`IncompleteRead`); ~15% of zip records were
+   silently un-peekable. Now falls back to a whole-file GET on the broken read. This is
+   what made the peek-aware census above reliable.
+2. **`fetch --max-disk-bytes`** — disk-budget valve; stops cleanly (resumable) when staging
+   fills, for paced fetch→parse→purge→resume.
+3. **`fetch --workers N` (default 4)** — parallel record downloads with a `_DiskBudget` that
+   reserves each in-flight download so peak disk still respects the budget. ~single-stream
+   20–35 h → ~3–6 h for the multi-TB pull. (Zenodo global limits 100 req/min, 5000 req/hour
+   authenticated; 30/min is search-only; CSD3 login nodes cap test runs at 4 CPUs.)
+4. **`pipeline` command** (`pipeline.py`) — overlaps fetch(batch i+1) with parse+purge(batch
+   i); disk-paced; one command for stages 2–4. Run commands live in the harvest memory note.

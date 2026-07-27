@@ -27,7 +27,6 @@ metadata never says so is invisible to discovery. Every number here is therefore
 - `sample_storage.py` — fetch + parse a size-stratified sample of rank≥3 records;
   measures **fetch yield** and the **ratios** (extract, frames/record, bytes/frame).
 - `project.py` — census JSON × ratios JSON → **final storage projection** per cap.
-- `slurm_discover.sh`, `slurm_sample.sh` — CSD3 SLURM templates.
 
 ## Procedure (CSD3)
 
@@ -36,8 +35,11 @@ Prereqs: `pip install -e .[parse]` (needs `pymatgen`+`ase` for the sample);
 
 ### 1. Exhaustive discovery (the only slow, network-bound step)
 
+Run inside a batch job (compute node — long jobs are killed on login nodes):
+
 ```bash
-sbatch scripts/estimate/slurm_discover.sh          # or run in tmux on a login node
+python -m zenodo_harvest.cli discover --exhaustive \
+    --out "$ZENODO_HARVEST_DATA/manifests/candidates_full.jsonl" -v
 ```
 
 Enumerates **all** default queries with recursive date-bisection past the 10k
@@ -83,8 +85,12 @@ very long AIMD `vasprun.xml`).
 
 ### 3. Storage sample (fetch + parse; question 2's ratios)
 
+Run inside a batch job (downloads happen here; needs scratch space):
+
 ```bash
-sbatch scripts/estimate/slurm_sample.sh
+python scripts/estimate/sample_storage.py \
+    "$ZENODO_HARVEST_DATA/manifests/candidates_full.jsonl" \
+    "$ZENODO_HARVEST_DATA/estimate_sample" --n 200 --cap-gb 2 --max-total-gb 100
 ```
 
 Fetches + parses a stratified sample. **Raise `--cap-gb` / `--n` to tighten the
