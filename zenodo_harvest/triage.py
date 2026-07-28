@@ -72,8 +72,11 @@ def _ranged_get(session: requests.Session, url: str, range_header: str,
 
 def _range_get(session: requests.Session, url: str, start: int, end: int) -> bytes | None:
     r = _ranged_get(session, url, f"bytes={start}-{end}")
-    if r is None or r.status_code != 206:  # 200 => Range ignored; refuse whole (GB) file
+    if r is None:
         return None
+    if r.status_code != 206:  # 200 => Range ignored; refuse whole (GB) file
+        r.close()             # streamed + unread: release the pooled connection now,
+        return None           # not at GC — a full triage does tens of thousands of peeks
     return r.content
 
 
@@ -99,7 +102,10 @@ def peek_zip_filenames(url: str, session: requests.Session | None = None, tail: 
     session = session or requests.Session()
     try:
         r = _ranged_get(session, url, f"bytes=-{tail}")  # retries 429 (see _ranged_get)
-        if r is None or r.status_code != 206:
+        if r is None:
+            return None
+        if r.status_code != 206:
+            r.close()          # streamed + unread (Range ignored): release the connection
             return None
         cr = r.headers.get("Content-Range", "")
         size = int(cr.split("/")[-1]) if "/" in cr else None
@@ -110,6 +116,13 @@ def peek_zip_filenames(url: str, session: requests.Session | None = None, tail: 
             # deliver, so the read breaks. Only a file SMALLER than the tail hits this
             # (a real tail of a big file reads fine), so re-fetch the whole small file.
             r.close()
+            # Guard the whole-file refetch on the KNOWN size: a broken tail read on a
+            # genuinely large file is a transient network error, not the underflow, and
+            # pulling a multi-GB file whole (into memory) is exactly the cost the peek
+            # exists to avoid. Unknown/oversized size => treat as an un-peekable failure
+            # (triage keeps the record; it is never dropped on a failed peek).
+            if size is None or size > tail:
+                return None
             whole = session.get(url, timeout=60)
             if whole.status_code != 200:
                 return None

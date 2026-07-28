@@ -127,7 +127,7 @@ python -m zenodo_harvest.cli discover \
 
 python -m zenodo_harvest.cli triage \
     --in data/manifests/candidates.jsonl \
-    --out data/manifests/keep.jsonl --min-rank 3 --peek
+    --out data/manifests/keep.jsonl --min-rank 3      # peek is ON by default (--no-peek disables)
 
 pip install -e .[parse]                  # stage 2-4 add pymatgen + ase
 

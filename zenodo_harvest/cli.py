@@ -10,10 +10,11 @@ Small WSL trial (first 10k per query, no download)::
         --in data/manifests/candidates.jsonl \
         --out data/manifests/keep.jsonl --min-rank 3
 
-Confirm archive contents without downloading (reads zip central directory)::
+Triage peeks into remote .zip central directories by default (confirms VASP without
+downloading); pass --no-peek to disable::
 
     python -m zenodo_harvest.cli triage --in data/manifests/candidates.jsonl \
-        --out data/manifests/keep.jsonl --peek
+        --out data/manifests/keep.jsonl
 
 Full harvest on the cluster (recursive date partitioning past the 10k cap)::
 
@@ -196,7 +197,8 @@ def _add_pipeline(sub: argparse._SubParsersAction) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    config.load_dotenv()  # pick up ZENODO_TOKEN from .env if present
+    config.load_dotenv()  # pick up ZENODO_TOKEN / ZENODO_HARVEST_DATA from .env if present
+    config.refresh_paths()  # so a .env ZENODO_HARVEST_DATA is honoured, not just a real export
     parser = argparse.ArgumentParser(prog="zenodo_harvest", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("-v", "--verbose", action="store_true")

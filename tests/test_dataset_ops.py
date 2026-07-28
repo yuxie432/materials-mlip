@@ -424,6 +424,38 @@ def test_parse_unit_falls_back_to_smaller_sibling_primary(tmp_path):
     assert seen["outcar"].endswith("OUTCAR")   # fell back to the small OUTCAR
 
 
+def test_parse_unit_trim_keeps_the_original_calc_id_for_resume(tmp_path):
+    # RESUME-CONSISTENCY: when an oversized vasprun.xml is trimmed and a sibling OUTCAR
+    # parses instead, the stored calc_id (and hence frame_ids) must stay keyed off the
+    # ORIGINAL unit's primary (the vasprun). The caller `parse` derives its resume/skip
+    # key from the untrimmed unit; if trimming re-keyed calc_id to the OUTCAR, a resumed
+    # run would not skip the calc, would re-parse it, and would write duplicate frames +
+    # a duplicate metadata record (verify's frame_id bijection then fails).
+    from zenodo_harvest.manifest import RejectionLogger
+    from zenodo_harvest.parse import _calc_id, parse_calc_unit
+    import zenodo_harvest.parse as parse_mod
+
+    unit, base_meta = _unit_and_meta(tmp_path, {"vasprun": 5000, "outcar": 10})
+    expected = _calc_id(unit, base_meta)                 # untrimmed => vasprun-keyed
+    assert expected == "zenodo:42:calc/vasprun.xml"
+    seen = {}
+    orig = parse_mod._parse_outcar_ase
+
+    def spy(outcar_path, calc_id):
+        seen["calc_id"] = calc_id                        # capture the id the OUTCAR path got
+        raise RuntimeError("stop after capturing calc_id")
+
+    parse_mod._parse_outcar_ase = spy
+    rej = RejectionLogger(tmp_path / "rej.jsonl")
+    try:
+        parse_calc_unit(unit, base_meta, {}, rej, max_primary_bytes=1000)
+    finally:
+        parse_mod._parse_outcar_ase = orig
+        rej.close()
+    # the OUTCAR fallback parsed under the vasprun-keyed id, NOT "zenodo:42:calc/OUTCAR"
+    assert seen["calc_id"] == expected
+
+
 # --------------------------------------------------------------------------- #
 # purge-raw partial reclaim — one unparsed unit must not pin a record's whole  #
 # staging for the rest of the harvest (that accumulation can exceed the whole  #

@@ -172,12 +172,21 @@ def _dir_usage(path: Path) -> tuple[int, int]:
     if not path.exists():
         return 0, 0
     total = count = 0
-    for p in path.rglob("*"):
-        if p.is_dir():
-            count += 1                  # a directory is an inode too (Lustre quota)
-        elif p.is_file():
-            total += p.stat().st_size
-            count += 1
+    # Walk defensively: in the overlapped `pipeline`, fetch baselines ``raw_dir`` for
+    # batch i+1 (this walk) WHILE ``purge-raw`` for batch i deletes trees under the same
+    # ``raw_dir`` in a background thread. A plain ``rglob`` + ``stat`` would then hit a
+    # just-deleted entry and raise ``FileNotFoundError`` mid-walk, aborting the foreground
+    # fetch (which the pipeline reports as a hard fetch_error). ``os.walk`` with an
+    # error-swallowing ``onerror`` skips a directory that vanishes, and the per-file
+    # ``stat`` is guarded so a file removed between listing and stat is simply not counted.
+    for root, dirs, files in os.walk(path, onerror=lambda _e: None):
+        count += len(dirs)              # a directory is an inode too (Lustre quota)
+        for name in files:
+            try:
+                total += os.stat(os.path.join(root, name)).st_size
+                count += 1
+            except OSError:
+                continue                # vanished mid-walk (concurrent purge) — skip it
     return total, count
 
 
@@ -1199,25 +1208,6 @@ def _terminal_reject_recids(rejections_path: Path) -> set[str]:
     return out
 
 
-def _download_estimate(rec: dict, max_bytes: int | None) -> int:
-    """Bytes fetch would transfer for one record (archives + direct VASP files under
-    the cap) — the disk-budget valve's reservation for that record's transient download.
-
-    ``max_bytes`` falsy (``None`` *or* ``0``) means "no cap", matching how every other
-    size check in this module reads it — the CLI maps ``--max-bytes 0`` to ``None``, but
-    a literal ``0`` reaching here must not make every record estimate 0 bytes and so
-    silently disable the valve's in-flight reservation.
-    """
-    tot = 0
-    for f in rec.get("files", []):
-        base = (f.get("key") or "").rsplit("/", 1)[-1]
-        size = f.get("size") or 0
-        if (_is_archive(base) is not None or bool(_PARSE_RE.search(base))) and (
-                not max_bytes or size <= max_bytes):
-            tot += size
-    return tot
-
-
 class BudgetExceeded(Exception):
     """Raised by :meth:`StagingBudget.charge` when a limit is reached by data that a
     ``parse``+``purge-raw`` COULD reclaim.
@@ -1559,11 +1549,12 @@ def fetch(
 
     ``workers`` (default 1) runs that many record downloads concurrently via a thread
     pool — records are independent (each stages into its own ``raw_dir/<recid>/``), and
-    downloads are I/O-bound, so this is the main throughput lever for a big harvest. With
-    ``workers>1`` the disk valve reserves each record's estimated download up front so
-    peak disk (staged + all in-flight downloads) still respects ``max_disk_bytes``; keep
-    ``workers`` small (~4) to stay well within Zenodo's global 100 req/min, 5000 req/hour
-    authenticated limits.
+    downloads are I/O-bound, so this is the main throughput lever for a big harvest. Peak
+    disk still respects ``max_disk_bytes`` with ``workers>1`` because the shared,
+    thread-safe :class:`StagingBudget` charges every byte as it is written (no up-front
+    reservation and no per-worker split of the budget is needed — the accounting is exact
+    across all in-flight downloads); keep ``workers`` small (~4) to stay well within
+    Zenodo's global 100 req/min, 5000 req/hour authenticated limits.
 
     The returned stats include the run's own high-water marks — ``peak_staged_bytes`` and
     ``peak_staged_files`` — plus ``staged_bytes_now``/``staged_files_now`` and

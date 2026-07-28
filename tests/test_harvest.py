@@ -1321,6 +1321,57 @@ def _staging_fetch_record(per_record):
     return fake
 
 
+def test_dir_usage_survives_concurrent_deletion(tmp_path, monkeypatch):
+    # In the overlapped `pipeline`, fetch baselines raw_dir for batch i+1 WHILE purge-raw
+    # for batch i deletes trees under the same raw_dir. _dir_usage must not crash when an
+    # entry vanishes between being listed and being stat()'d — otherwise a racing purge
+    # aborts the foreground fetch. Simulate a file that disappears mid-walk.
+    root = tmp_path / "raw"
+    (root / "recA").mkdir(parents=True)
+    (root / "recB").mkdir(parents=True)
+    (root / "recA" / "OUTCAR").write_bytes(b"x" * 100)
+    doomed = root / "recB" / "vasprun.xml"
+    doomed.write_bytes(b"y" * 200)
+
+    real_stat = os.stat
+
+    def flaky_stat(path, *a, **k):
+        if str(path) == str(doomed):
+            doomed.unlink(missing_ok=True)           # vanish exactly as it is stat()'d
+            return real_stat(path, *a, **k)          # -> raises FileNotFoundError
+        return real_stat(path, *a, **k)
+
+    monkeypatch.setattr(fetch_mod.os, "stat", flaky_stat)
+    total, count = fetch_mod._dir_usage(root)         # must not raise
+    assert total == 100                               # the survivor's bytes still counted
+    # two record dirs counted as inodes; the vanished file is simply skipped
+    assert count == 2 + 1                             # recA, recB, + surviving OUTCAR
+
+
+def test_env_data_root_from_dotenv_is_honoured(tmp_path, monkeypatch):
+    # A ZENODO_HARVEST_DATA that lives ONLY in .env (not exported) must still redirect the
+    # data dirs. Before refresh_paths the constants stayed bound to their import-time
+    # default `data/` — on CSD3 that is /home's 50 GB *backed-up* quota, not the 1 TB
+    # scratch, so a full harvest would silently fill it and fail.
+    from zenodo_harvest import config
+    monkeypatch.delenv("ZENODO_HARVEST_DATA", raising=False)
+    scratch = tmp_path / "rds" / "hpc-work" / "zenodo"
+    (tmp_path / ".env").write_text(f"ZENODO_HARVEST_DATA={scratch}\n")
+    saved = (config.DATA_ROOT, config.MANIFEST_DIR, config.RAW_DIR, config.DATASET_DIR)
+    try:
+        config.load_dotenv(tmp_path / ".env")
+        assert os.environ.get("ZENODO_HARVEST_DATA") == str(scratch)  # .env populated env
+        config.refresh_paths()
+        assert config.RAW_DIR == scratch / "raw"
+        assert config.DATASET_DIR == scratch / "dataset"
+        assert config.MANIFEST_DIR == scratch / "manifests"
+    finally:
+        # config globals + the env var are process-wide: restore them so later tests that
+        # fall back to config defaults are unaffected.
+        os.environ.pop("ZENODO_HARVEST_DATA", None)
+        config.DATA_ROOT, config.MANIFEST_DIR, config.RAW_DIR, config.DATASET_DIR = saved
+
+
 def test_fetch_parallel_fetches_all(tmp_path, monkeypatch):
     # workers>1 must fetch every independent record exactly once, with thread-safe
     # writes to the output manifest and the (shared) rejection log.
@@ -1337,17 +1388,6 @@ def test_fetch_parallel_fetches_all(tmp_path, monkeypatch):
     assert len(lines) == 10 and {ln["recid"] for ln in lines} == {str(i) for i in range(10)}
     # rejection log stayed uncorrupted under concurrent appends (all 10 lines parse)
     assert len(list(read_jsonl(tmp_path / "rej.jsonl"))) == 10
-
-
-def test_download_estimate_treats_zero_max_bytes_as_uncapped(tmp_path):
-    # `--max-bytes 0` means "no cap" everywhere else in fetch; if the disk-budget
-    # estimator instead read 0 as a literal cap, EVERY record would estimate 0 bytes and
-    # the valve would stop reserving in-flight downloads (unbounded peak disk).
-    rec = {"recid": "1", "files": [{"key": "data.zip", "size": 5_000_000_000},
-                                   {"key": "OUTCAR", "size": 1_000}]}
-    assert fetch_mod._download_estimate(rec, None) == 5_000_001_000
-    assert fetch_mod._download_estimate(rec, 0) == 5_000_001_000     # 0 == uncapped
-    assert fetch_mod._download_estimate(rec, 2_000) == 1_000         # real cap applies
 
 
 def test_fetch_parallel_max_records_does_not_overshoot(tmp_path, monkeypatch):

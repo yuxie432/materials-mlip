@@ -89,3 +89,13 @@ class RejectionLogger:
 
     def close(self) -> None:
         self._w.close()
+
+    def __enter__(self) -> "RejectionLogger":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        # Context-managed so a raising parse/fetch still releases the log's file handle
+        # (each line is already flushed, so no rejection is lost — this only stops an fd
+        # leak on the error path, which matters in `pipeline` where a failed batch's
+        # exception is caught and the process keeps running for the remaining batches).
+        self.close()

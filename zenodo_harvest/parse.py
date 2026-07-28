@@ -568,6 +568,18 @@ def parse_calc_unit(unit: dict, base_meta: dict, availability: dict,
     huge vasprun.xml beside a modest OUTCAR) the oversized one is dropped from the unit
     and the normal precedence picks the next parseable primary.
     """
+    # calc_id is keyed off the ORIGINAL unit's primary (precedence vasprun>vaspout>outcar)
+    # and is computed ONCE here, BEFORE any oversized-primary trimming below — so it is
+    # stable across a trim. It has to be: the caller (`parse`) derives the resume/skip key
+    # and the `done_calc_ids` entry from this same untrimmed unit, and stores this id (plus
+    # `<calc_id>#<step>` frame_ids) in metadata.jsonl, which `_load_committed` reads back on
+    # resume. If trimming away a huge vasprun.xml re-keyed calc_id to the surviving OUTCAR,
+    # a resumed run would not recognise the calc as already done, would re-parse it, and
+    # would emit duplicate frames + a duplicate metadata record — and `verify`'s frame_id
+    # bijection would then report the whole dataset corrupt. Under the recommended
+    # `--max-primary-bytes` this is the common case (long-AIMD vasprun.xml beside a modest
+    # OUTCAR), so calc_id must NOT depend on which primary survives trimming.
+    calc_id = _calc_id(unit, base_meta)
     if max_primary_bytes:
         over = _oversized_primaries(unit, max_primary_bytes)
         if over:
@@ -575,7 +587,7 @@ def parse_calc_unit(unit: dict, base_meta: dict, availability: dict,
             if not any(trimmed.get(r) for r in _PRIMARY_ROLES_ORDER):
                 # Reject under the ORIGINAL unit's calc_id, so the audit line names the
                 # same calc a later (bigger-memory, or uncapped) re-run would parse.
-                rej.reject("parse", _calc_id(unit, base_meta), "primary_too_large",
+                rej.reject("parse", calc_id, "primary_too_large",
                            roles=over, max_primary_bytes=max_primary_bytes)
                 return None
             logger.warning("skipping oversized primary(s) %s (> %d B) in %s; using a "
@@ -587,7 +599,6 @@ def parse_calc_unit(unit: dict, base_meta: dict, availability: dict,
     extracted_root = Path(base_meta["_extracted_root"])
     rel = (str(Path(unit["dir"]).relative_to(extracted_root))
            if (vasprun or vaspout or outcar) else unit["dir"])
-    calc_id = _calc_id(unit, base_meta)
 
     # Primary parse: pymatgen Vasprun/Vaspout. On failure, if an OUTCAR is present
     # in the same unit, fall back to the ASE OUTCAR reader rather than dropping the
@@ -800,9 +811,9 @@ def parse(
             logger.info("parse resume: %d calc(s) already done, pruned %s, new shards from %05d",
                         len(done_calc_ids), pruned, start_index)
 
-        rej = RejectionLogger(rejections_path)
-        with ShardedExtxyzWriter(dataset_dir, frames_per_shard, start_index=start_index,
-                                 compresslevel=gzip_level) as xyz, \
+        with RejectionLogger(rejections_path) as rej, \
+                ShardedExtxyzWriter(dataset_dir, frames_per_shard, start_index=start_index,
+                                    compresslevel=gzip_level) as xyz, \
                 MetadataWriter(metadata_path) as meta_w:
             for rec in read_jsonl(in_path):
                 stats["records"] += 1
@@ -834,7 +845,6 @@ def parse(
                     stats["calcs_parsed"] += 1
                 if max_records and stats["records"] >= max_records:
                     break
-        rej.close()
     stats["rejections"] = rej.n
     stats["pruned"] = pruned
     logger.info("parse: %s", stats)

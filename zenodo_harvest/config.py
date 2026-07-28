@@ -53,13 +53,33 @@ def load_dotenv(path: str | Path = ".env") -> None:
 
 
 # Filesystem layout. Override the root via ZENODO_HARVEST_DATA (e.g. point it at
-# cluster scratch). Everything here is gitignored. NB: this is read once, at
-# import — set it as a real env var / in your batch script (before Python starts),
-# not in .env, which is loaded after this module is imported.
-DATA_ROOT = Path(os.environ.get("ZENODO_HARVEST_DATA", "data"))
-MANIFEST_DIR = DATA_ROOT / "manifests"   # JSONL pipeline manifests
-RAW_DIR = DATA_ROOT / "raw"              # downloaded + extracted VASP files (staging)
-DATASET_DIR = DATA_ROOT / "dataset"      # final extxyz.gz shards + metadata.jsonl
+# cluster scratch). Everything here is gitignored.
+def _layout(root: str | None = None) -> tuple[Path, Path, Path, Path]:
+    data_root = Path(root if root is not None
+                     else os.environ.get("ZENODO_HARVEST_DATA", "data"))
+    return (data_root, data_root / "manifests",  # JSONL pipeline manifests
+            data_root / "raw",                    # downloaded + extracted VASP files (staging)
+            data_root / "dataset")                # final extxyz.gz shards + metadata.jsonl
+
+
+# Bound at import from the process environment. A ZENODO_HARVEST_DATA that arrives only
+# via .env (loaded later, in the CLI) is picked up by refresh_paths() below.
+DATA_ROOT, MANIFEST_DIR, RAW_DIR, DATASET_DIR = _layout()
+
+
+def refresh_paths() -> None:
+    """Recompute the data-dir layout from the current environment.
+
+    The path constants are bound at import, but ``load_dotenv`` runs later (from the CLI),
+    so a ``ZENODO_HARVEST_DATA`` living in ``.env`` would otherwise be ignored and the
+    harvest would silently write under the default ``data/`` — on CSD3 that is ``/home``'s
+    50 GB *backed-up* quota, not the 1 TB scratch, so a real harvest would fill it and fail.
+    The CLI calls this once, right after ``load_dotenv`` and before argparse reads the
+    path defaults, so ``.env`` and a real ``export`` behave identically. (Batch scripts
+    still ``export`` it before Python starts, which works with or without this.)
+    """
+    global DATA_ROOT, MANIFEST_DIR, RAW_DIR, DATASET_DIR
+    DATA_ROOT, MANIFEST_DIR, RAW_DIR, DATASET_DIR = _layout()
 
 
 def ensure_dirs() -> None:
