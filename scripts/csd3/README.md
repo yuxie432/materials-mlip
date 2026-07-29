@@ -6,6 +6,7 @@ block, then submit from the repo root.
 
 ```
 scripts/csd3/00_check_network.sh   # ONE-OFF: prove compute nodes can reach zenodo.org
+scripts/csd3/csd3_download_speed.py# ONE-OFF: measure compute-node download throughput (fetch-time estimate)
 scripts/csd3/10_discover.sh        # stage 0-1 (discover + triage) — network, 1 core
 scripts/csd3/20_pipeline.sh        # stage 2-4 overlapped (fetch || parse+purge) + verify
 scripts/csd3/30_parse_array.sh     # OPTIONAL: many-core array parse of a fetched manifest
@@ -77,8 +78,30 @@ srun -A MYACCT-SL3-CPU -p icelake-himem --cpus-per-task=4 --time=00:20:00 \
 ```
 
 Discovery is hard-limited by Zenodo to 30 search requests/minute, so it is single-stream
-by design — do **not** parallelise it. Measured 2026-07-27 for the 3-resource-type run:
-~34k hits ≈ 1.4k pages ≈ **under 1 h** of paging. Only `fetch` benefits from `--workers`.
+by design — do **not** parallelise it. Measured 2026-07-29 for the 3-resource-type run
+(current keywords): ~18.7k hits ≈ 750 pages ≈ **~51 min** of paging. Only `fetch` benefits
+from `--workers`.
+
+## Download throughput (the fetch-time estimate)
+
+`fetch` dominates the harvest wall-clock, and the one unknown is the **compute-node →
+zenodo.org throughput** (the CSD3 docs don't state it, and it depends on the node's outbound
+path / any proxy). Measure it directly on a compute node **before** sizing the job:
+
+```bash
+srun -A MYACCT-SL3-CPU -p icelake --nodes=1 --ntasks=1 --cpus-per-task=4 --time=00:20:00 \
+    python scripts/csd3/csd3_download_speed.py --workers 4
+```
+
+It reports single-stream MB/s, N-worker aggregate MB/s (the number to divide the transfer
+by), and Range round-trip latency (the peek / targeted-zip-fetch cost). Plug the aggregate
+into: **fetch time ≈ transfer ÷ aggregate MB/s**. The measured 2026-07-29 transfer to plan
+against is **~7.5 TB uncapped** (peek + zip-walk-aware) or **~1.1 TB at `--max-bytes 2e9`**
+(see `docs/survey-findings.md`), so e.g. at 200 MB/s aggregate: ~10 h uncapped (a 1–2 job,
+self-resubmitting run) vs ~1.6 h capped (one job). NB peeking and the many-small-file parts
+of fetch are **request-rate-bound**, not bandwidth-bound — Zenodo's file endpoint throttles
+hard (a full peek of ~2,200 zips absorbed 225 × HTTP 429), so budget ~1 h for triage-peek
+independent of bandwidth.
 
 ## Resuming
 

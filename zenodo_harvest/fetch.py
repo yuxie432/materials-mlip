@@ -137,6 +137,26 @@ _PARSE_STEMS = ("vasprun", "vaspout", "outcar", "incar", "kpoints",
                 "poscar", "contcar", "potcar", "oszicar")
 _PARSE_RE = re.compile(r"(?:^|[/_.\-])(?:" + "|".join(_PARSE_STEMS) + r")", re.IGNORECASE)
 
+
+def _is_junk_member(name: str) -> bool:
+    """Archive/upload metadata cruft that is never a VASP file or a real sub-archive.
+
+    macOS tars/zips carry an **AppleDouble** ``._<name>`` sidecar beside every file and a
+    top-level ``__MACOSX/`` tree (and a ``.DS_Store`` per directory). These are tiny binary
+    resource-fork blobs, but their names defeat every name-based check here:
+    ``._OUTCAR``/``._vasprun.xml`` match :data:`_PARSE_RE` (the ``_`` before the stem is a
+    valid separator) so they were extracted and fed to pymatgen as if they were real VASP
+    outputs (observed: a Mac-tarred upload produced dozens of ``vasprun_parse_error`` on
+    ``._vasprun.xml.gz`` sidecars), and ``._Data.zip`` matches :func:`_is_archive` so the
+    nested-archive recursion tried to unzip a 4 KB AppleDouble header (``BadZipFile``).
+    Worse, a ``._vasprun.xml`` beside a real ``vasprun.xml`` in one directory can seed a
+    duplicate calc unit that then fails to parse. Skipping them everywhere a member/file
+    name is classified removes the noise, the wasted work, and that displacement risk."""
+    base = name.rsplit("/", 1)[-1]
+    if base.startswith("._") or base == ".DS_Store":
+        return True
+    return name == "__MACOSX" or name.startswith("__MACOSX/") or "/__MACOSX/" in name
+
 # Heavy outputs: presence recorded as availability, contents never extracted.
 _AVAILABILITY = {
     "charge_density": re.compile(r"^(chgcar|chg|aeccar\d*|parchg)", re.IGNORECASE),
@@ -455,7 +475,10 @@ def _copy_capped(src: Any, out: Path, cap: int,
 def _want_member(base: str) -> bool:
     """A member worth extracting from an archive: a VASP file (to keep), OR a nested
     archive (to recurse into so its own VASP files can be reached — see
-    :func:`_recurse_nested_archives`)."""
+    :func:`_recurse_nested_archives`). AppleDouble/``__MACOSX`` cruft is never either
+    (see :func:`_is_junk_member`)."""
+    if _is_junk_member(base):
+        return False
     return bool(_PARSE_RE.search(base)) or _is_archive(base) is not None
 
 
@@ -538,10 +561,12 @@ def _fetch_zip_targeted(url: str, dest: Path, session: requests.Session,
     # enumeration, so targeted fetch cannot see the VASP files within it. Fall back to a
     # whole-archive download, which the recursion path (_recurse_nested_archives) then
     # unpacks. This also keeps the "proven no VASP" shortcut below sound.
-    if any(_is_archive(n.rsplit("/", 1)[-1]) is not None for n in names):
+    if any(_is_archive(n.rsplit("/", 1)[-1]) is not None
+           and not _is_junk_member(n) for n in names):
         return None
     targets = [e for e in entries
-               if not e.is_dir and _PARSE_RE.search(e.name.rsplit("/", 1)[-1])]
+               if not e.is_dir and not _is_junk_member(e.name)
+               and _PARSE_RE.search(e.name.rsplit("/", 1)[-1])]
     if not targets:
         return names, []                    # proven no VASP inside -> no download needed
     if any(not t.targetable for t in targets):
@@ -1002,7 +1027,8 @@ def _recurse_nested_archives(
     # Snapshot eagerly: extraction below creates new dirs, which the recursive call (scoped
     # to each new dir) handles — so a freshly-written sub-archive is never re-processed here.
     nested = sorted(p for p in root.rglob("*")
-                    if p.is_file() and _is_archive(p.name) is not None)
+                    if p.is_file() and _is_archive(p.name) is not None
+                    and not _is_junk_member(p.name))
     for arc in nested:
         base = arc.name
         kind = _is_archive(base)
@@ -1100,7 +1126,7 @@ def _find_calc_units(root: Path) -> list[dict[str, str]]:
     """
     by_dir: dict[Path, list[tuple[str, Path]]] = {}
     for p in root.rglob("*"):
-        if not p.is_file():
+        if not p.is_file() or _is_junk_member(p.name):
             continue
         role = _unit_role(p.name)
         if role is not None:
@@ -1292,6 +1318,10 @@ def _stage_record_files(
         key, url, size = f["key"], f.get("download"), f.get("size") or 0
         cksum = (f.get("checksum") or "").split(":", 1)[-1] or None
         base = (key or "").rsplit("/", 1)[-1]
+        # AppleDouble/__MACOSX cruft (a directly-exposed ``._OUTCAR`` etc.) is never a real
+        # VASP file or archive — skip before it is classified/downloaded.
+        if _is_junk_member(key or ""):
+            continue
         kind = _is_archive(base)
 
         # A split/spanned archive part (foo.z01, foo.r01, foo.partN.rar) cannot be

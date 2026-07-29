@@ -44,12 +44,14 @@ python -m zenodo_harvest.cli discover --exhaustive \
 
 Enumerates **all** default queries with recursive date-bisection past the 10k
 window. Serial + polite (~30 req/min even with a token — more cores do not help).
-**Resumable**: resubmit and it continues from the sidecar checkpoint. With the
-current (fixed, explicit-boolean) default queries the whole enumeration is small —
-the largest single query is `VASP` at ~330 dataset hits and the full deduped census
-is <1k concepts, so a windowed (non-`--exhaustive`) run already captures everything
-and `--exhaustive` finishes in minutes. (The old bare-OR `"ab initio" molecular
-dynamics forces` query that used to flood ~53k junk hits has been removed.)
+**Resumable**: resubmit and it continues from the sidecar checkpoint. Measured
+2026-07-29 (current keywords, all three resource types): **no single query exceeds
+the 10k window** (largest is ~2.3k publication hits), so a windowed
+(non-`--exhaustive`) run already captures everything and `--exhaustive` is
+equivalent. Scale per resource type: **dataset ~4.7k hits → 2,463 concepts (~13 min),
+software ~1.1k → 719 (~3 min), publication ~12.9k → 7,191 (~35 min)** — the whole
+3-type discovery is **~51 min** single-stream. (The old bare-OR `"ab initio"
+molecular dynamics forces` query that used to flood ~53k junk hits has been removed.)
 
 Output: `…/manifests/candidates_full.jsonl` (deduplicated, classified, gated).
 
