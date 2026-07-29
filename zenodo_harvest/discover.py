@@ -39,11 +39,10 @@ logger = logging.getLogger(__name__)
 # for method/tooling terms and the code's own filenames, which uploaders often name.
 
 _COMPUTATION_CHUNKS = (
-    '(DFT OR GGA OR LDA OR "Hubbard U" OR "molecular dynamics" OR AIMD OR relaxation '
-    'OR "density functional theory" OR ase OR "geometry optimization" '
-    'OR forces OR "potential energy surface")',
-    '("transition state" OR "first principles" OR "first-principles" OR "ab initio" OR "ab-initio" '
-    'OR "force field" OR NEB OR "nudged elastic band" OR "energy convergence" OR "force convergence" '
+    '(DFT OR GGA OR LDA OR "Hubbard U" OR AIMD OR "transition state" '
+    'OR "density functional" OR "density-functional" OR "geometry optimization" OR "potential energy surface")',
+    '("first principles" OR "first-principles" OR "ab initio" OR "ab-initio" OR ase '
+    'OR NEB OR "nudged elastic band" OR "energy convergence" OR "force convergence" '
     'OR "Born-Oppenheimer" OR "self-consistent field" OR "SCF convergence")',
 )
 
