@@ -61,6 +61,15 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
     targeted member is a wanted VASP file); only the disk valve bounds it. Enumeration alone
     can prove a zip holds no VASP and skip the download entirely. tar/rar/7z/zst have no tail
     index (or are non-seekable when compressed) and keep the whole-download path.
+    **Nested archives** (an archive inside an archive — a `.zip` of per-run `.tar.gz`s, a
+    `.tar` of `.zip`s, …) are unpacked recursively *after download* for every archive type
+    (`_recurse_nested_archives`, depth cap 8): the extractors also pull out nested-archive
+    members and each sub-archive is extracted then deleted+refunded, so VASP files inside
+    sub-archives are reached (CHGCAR inside a sub-archive is still recorded as availability
+    only). Targeted ZIP fetch **falls back to a whole download** when the zip contains a
+    nested archive (the central-directory peek can't see inside it), letting the recursion
+    unpack it — random access *into* a compressed sub-archive is impossible (its index sits
+    in a non-seekable DEFLATE blob).
     `.rar`/`.7z`/`.tar.zst` extract when the `archives` extra (py7zr/rarfile/zstandard + an
     `unrar`/`bsdtar` binary for rar) is installed, else a logged rejection. Emits
     `fetched.jsonl` (one calc-unit list per record). Three independent size/pacing levers:

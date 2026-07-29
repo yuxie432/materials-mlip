@@ -2705,3 +2705,127 @@ def test_cli_fetch_wires_zip_stream_flags(tmp_path, monkeypatch):
     cli_mod.main(["fetch", "--in", str(keep), "--no-zip-stream",
                   "--zip-stream-max-files", "7"])
     assert captured["zip_stream"] is False and captured["zip_stream_max_files"] == 7
+
+
+# --------------------------------------------------------------------------- #
+# Nested-archive recursion — extract VASP files from sub-archives (a .zip of   #
+# per-run .tar.gz's, a .tar of .zip's, …), for ALL archive types, after        #
+# download. The extractors pull out nested-archive members too; a recursion    #
+# driver then unpacks each one, deleting it afterwards (mentor/user request).   #
+# --------------------------------------------------------------------------- #
+
+def _tar_gz_bytes(items):
+    """Build an in-memory gzip-compressed tar from ``[(name, bytes), ...]``."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for name, content in items:
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            tf.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+def _fetch_whole(rec, session, raw_dir):
+    rej = RejectionLogger(Path(raw_dir).parent / "rej.jsonl")
+    entry = fetch_record(rec, session, raw_dir, max_bytes=None, rej=rej)
+    rej.close()
+    return entry
+
+
+def _zip_rec(recid, key, blob):
+    return {"recid": recid, "files": [{"key": key, "download": f"http://x/{key}",
+            "size": len(blob), "checksum": "md5:" + md5(blob).hexdigest()}]}
+
+
+def test_extract_zip_also_extracts_nested_archive_member(tmp_path):
+    # The broadened extractor pulls out a nested archive member (so recursion can reach it),
+    # alongside the VASP files — without touching the existing VASP-only behaviour.
+    inner = _zip_with([("calc/OUTCAR", b"o")])
+    arc = tmp_path / "a.zip"
+    arc.write_bytes(_zip_with([("run/vasprun.xml", b"<x/>"), ("bundle.zip", inner)]))
+    names, extracted = _extract_zip(arc, tmp_path / "extracted", 1 << 30)
+    assert "bundle.zip" in extracted and "run/vasprun.xml" in extracted
+    assert (tmp_path / "extracted" / "bundle.zip").exists()
+
+
+def test_fetch_record_recurses_nested_targz_in_zip(tmp_path):
+    # The headline case: a .zip whose VASP data lives inside a nested .tar.gz. Recursion
+    # must extract the vasprun/OUTCAR, record a CHGCAR that lives inside the sub-archive as
+    # availability, and delete the sub-archive afterwards.
+    inner = _tar_gz_bytes([("calc/vasprun.xml", b"<modeling>V</modeling>"),
+                           ("calc/OUTCAR", b"outcar"), ("calc/CHGCAR", b"heavy" * 100)])
+    outer = _zip_with([("data/inner.tar.gz", inner), ("top/README", b"hi")])
+    entry = _fetch_whole(_zip_rec("7001", "outer.zip", outer),
+                         _MultiFileStreamSession({"http://x/outer.zip": outer}), tmp_path / "raw")
+    assert entry is not None and entry["n_calc_units"] == 1
+    assert entry["availability"]["charge_density"] is True          # CHGCAR inside sub-archive
+    raw = [p.name for p in (tmp_path / "raw").rglob("*") if p.is_file()]
+    assert "vasprun.xml" in raw and "OUTCAR" in raw
+    assert "CHGCAR" not in raw                                       # heavy -> availability only
+    assert not any(p.name == "inner.tar.gz" for p in (tmp_path / "raw").rglob("*"))  # deleted
+
+
+def test_fetch_record_recurses_two_levels(tmp_path):
+    # zip -> a.zip -> b.tar -> vasprun/OUTCAR: recursion must descend more than one level.
+    b = _tar_bytes([("calc/vasprun.xml", b"<x/>"), ("calc/OUTCAR", b"o")])
+    a = _zip_with([("sub/b.tar", b)])
+    outer = _zip_with([("deep/a.zip", a)])
+    entry = _fetch_whole(_zip_rec("7002", "outer.zip", outer),
+                         _MultiFileStreamSession({"http://x/outer.zip": outer}), tmp_path / "raw")
+    assert entry is not None and entry["n_calc_units"] == 1
+    raw = [p.name for p in (tmp_path / "raw").rglob("*") if p.is_file()]
+    assert "vasprun.xml" in raw and "OUTCAR" in raw
+    assert not any(p.suffix in {".zip", ".tar"} for p in (tmp_path / "raw").rglob("*"))
+
+
+def test_fetch_record_recurses_zip_inside_tar(tmp_path):
+    # Cross-type: the TOP archive is a .tar containing a nested .zip. Recursion is
+    # archive-type-agnostic, so the zip's VASP files are still extracted.
+    inner = _zip_with([("calc/vasprun.xml", b"<x/>"), ("calc/OUTCAR", b"o")])
+    outer = _tar_bytes([("nested/inner.zip", inner)])
+    entry = _fetch_whole(_zip_rec("7003", "outer.tar", outer),
+                         _MultiFileStreamSession({"http://x/outer.tar": outer}), tmp_path / "raw")
+    assert entry is not None and entry["n_calc_units"] == 1
+    raw = [p.name for p in (tmp_path / "raw").rglob("*") if p.is_file()]
+    assert "vasprun.xml" in raw and "OUTCAR" in raw
+
+
+def test_nested_recursion_depth_cap(tmp_path, monkeypatch):
+    # A depth cap guards an archive-quine: with the cap at 1, only the first nested level
+    # is unpacked and the deeper one is logged, not descended into forever.
+    monkeypatch.setattr(fetch_mod, "_MAX_NEST_DEPTH", 1)
+    b = _tar_bytes([("calc/vasprun.xml", b"<x/>"), ("calc/OUTCAR", b"o")])
+    a = _zip_with([("sub/b.tar", b)])
+    outer = _zip_with([("deep/a.zip", a)])
+    rej = RejectionLogger(tmp_path / "rej.jsonl")
+    entry = fetch_record(_zip_rec("7004", "outer.zip", outer),
+                         _MultiFileStreamSession({"http://x/outer.zip": outer}),
+                         tmp_path / "raw", max_bytes=None, rej=rej)
+    rej.close()
+    reasons = [r["reason"] for r in read_jsonl(tmp_path / "rej.jsonl")]
+    assert "archive_nesting_too_deep" in reasons
+    # b.tar was reached (depth 1) but not descended into -> no vasprun surfaced -> no unit
+    assert entry is None
+
+
+def test_targeted_fetch_falls_back_on_nested_archive(tmp_path):
+    # A zip containing a nested archive can't be targeted (the sub-archive's members are
+    # invisible to the central-directory enumeration) -> None, so the caller whole-downloads
+    # and the recursion path unpacks it.
+    inner = _tar_bytes([("calc/vasprun.xml", b"<x/>"), ("calc/OUTCAR", b"o")])
+    outer = _zip_with([("data/inner.tar", inner), ("run/CHGCAR", os.urandom(1 << 20))])
+    sess = _ZipRangeSession({"http://x/o.zip": outer})
+    assert _fetch_zip_targeted("http://x/o.zip", tmp_path / "e", sess, None, 128) is None
+
+
+def test_fetch_record_targeted_falls_back_and_recurses(tmp_path):
+    # End-to-end over a Range-honouring server: targeted declines (nested archive), so
+    # fetch_record whole-downloads (a no-Range GET) and recursion extracts the sub-archive.
+    inner = _tar_bytes([("calc/vasprun.xml", b"<modeling>V</modeling>"), ("calc/OUTCAR", b"o")])
+    outer = _zip_with([("data/inner.tar", inner)])
+    sess = _ZipRangeSession({"http://x/outer.zip": outer})
+    entry = _fetch_whole(_zip_rec("7005", "outer.zip", outer), sess, tmp_path / "raw")
+    assert entry is not None and entry["n_calc_units"] == 1
+    assert any(r is None for _u, r in sess.requests)     # a whole-file (no-Range) GET happened
+    raw = [p.name for p in (tmp_path / "raw").rglob("*") if p.is_file()]
+    assert "vasprun.xml" in raw and "OUTCAR" in raw

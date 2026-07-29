@@ -108,9 +108,12 @@ splitting the work: **be permissive early, strict late.**
   (~1 request/file, CRC-verified) **without downloading the whole archive** — skipping
   the heavy CHGCAR/WAVECAR bulk instead of downloading it to extract a few files and
   delete the rest. Falls back to a whole-archive download for anything not addressable
-  this way (ZIP64/encrypted target member, too many members, non-zip formats). This is
-  the third survey investigation's recommendation #2 (tar has no tail index and
-  compressed tars are non-seekable, so only ZIP supports it).
+  this way (ZIP64/encrypted target member, too many members, non-zip formats, or a zip
+  that contains a **nested archive**). This is the third survey investigation's
+  recommendation #2 (tar has no tail index and compressed tars are non-seekable, so only
+  ZIP supports it). **Nested archives** (an archive inside an archive) are unpacked
+  recursively *after download* for every archive type (`_recurse_nested_archives`), so
+  VASP files inside sub-archives are reached — closing the earlier nested-archive gap.
 - **Stage 3 parse**: the real precision gate. If pymatgen parses it as a valid
   `Vasprun` with the required properties, keep it; otherwise reject **and log the
   reason**. This is also where consistency (functional, etc.) is recorded.

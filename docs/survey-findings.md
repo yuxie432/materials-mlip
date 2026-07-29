@@ -415,6 +415,9 @@ elastic constants, clusters), so gating on it would lose real recall.
    ignored, corrupt member) falls back to the whole-archive download — no regression. A huge
    ZIP64 *heavy* member beside 32-bit VASP outputs is fine (we skip it anyway). Measured on a
    4.2 MB test zip whose bulk was a 4 MB CHGCAR: **1.9% transferred**, archive never staged.
+   The **nested-archive limitation is now closed** (`_recurse_nested_archives`): sub-archives
+   of any type are unpacked recursively after download (depth cap 8), and targeted ZIP fetch
+   falls back to a whole download when a zip contains one so the recursion can reach it.
 3. **Harden `download_file` with 5xx/504 retry** (currently only 429 retries in-run; 504 is
    transient — a re-run recovers it, but in-run retry avoids leaving files for the next pass).
 4. **Discovery precision:** the applied keyword deletions remove the protein/GROMACS/foreign tail

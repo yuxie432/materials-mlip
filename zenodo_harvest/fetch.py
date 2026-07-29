@@ -452,6 +452,21 @@ def _copy_capped(src: Any, out: Path, cap: int,
                 budget.refund(written, 1)
 
 
+def _want_member(base: str) -> bool:
+    """A member worth extracting from an archive: a VASP file (to keep), OR a nested
+    archive (to recurse into so its own VASP files can be reached — see
+    :func:`_recurse_nested_archives`)."""
+    return bool(_PARSE_RE.search(base)) or _is_archive(base) is not None
+
+
+def _member_cap_for(base: str, member_cap: int) -> int:
+    """Per-member size cap. A nested *archive* member is a container, not a final file,
+    so the decompression-bomb cap does not apply to it (its own inner members are capped
+    when it is recursively extracted); only the disk budget bounds it. A plain VASP file
+    keeps the ``member_cap`` guard."""
+    return (1 << 62) if _is_archive(base) is not None else member_cap
+
+
 def _extract_zip(path: Path, dest: Path, member_cap: int,
                  budget: "StagingBudget | None" = None) -> tuple[list[str], list[str]]:
     extracted: list[str] = []
@@ -461,12 +476,13 @@ def _extract_zip(path: Path, dest: Path, member_cap: int,
             if info.is_dir():
                 continue
             base = info.filename.rsplit("/", 1)[-1]
-            if not _PARSE_RE.search(base):
+            if not _want_member(base):
                 continue
             out = dest / info.filename
             if not _is_within(dest, out):
                 continue  # zip-slip guard
-            if info.file_size > member_cap:  # header says it's too big -> skip pre-extract
+            cap = _member_cap_for(base, member_cap)
+            if info.file_size > cap:  # header says it's too big -> skip pre-extract
                 logger.warning("skip oversized member %s (%d B) in %s", base, info.file_size, path.name)
                 continue
             # Declared size is used ONLY to avoid starting a decompression that clearly
@@ -475,7 +491,7 @@ def _extract_zip(path: Path, dest: Path, member_cap: int,
             if budget is not None and not budget.check(info.file_size, 1):
                 break  # a disk/inode limit is reached — stop; the run pauses to purge
             with zf.open(info) as src:
-                outcome = _copy_capped(src, out, member_cap, budget)
+                outcome = _copy_capped(src, out, cap, budget)
             if outcome == _COPY_OK:
                 extracted.append(info.filename)
             elif outcome == _COPY_NO_BUDGET:
@@ -518,6 +534,12 @@ def _fetch_zip_targeted(url: str, dest: Path, session: requests.Session,
     if entries is None:
         return None
     names = [e.name for e in entries]
+    # A nested archive inside the zip hides its own members from the central-directory
+    # enumeration, so targeted fetch cannot see the VASP files within it. Fall back to a
+    # whole-archive download, which the recursion path (_recurse_nested_archives) then
+    # unpacks. This also keeps the "proven no VASP" shortcut below sound.
+    if any(_is_archive(n.rsplit("/", 1)[-1]) is not None for n in names):
+        return None
     targets = [e for e in entries
                if not e.is_dir and _PARSE_RE.search(e.name.rsplit("/", 1)[-1])]
     if not targets:
@@ -578,12 +600,13 @@ def _extract_tar(path: Path, dest: Path, member_cap: int,
             if not member.isfile():
                 continue
             base = member.name.rsplit("/", 1)[-1]
-            if not _PARSE_RE.search(base):
+            if not _want_member(base):
                 continue
             out = dest / member.name
             if not _is_within(dest, out):
                 continue
-            if member.size > member_cap:
+            cap = _member_cap_for(base, member_cap)
+            if member.size > cap:
                 logger.warning("skip oversized member %s (%d B) in %s", base, member.size, path.name)
                 continue
             if budget is not None and not budget.check(member.size, 1):
@@ -591,7 +614,7 @@ def _extract_tar(path: Path, dest: Path, member_cap: int,
             src = tf.extractfile(member)
             if src is None:
                 continue
-            outcome = _copy_capped(src, out, member_cap, budget)
+            outcome = _copy_capped(src, out, cap, budget)
             if outcome == _COPY_OK:
                 extracted.append(member.name)
             elif outcome == _COPY_NO_BUDGET:
@@ -608,19 +631,20 @@ def _extract_rar(path: Path, dest: Path, member_cap: int,
             if info.isdir():
                 continue
             base = info.filename.rsplit("/", 1)[-1]
-            if not _PARSE_RE.search(base):
+            if not _want_member(base):
                 continue
             out = dest / info.filename
             if not _is_within(dest, out):
                 continue
             size = getattr(info, "file_size", 0) or 0
-            if size > member_cap:
+            cap = _member_cap_for(base, member_cap)
+            if size > cap:
                 logger.warning("skip oversized member %s in %s", base, path.name)
                 continue
             if budget is not None and not budget.check(size, 1):
                 break
             with rf.open(info) as src:
-                outcome = _copy_capped(src, out, member_cap, budget)
+                outcome = _copy_capped(src, out, cap, budget)
             if outcome == _COPY_OK:
                 extracted.append(info.filename)
             elif outcome == _COPY_NO_BUDGET:
@@ -638,10 +662,12 @@ class _BudgetedMemberWriter:
     finish its CRC bookkeeping while nothing more lands on disk.
     """
 
-    def __init__(self, factory: "_BudgetedWriterFactory", out: Path | None, name: str):
+    def __init__(self, factory: "_BudgetedWriterFactory", out: Path | None, name: str,
+                 cap: int | None = None):
         self._factory = factory
         self._out = out
         self._name = name
+        self._cap = factory.cap if cap is None else cap  # per-member (archives are uncapped)
         self._fh = out.open("wb") if out is not None else None
         self._written = 0
         self._dropped = out is None
@@ -650,7 +676,7 @@ class _BudgetedMemberWriter:
         n = len(s)
         if self._dropped:
             return n                       # deliberately discarded; report it as written
-        if self._written + n > self._factory.cap:
+        if self._written + n > self._cap:
             logger.warning("skip oversized member %s in %s", self._name, self._factory.label)
             self._drop()
             return n
@@ -745,7 +771,8 @@ class _BudgetedWriterFactory:
             name = out.name
         usable = not self.abort and _is_within(self.dest, out) and self._parents(out.parent)
         writer = _BudgetedMemberWriter(
-            self, out if usable and self.take(0, 1) else None, name)
+            self, out if usable and self.take(0, 1) else None, name,
+            _member_cap_for(out.name, self.cap))
         self._writers.append(writer)
         return writer
 
@@ -789,10 +816,11 @@ def _extract_7z(path: Path, dest: Path, member_cap: int,
         sizes = {i.filename: getattr(i, "uncompressed", 0) or 0 for i in infos}
         targets = []
         for n in names:
-            if (n.endswith("/") or not _PARSE_RE.search(n.rsplit("/", 1)[-1])
+            base = n.rsplit("/", 1)[-1]
+            if (n.endswith("/") or not _want_member(base)
                     or not _is_within(dest, dest / n)):
                 continue
-            if sizes.get(n, 0) > member_cap:
+            if sizes.get(n, 0) > _member_cap_for(base, member_cap):
                 logger.warning("skip oversized member %s (%d B) in %s",
                                n, sizes.get(n, 0), path.name)
                 continue
@@ -836,12 +864,13 @@ def _extract_tar_zst(path: Path, dest: Path, member_cap: int,
                 if not member.isfile():
                     continue
                 base = member.name.rsplit("/", 1)[-1]
-                if not _PARSE_RE.search(base):
+                if not _want_member(base):
                     continue
                 out = dest / member.name
                 if not _is_within(dest, out):
                     continue
-                if member.size > member_cap:
+                cap = _member_cap_for(base, member_cap)
+                if member.size > cap:
                     logger.warning("skip oversized member %s (%d B) in %s", base, member.size, path.name)
                     continue
                 if budget is not None and not budget.check(member.size, 1):
@@ -849,7 +878,7 @@ def _extract_tar_zst(path: Path, dest: Path, member_cap: int,
                 src = tf.extractfile(member)
                 if src is None:
                     continue
-                outcome = _copy_capped(src, out, member_cap, budget)
+                outcome = _copy_capped(src, out, cap, budget)
                 if outcome == _COPY_OK:
                     extracted.append(member.name)
                 elif outcome == _COPY_NO_BUDGET:
@@ -920,6 +949,94 @@ def _archive_subdir(base: str) -> str:
             stem = stem[: -len(suf)]
             break
     return re.sub(r"[^A-Za-z0-9._-]", "_", stem) or "archive"
+
+
+# --- Nested-archive recursion ---------------------------------------------------
+# An archive can contain another archive (a `.zip` of per-run `.tar.gz`s, a `.tar` of
+# `.zip`s, …). The extractors above pull out nested-archive members as well as VASP files
+# (see :func:`_want_member`); this driver then extracts each nested archive in turn,
+# recursively, so the VASP files inside sub-archives are reached too — for ALL archive
+# types, run AFTER download (mentor/user 2026-07-29). A depth cap guards an archive-quine.
+_MAX_NEST_DEPTH = 8
+_NESTED_SUFFIX = "__extracted"
+
+
+def _missing_backend(kind: str | None) -> bool:
+    """Whether the optional backend for ``kind`` is not installed (rar/7z/tar.zst)."""
+    return ((kind == "rar" and rarfile is None)
+            or (kind == "sevenzip" and py7zr is None)
+            or (kind == "tarzst" and zstandard is None))
+
+
+def _delete_refund(path: Path, budget: "StagingBudget | None") -> None:
+    """Delete a staged file and refund its bytes + inode to the budget (best-effort)."""
+    try:
+        sz = path.stat().st_size
+    except OSError:
+        return
+    path.unlink(missing_ok=True)
+    if budget is not None:
+        budget.refund(sz, 1)
+
+
+def _recurse_nested_archives(
+    root: Path, member_cap: int, budget: "StagingBudget | None",
+    rej: RejectionLogger, id_prefix: str, depth: int = 1,
+) -> tuple[list[str], list[str], bool]:
+    """Extract any archive files staged under ``root``, recursively.
+
+    Returns ``(extra_names, extra_vasp_extracted, transient)``: member names seen inside
+    the nested archives (folded into the availability scan), the VASP files they yielded,
+    and whether any nested failure was transient (out-of-space). Each nested archive is
+    extracted into a sibling ``<name>__extracted`` dir and then deleted+refunded — the
+    persistent footprint is its extracted VASP files, not the sub-archive. Raises
+    :class:`BudgetExceeded` for a whole-record rollback, exactly like the extractors.
+    """
+    extra_names: list[str] = []
+    extra_vasp: list[str] = []
+    transient = False
+    if depth > _MAX_NEST_DEPTH:
+        rej.reject("fetch", id_prefix, "archive_nesting_too_deep",
+                   detail=f"stopped at depth {_MAX_NEST_DEPTH}")
+        return extra_names, extra_vasp, transient
+    # Snapshot eagerly: extraction below creates new dirs, which the recursive call (scoped
+    # to each new dir) handles — so a freshly-written sub-archive is never re-processed here.
+    nested = sorted(p for p in root.rglob("*")
+                    if p.is_file() and _is_archive(p.name) is not None)
+    for arc in nested:
+        base = arc.name
+        kind = _is_archive(base)
+        if kind is None:            # unreachable (nested is filtered), but narrows for mypy
+            continue
+        nid = f"{id_prefix}/{arc.relative_to(root).as_posix()}"
+        if _MULTIPART_RE.search(base):
+            rej.reject("fetch", nid, "archive_multipart_unsupported",
+                       detail="nested split/spanned archive; not reassembled")
+            _delete_refund(arc, budget)
+            continue
+        if _missing_backend(kind):
+            rej.reject("fetch", nid, "archive_unsupported",
+                       format=base.rsplit(".", 1)[-1], detail="nested; install 'archives' extra")
+            _delete_refund(arc, budget)
+            continue
+        out_dir = arc.parent / (base + _NESTED_SUFFIX)
+        try:
+            names, extracted = _EXTRACTORS[kind](arc, out_dir, member_cap, budget)
+        except _EXTRACT_ERRORS as exc:
+            rej.reject("fetch", nid, "extract_error", detail=f"{type(exc).__name__}: {exc}")
+            if isinstance(exc, OSError) and exc.errno in _OUT_OF_SPACE_ERRNOS:
+                transient = True
+            _delete_refund(arc, budget)
+            continue
+        _delete_refund(arc, budget)   # its members are out now; drop the sub-archive
+        extra_names.extend(names)
+        extra_vasp.extend(n for n in extracted if _is_archive(n.rsplit("/", 1)[-1]) is None)
+        sub_names, sub_vasp, sub_tr = _recurse_nested_archives(
+            out_dir, member_cap, budget, rej, nid, depth + 1)
+        extra_names.extend(sub_names)
+        extra_vasp.extend(sub_vasp)
+        transient = transient or sub_tr
+    return extra_names, extra_vasp, transient
 
 
 # Role detection for grouping extracted files into calc units. Separator-tolerant
@@ -1188,12 +1305,7 @@ def _stage_record_files(
 
         # Optional-backend archives: skip cleanly (visible rejection) when the backing
         # library isn't installed, rather than silently dropping the record's data.
-        _missing_backend = (
-            (kind == "rar" and rarfile is None)
-            or (kind == "sevenzip" and py7zr is None)
-            or (kind == "tarzst" and zstandard is None)
-        )
-        if _missing_backend:
+        if _missing_backend(kind):
             rej.reject("fetch", f"{recid}:{key}", "archive_unsupported",
                        format=base.rsplit(".", 1)[-1], detail="install the 'archives' extra")
             continue
@@ -1265,14 +1377,25 @@ def _stage_record_files(
                 if budget is not None:
                     budget.refund(arc_bytes, 1)
                 continue
-            info = _safe_members(names)
+            # The top archive's members are out; drop it BEFORE recursing so its bytes
+            # are not held on disk while nested sub-archives are extracted.
+            arc.unlink(missing_ok=True)  # keep only extracted VASP files, not the archive
+            if budget is not None:
+                budget.refund(arc_bytes, 1)  # transient bytes, not staged footprint
+            # Recurse into any nested archives the extraction produced (all archive types),
+            # extracting their VASP files too. BudgetExceeded propagates for a rollback.
+            sub_names, sub_vasp, sub_tr = _recurse_nested_archives(
+                extract_dir, max_member_bytes, budget, rej, f"{recid}:{key}")
+            transient = transient or sub_tr
+            # A nested-archive member is a container, not a VASP file — exclude it from the
+            # "did we get VASP?" verdict; its extracted contents (sub_vasp) are what count.
+            vasp_extracted = [n for n in extracted
+                              if _is_archive(n.rsplit("/", 1)[-1]) is None] + sub_vasp
+            info = _safe_members(names + sub_names)   # availability across all nesting levels
             for k, v in info["availability"].items():
                 availability[k] = availability[k] or v
             availability_files.update(info["availability_files"])
-            arc.unlink(missing_ok=True)  # drop the archive; keep only extracted VASP files
-            if budget is not None:
-                budget.refund(arc_bytes, 1)  # transient bytes, not staged footprint
-            got_any = got_any or bool(extracted)
+            got_any = got_any or bool(vasp_extracted)
 
         elif _PARSE_RE.search(base):  # directly-exposed VASP file
             if max_bytes and size > max_bytes:
