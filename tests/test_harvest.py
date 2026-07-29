@@ -30,6 +30,7 @@ from zenodo_harvest import client as client_mod
 from zenodo_harvest import discover as discover_mod
 from zenodo_harvest import fetch as fetch_mod
 from zenodo_harvest import triage as triage_mod
+from zenodo_harvest import zipstream as zipstream_mod
 from zenodo_harvest.client import ZenodoClient, _parse_retry_after
 from zenodo_harvest.fetch import (
     _MULTIPART_RE,
@@ -38,6 +39,7 @@ from zenodo_harvest.fetch import (
     _extract_tar,
     _extract_tar_zst,
     _extract_zip,
+    _fetch_zip_targeted,
     _find_calc_units,
     _is_archive,
     _unit_role,
@@ -555,6 +557,13 @@ class _FakeStreamResp:
                 raise requests.RequestException("connection dropped mid-stream")
             yield chunk
             sent += len(chunk)
+
+    @property
+    def content(self):
+        return self._content
+
+    def close(self):
+        pass
 
 
 class _Stream429ThenOk:
@@ -1312,7 +1321,8 @@ def _write_recs(path, n, size):
 
 
 def _staging_fetch_record(per_record):
-    def fake(rec, session, rd, max_bytes, rej, max_member_bytes=0, quota=None):
+    def fake(rec, session, rd, max_bytes, rej, max_member_bytes=0, budget=None,
+             zip_stream=True, zip_stream_max_files=128):
         d = Path(rd) / rec["recid"] / "extracted"
         d.mkdir(parents=True, exist_ok=True)
         (d / "OUTCAR").write_bytes(b"x" * per_record)
@@ -2410,3 +2420,288 @@ def test_record_bigger_than_the_whole_budget_does_not_livelock(tmp_path, monkeyp
     assert staged <= budget                            # limit still respected
     reasons = [r["reason"] for r in read_jsonl(tmp_path / "r.jsonl")]
     assert "record_exceeds_disk_budget" in reasons     # and it is reported, not silent
+
+
+# --------------------------------------------------------------------------- #
+# Targeted ZIP member fetch (zipstream) — pull only the VASP files out of a    #
+# .zip over HTTP Range, instead of downloading the whole archive to extract a  #
+# few files and delete the rest (mentor/user 2026-07-29). Standard 32-bit ZIP; #
+# falls back to whole-archive download for anything not addressable this way.  #
+# --------------------------------------------------------------------------- #
+
+class _ZipRangeSession:
+    """Serves a fixed ``{url: blob}`` over HTTP Range like Zenodo: 206 + Content-Range for
+    ``bytes=-N`` (suffix) and ``bytes=start-end`` (explicit); a Range-less GET returns the
+    whole file (200), which is what the whole-archive fallback + the small-file suffix
+    underflow use. Records every ``(url, range_header)`` and the total bytes served, so a
+    test can prove targeted fetch transferred far less than the whole archive.
+
+    ``honor_range=False`` models a server that ignores Range (answers 200) — the enumeration
+    then fails and the caller must fall back to a whole download.
+    """
+
+    def __init__(self, blobs, honor_range=True):
+        self.blobs = blobs
+        self.honor_range = honor_range
+        self.requests: list[tuple] = []
+        self.bytes_served = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def close(self):
+        pass
+
+    def get(self, url, headers=None, timeout=None, stream=None):
+        blob = self.blobs[url]
+        size = len(blob)
+        rng = (headers or {}).get("Range")
+        self.requests.append((url, rng))
+        if rng and self.honor_range:
+            spec = rng.split("=", 1)[1]
+            if spec.startswith("-"):
+                n = int(spec[1:])
+                start, end = max(0, size - n), size - 1
+            else:
+                s, e = spec.split("-")
+                start = int(s)
+                end = min(int(e), size - 1) if e else size - 1
+            body = blob[start:end + 1]
+            self.bytes_served += len(body)
+            return _FakeStreamResp(206, content=body,
+                                   headers={"Content-Range": f"bytes {start}-{end}/{size}",
+                                            "Content-Length": str(len(body))})
+        self.bytes_served += size                        # whole file (fresh / Range ignored)
+        return _FakeStreamResp(200, content=blob, headers={"Content-Length": str(size)})
+
+
+def _zip_with(members, stored=()):
+    """Build an in-memory zip from ``[(name, bytes), ...]`` (stored members uncompressed)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, content in members:
+            ct = zipfile.ZIP_STORED if name in stored else zipfile.ZIP_DEFLATED
+            zf.writestr(name, content, compress_type=ct)
+    return buf.getvalue()
+
+
+def _read_member(session, url, entry):
+    reader = zipstream_mod.open_member_reader(session, url, entry)
+    assert reader is not None
+    out = bytearray()
+    while True:
+        b = reader.read(1 << 16)
+        if not b:
+            break
+        out.extend(b)
+    reader.close()
+    return bytes(out), reader
+
+
+def test_remote_central_directory_matches_stdlib_offsets():
+    # The enumerated members (name/method/sizes/crc/offset) must agree with stdlib's own
+    # central-directory reading, or a targeted fetch would seek to the wrong byte.
+    members = [("calc/vasprun.xml", b"<xml>" + b"A" * 4000), ("calc/OUTCAR", b"o" * 500),
+               ("calc/CHGCAR", os.urandom(20000)), ("stored/POSCAR", b"poscar")]
+    blob = _zip_with(members, stored={"stored/POSCAR"})
+    entries = zipstream_mod.remote_central_directory("http://x/a.zip", _ZipRangeSession({"http://x/a.zip": blob}))
+    assert entries is not None
+    ref = {i.filename: i for i in zipfile.ZipFile(io.BytesIO(blob)).infolist()}
+    assert {e.name for e in entries} == set(ref)
+    for e in entries:
+        zi = ref[e.name]
+        assert e.local_header_offset == zi.header_offset
+        assert e.compressed_size == zi.compress_size
+        assert e.uncompressed_size == zi.file_size
+        assert e.crc == zi.CRC
+        assert e.method == zi.compress_type
+
+
+def test_remote_central_directory_none_when_range_ignored():
+    blob = _zip_with([("calc/OUTCAR", b"o" * 100)])
+    sess = _ZipRangeSession({"http://x/a.zip": blob}, honor_range=False)
+    assert zipstream_mod.remote_central_directory("http://x/a.zip", sess) is None
+
+
+def test_open_member_reader_extracts_bytewise_and_verifies_crc():
+    members = [("calc/vasprun.xml", b"<xml>" + b"B" * 6000 + b"</xml>"),
+               ("calc/OUTCAR", b"outcar " * 300), ("empty/POSCAR", b""),
+               ("stored/INCAR", b"ENCUT = 520\nISMEAR = 0\n")]
+    blob = _zip_with(members, stored={"stored/INCAR"})
+    ref = zipfile.ZipFile(io.BytesIO(blob))
+    entries = zipstream_mod.remote_central_directory("http://x/a.zip", _ZipRangeSession({"http://x/a.zip": blob}))
+    for e in entries:
+        got, reader = _read_member(_ZipRangeSession({"http://x/a.zip": blob}), "http://x/a.zip", e)
+        assert got == ref.read(e.name), e.name
+        assert reader.complete and reader.crc_ok
+
+
+def test_open_member_reader_refetch_path_when_local_extra_exceeds_margin():
+    # A member whose LOCAL header carries a bigger extra field than the central one
+    # (force_zip64 does this) must still extract correctly — with margin=0 the reader
+    # cannot grab header+data in one shot and must issue a precise second Range read.
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        with zf.open(zipfile.ZipInfo("big/vasprun.xml"), "w", force_zip64=True) as fh:
+            fh.write(b"Z" * 5000)
+    blob = buf.getvalue()
+    entries = zipstream_mod.remote_central_directory("http://x/z.zip", _ZipRangeSession({"http://x/z.zip": blob}))
+    entry = entries[0]
+    assert entry.targetable                         # small actual size -> not ZIP64 in the CD
+    sess = _ZipRangeSession({"http://x/z.zip": blob})
+    reader = zipstream_mod.open_member_reader(sess, "http://x/z.zip", entry, margin=0)
+    out = bytearray()
+    while True:
+        c = reader.read(1 << 16)
+        if not c:
+            break
+        out.extend(c)
+    reader.close()
+    assert bytes(out) == zipfile.ZipFile(io.BytesIO(blob)).read("big/vasprun.xml")
+    assert reader.complete
+    assert sum(1 for _u, r in sess.requests if r and not r.startswith("bytes=-")) == 2  # 2 reads
+
+
+def test_targeted_fetch_pulls_only_vasp_and_skips_heavy(tmp_path, monkeypatch):
+    # The core win: a zip whose bulk is a heavy CHGCAR yields its VASP files while the
+    # CHGCAR is never fetched (recorded as availability only), transferring far less than
+    # the whole archive.
+    monkeypatch.setattr(fetch_mod, "ZIP_STREAM_MIN_SKIP_BYTES", 100_000)
+    members = [("run/vasprun.xml", b"<modeling>" + b"V" * 3000 + b"</modeling>"),
+               ("run/OUTCAR", b"outcar " * 400), ("run/INCAR", b"ENCUT=520"),
+               ("run/CHGCAR", os.urandom(1 << 20))]        # ~1 MB incompressible heavy file
+    blob = _zip_with(members)
+    dest = tmp_path / "extracted"
+    sess = _ZipRangeSession({"http://x/a.zip": blob})
+    result = _fetch_zip_targeted("http://x/a.zip", dest, sess, None, 128)
+    assert result is not None
+    names, extracted = result
+    assert set(extracted) == {"run/vasprun.xml", "run/OUTCAR", "run/INCAR"}   # CHGCAR skipped
+    ref = zipfile.ZipFile(io.BytesIO(blob))
+    for n in extracted:
+        assert (dest / n).read_bytes() == ref.read(n)
+    assert not (dest / "run" / "CHGCAR").exists()          # heavy file never written
+    assert "run/CHGCAR" in names                           # ...but still enumerated
+    assert sess.bytes_served < len(blob)                   # transferred far less than whole
+
+
+def test_targeted_fetch_proven_no_vasp_downloads_nothing(tmp_path):
+    # Enumeration alone proves a zip holds no VASP -> return (names, []) and never pull a
+    # single member (no explicit-range request), so a non-VASP zip costs one tail read.
+    blob = _zip_with([("data/results.csv", b"a,b,c\n1,2,3\n"), ("README.txt", b"hi")])
+    dest = tmp_path / "extracted"
+    sess = _ZipRangeSession({"http://x/a.zip": blob})
+    names, extracted = _fetch_zip_targeted("http://x/a.zip", dest, sess, None, 128)
+    assert extracted == []
+    assert set(names) == {"data/results.csv", "README.txt"}
+    assert not dest.exists() or not any(dest.rglob("*"))
+    assert all(r is None or r.startswith("bytes=-") for _u, r in sess.requests)  # no member fetch
+
+
+def test_targeted_fetch_falls_back_when_too_many_members(tmp_path):
+    # More target members than the budget -> None (one whole download is cheaper).
+    blob = _zip_with([(f"c{i}/vasprun.xml", b"<x/>") for i in range(5)])
+    sess = _ZipRangeSession({"http://x/a.zip": blob})
+    assert _fetch_zip_targeted("http://x/a.zip", tmp_path / "e", sess, None, 3) is None
+
+
+def test_targeted_fetch_falls_back_for_small_all_vasp_zip(tmp_path):
+    # A small, ~all-VASP zip has nothing worth skipping -> fall back (one request beats N).
+    blob = _zip_with([("run/vasprun.xml", b"<x/>"), ("run/OUTCAR", b"o")])
+    sess = _ZipRangeSession({"http://x/a.zip": blob})
+    assert _fetch_zip_targeted("http://x/a.zip", tmp_path / "e", sess, None, 128) is None
+
+
+def test_targeted_fetch_zip_slip_guard(tmp_path, monkeypatch):
+    monkeypatch.setattr(fetch_mod, "ZIP_STREAM_MIN_SKIP_BYTES", 100_000)
+    members = [("good/OUTCAR", b"good outcar"), ("../evil_OUTCAR", b"pwned"),
+               ("heavy/CHGCAR", os.urandom(1 << 20))]
+    blob = _zip_with(members)
+    dest = tmp_path / "extracted"
+    result = _fetch_zip_targeted("http://x/a.zip", dest, _ZipRangeSession({"http://x/a.zip": blob}),
+                                 None, 128)
+    assert result is not None
+    _names, extracted = result
+    assert extracted == ["good/OUTCAR"]                    # traversal member refused
+    assert (dest / "good" / "OUTCAR").read_bytes() == b"good outcar"
+    assert not (tmp_path / "evil_OUTCAR").exists()
+    assert not (dest.parent / "evil_OUTCAR").exists()
+
+
+def test_fetch_record_targeted_zip_end_to_end(tmp_path, monkeypatch):
+    # Record-level: targeted fetch stages the VASP unit, records the CHGCAR as availability
+    # only (never written), and transfers far less than the whole archive.
+    monkeypatch.setattr(fetch_mod, "ZIP_STREAM_MIN_SKIP_BYTES", 100_000)
+    members = [("run/vasprun.xml", b"<modeling>" + b"V" * 2000 + b"</modeling>"),
+               ("run/OUTCAR", b"outcar " * 300), ("run/CHGCAR", os.urandom(1 << 20))]
+    blob = _zip_with(members)
+    rec = {"recid": "4242", "files": [{"key": "data.zip", "download": "http://x/data.zip",
+                                       "size": len(blob),
+                                       "checksum": "md5:" + md5(blob).hexdigest()}]}
+    sess = _ZipRangeSession({"http://x/data.zip": blob})
+    rej = RejectionLogger(tmp_path / "rej.jsonl")
+    entry = fetch_record(rec, sess, tmp_path / "raw", max_bytes=None, rej=rej)
+    rej.close()
+    assert entry is not None and entry["n_calc_units"] == 1
+    assert entry["availability"]["charge_density"] is True         # CHGCAR recorded...
+    raw_files = [p.name for p in (tmp_path / "raw").rglob("*") if p.is_file()]
+    assert "CHGCAR" not in raw_files                               # ...but not on disk
+    assert "vasprun.xml" in raw_files and "OUTCAR" in raw_files
+    assert sess.bytes_served < len(blob)                          # much less than whole archive
+
+
+def test_fetch_record_falls_back_to_whole_download_when_range_ignored(tmp_path):
+    # A server that ignores Range: enumeration fails, so fetch_record must fall back to the
+    # whole-archive download+extract and still produce the calc unit.
+    members = [("run/vasprun.xml", b"<modeling>" + b"V" * 2000 + b"</modeling>"),
+               ("run/OUTCAR", b"outcar " * 300)]
+    blob = _zip_with(members)
+    rec = {"recid": "4243", "files": [{"key": "data.zip", "download": "http://x/data.zip",
+                                       "size": len(blob),
+                                       "checksum": "md5:" + md5(blob).hexdigest()}]}
+    sess = _ZipRangeSession({"http://x/data.zip": blob}, honor_range=False)
+    rej = RejectionLogger(tmp_path / "rej.jsonl")
+    entry = fetch_record(rec, sess, tmp_path / "raw", max_bytes=None, rej=rej)
+    rej.close()
+    assert entry is not None and entry["n_calc_units"] == 1
+    raw_files = [p.name for p in (tmp_path / "raw").rglob("*") if p.is_file()]
+    assert "vasprun.xml" in raw_files and "OUTCAR" in raw_files
+
+
+def test_fetch_record_zip_stream_disabled_never_range_peeks(tmp_path):
+    # --no-zip-stream: targeted fetch is not attempted at all (no suffix-range peek), the
+    # archive is whole-downloaded as before.
+    members = [("run/vasprun.xml", b"<modeling>V</modeling>"), ("run/OUTCAR", b"o" * 50),
+               ("run/CHGCAR", os.urandom(1 << 20))]
+    blob = _zip_with(members)
+    rec = {"recid": "4244", "files": [{"key": "data.zip", "download": "http://x/data.zip",
+                                       "size": len(blob),
+                                       "checksum": "md5:" + md5(blob).hexdigest()}]}
+    sess = _ZipRangeSession({"http://x/data.zip": blob})
+    rej = RejectionLogger(tmp_path / "rej.jsonl")
+    entry = fetch_record(rec, sess, tmp_path / "raw", max_bytes=None, rej=rej, zip_stream=False)
+    rej.close()
+    assert entry is not None and entry["n_calc_units"] == 1
+    assert all(r is None or not r.startswith("bytes=-") for _u, r in sess.requests)  # no peek
+
+
+def test_cli_fetch_wires_zip_stream_flags(tmp_path, monkeypatch):
+    # --no-zip-stream / --zip-stream-max-files reach the fetch() call.
+    import zenodo_harvest.cli as cli_mod
+    captured: dict = {}
+
+    def fake_fetch(in_path, **k):
+        captured.update(k)
+        return {"ok": True, "fetched": 0}
+
+    monkeypatch.setattr(cli_mod, "fetch", fake_fetch)
+    keep = tmp_path / "keep.jsonl"
+    keep.write_text("")
+    cli_mod.main(["fetch", "--in", str(keep)])                     # default
+    assert captured["zip_stream"] is True
+    cli_mod.main(["fetch", "--in", str(keep), "--no-zip-stream",
+                  "--zip-stream-max-files", "7"])
+    assert captured["zip_stream"] is False and captured["zip_stream_max_files"] == 7

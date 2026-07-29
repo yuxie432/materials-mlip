@@ -407,6 +407,14 @@ elastic constants, clusters), so gating on it would lose real recall.
 2. **The worthwhile random-access play is ZIP targeted-fetch** — enumeration is 1 request
    (central dir, already built), targeted extraction ~2 requests/file, and zip is the dominant
    addressable class (4.90 TB). Shares only the *nested-archive* limitation (already fail-safed).
+   ✅ **IMPLEMENTED 2026-07-29** (`zenodo_harvest/zipstream.py` + `fetch.py`, on by default,
+   `--no-zip-stream` to disable): standard 32-bit ZIP (STORED/DEFLATE), ~1 Range request per
+   member (CRC-verified), chosen over a whole download when worthwhile (heavy bytes to skip, or
+   a huge archive) and the target count is within `--zip-stream-max-files` (default 128);
+   everything else (ZIP64/encrypted/odd-compression *target* member, enumeration failure, Range
+   ignored, corrupt member) falls back to the whole-archive download — no regression. A huge
+   ZIP64 *heavy* member beside 32-bit VASP outputs is fine (we skip it anyway). Measured on a
+   4.2 MB test zip whose bulk was a 4 MB CHGCAR: **1.9% transferred**, archive never staged.
 3. **Harden `download_file` with 5xx/504 retry** (currently only 429 retries in-run; 504 is
    transient — a re-run recovers it, but in-run retry avoids leaving files for the next pass).
 4. **Discovery precision:** the applied keyword deletions remove the protein/GROMACS/foreign tail

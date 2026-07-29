@@ -65,7 +65,9 @@ Verified against `https://zenodo.org/api/records`:
 - **Search window caps at 10,000** (`page*size <= 10000`). Bigger result sets
   must be partitioned (we bisect the `created` date range).
 - **Range requests work** on file downloads (206) even though Zenodo omits the
-  `Accept-Ranges` header — this is what lets us peek inside a remote `.zip`.
+  `Accept-Ranges` header — this is what lets us peek inside a remote `.zip` (triage)
+  **and pull individual VASP members straight out of one over HTTP Range** without
+  downloading the whole archive (fetch's targeted ZIP fetch, `zipstream.py` — see §3a).
 
 ## 2. The extraction funnel (precision vs recall)
 
@@ -99,6 +101,16 @@ splitting the work: **be permissive early, strict late.**
   `archive` records where the payload is hidden, **peek the zip central
   directory over HTTP Range** to confirm `vasprun.xml`/`OUTCAR` *without
   downloading gigabytes* (works for `.zip`; `.tar.gz`/`.rar` need download).
+- **Stage 2 fetch** (`fetch.py`): download the VASP-relevant files and lay them out
+  one dir per calc. For a `.zip` this is done by **targeted member fetch** by default
+  (`zipstream.py`): the same central directory that triage peeks also gives every
+  member's byte offset, so the VASP files are pulled straight out over HTTP Range
+  (~1 request/file, CRC-verified) **without downloading the whole archive** — skipping
+  the heavy CHGCAR/WAVECAR bulk instead of downloading it to extract a few files and
+  delete the rest. Falls back to a whole-archive download for anything not addressable
+  this way (ZIP64/encrypted target member, too many members, non-zip formats). This is
+  the third survey investigation's recommendation #2 (tar has no tail index and
+  compressed tars are non-seekable, so only ZIP supports it).
 - **Stage 3 parse**: the real precision gate. If pymatgen parses it as a valid
   `Vasprun` with the required properties, keep it; otherwise reject **and log the
   reason**. This is also where consistency (functional, etc.) is recorded.

@@ -45,6 +45,22 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
     `--max-bytes 0` = no cap) and **selectively extract only VASP files** from archives; the
     archive is deleted right after extraction (persistent disk = extracted files, not archives);
     records availability of heavy files (CHGCAR/WAVECAR/DOSCAR/EIGENVAL/…) without extracting them.
+    **`.zip` uses targeted member fetch by default** (`zipstream.py`; `--no-zip-stream` to
+    disable): a ZIP's tail central directory gives every member's byte offset, so the VASP
+    files are pulled straight out over HTTP Range (~1 request/file, CRC-verified) **without
+    downloading the whole archive** — so a huge zip whose bulk is CHGCAR/WAVECAR (incl. a
+    >4 GB ZIP64 heavy file beside 32-bit VASP outputs) transfers only its vasprun/OUTCAR and
+    never stages the archive at all (transfer, transient disk, and time all drop; validated
+    on Zenodo — the third survey investigation's recommendation #2). It is chosen over a
+    whole download only when worthwhile (heavy bytes to skip, or a huge archive) and the
+    target count is within `--zip-stream-max-files` (default 128; each member ≈ 1–2 HTTP
+    requests, so a many-small-member VASP dump is cheaper whole); anything not addressable
+    (ZIP64/encrypted/odd-compression *target* member, enumeration failure, Range ignored, a
+    corrupt member) **falls back to the whole-archive download** — never a regression.
+    Targeted fetch is deliberately NOT bounded by `--max-bytes`/`--max-member-bytes` (every
+    targeted member is a wanted VASP file); only the disk valve bounds it. Enumeration alone
+    can prove a zip holds no VASP and skip the download entirely. tar/rar/7z/zst have no tail
+    index (or are non-seekable when compressed) and keep the whole-download path.
     `.rar`/`.7z`/`.tar.zst` extract when the `archives` extra (py7zr/rarfile/zstandard + an
     `unrar`/`bsdtar` binary for rar) is installed, else a logged rejection. Emits
     `fetched.jsonl` (one calc-unit list per record). Three independent size/pacing levers:

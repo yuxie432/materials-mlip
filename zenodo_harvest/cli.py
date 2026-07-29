@@ -44,7 +44,7 @@ from . import config
 from .client import ZenodoClient
 from .dataset_ops import merge_datasets, purge_raw, split_manifest, verify_dataset
 from .discover import DEFAULT_QUERIES, DEFAULT_RESOURCE_TYPES, discover
-from .fetch import DEFAULT_MAX_MEMBER_BYTES, fetch
+from .fetch import DEFAULT_MAX_MEMBER_BYTES, DEFAULT_ZIP_STREAM_MAX_FILES, fetch
 from .parse import parse
 from .store import DatasetLockError
 from .triage import triage
@@ -117,6 +117,17 @@ def _add_fetch(sub: argparse._SubParsersAction) -> None:
                    help="concurrent record downloads (default 4). Records are independent; "
                         "keep small to respect Zenodo's 100 req/min, 5000 req/hour limits. "
                         "The disk valve still bounds peak disk across all in-flight downloads.")
+    p.add_argument("--no-zip-stream", dest="zip_stream", action="store_false",
+                   help="disable targeted ZIP member fetch (pull only the VASP files out "
+                        "of a .zip over HTTP Range instead of downloading the whole "
+                        "archive). ON by default; a zip that is not addressable this way "
+                        "(ZIP64/encrypted/odd-compression VASP member, or a small ~all-VASP "
+                        "zip) falls back to a whole-archive download automatically.")
+    p.add_argument("--zip-stream-max-files", type=int, default=DEFAULT_ZIP_STREAM_MAX_FILES,
+                   help=f"max VASP members to pull individually from one .zip before falling "
+                        f"back to a whole-archive download — each costs ~1-2 HTTP requests, "
+                        f"so a many-small-member VASP dump is cheaper whole "
+                        f"(default {DEFAULT_ZIP_STREAM_MAX_FILES}).")
     p.add_argument("--max-records", type=int, default=None)
 
 
@@ -190,6 +201,13 @@ def _add_pipeline(sub: argparse._SubParsersAction) -> None:
                         "this binds before bytes (1M-file quota vs ~0.3 TB of small "
                         "extracted files) — suggest ~800000 for a 1M-file quota.")
     p.add_argument("--workers", type=int, default=4, help="concurrent downloads per batch (default 4)")
+    p.add_argument("--no-zip-stream", dest="zip_stream", action="store_false",
+                   help="disable targeted ZIP member fetch (on by default; pulls only the "
+                        "VASP files out of a .zip over HTTP Range, falling back to a whole "
+                        "download when a zip is not addressable this way)")
+    p.add_argument("--zip-stream-max-files", type=int, default=DEFAULT_ZIP_STREAM_MAX_FILES,
+                   help=f"max VASP members pulled individually from one .zip before falling "
+                        f"back to a whole download (default {DEFAULT_ZIP_STREAM_MAX_FILES})")
     p.add_argument("--max-primary-bytes", type=int, default=0,
                    help="parse guard: skip any single vasprun.xml/vaspout.h5/OUTCAR larger "
                         "than this (0 = no cap). Recommended on a batch job so one huge "
@@ -250,6 +268,8 @@ def main(argv: list[str] | None = None) -> int:
             max_disk_bytes=(args.max_disk_bytes or None),
             max_disk_files=(args.max_disk_files or None),
             workers=args.workers,
+            zip_stream=args.zip_stream,
+            zip_stream_max_files=args.zip_stream_max_files,
         )
     elif args.cmd == "parse":
         # Default the rejection log INSIDE the dataset dir, not a shared sibling: in the
@@ -309,7 +329,8 @@ def main(argv: list[str] | None = None) -> int:
                             raw_dir=str(raw_dir), rejections_path=fetch_rej,
                             max_bytes=max_bytes, max_member_bytes=max_member_bytes,
                             max_disk_bytes=max_disk_bytes, max_disk_files=max_disk_files,
-                            workers=args.workers)
+                            workers=args.workers, zip_stream=args.zip_stream,
+                            zip_stream_max_files=args.zip_stream_max_files)
             return not summary.get("stopped_disk_budget", False)
 
         def process_fn(part: Path) -> None:

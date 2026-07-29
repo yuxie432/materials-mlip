@@ -66,6 +66,11 @@ echo "=== pipeline attempt $ATTEMPT/$MAX_ATTEMPTS $(date -Is) on $(hostname) ===
 df -h "$ZENODO_HARVEST_DATA" || true
 quota -s 2>/dev/null || true
 
+# Targeted ZIP member fetch is ON by default (pulls only VASP files out of a .zip over
+# HTTP Range, skipping heavy CHGCAR/WAVECAR bulk and never staging the archive). Pass
+# --no-zip-stream to disable, or --zip-stream-max-files N to tune the per-archive request
+# budget. --max-member-bytes below only bounds the whole-download fallback + tar/rar/7z;
+# targeted ZIP members are always wanted VASP files and are bounded solely by the disk valve.
 rc=0
 python -m zenodo_harvest.cli -v pipeline \
     --in "$MAN/keep.jsonl" \

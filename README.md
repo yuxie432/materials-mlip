@@ -27,7 +27,7 @@ scripts/estimate/   one-off measurement tools for the survey + their runbook
 ```
 stage 0  discover  keyword search          -> candidate manifest (JSONL)  [done]
 stage 1  triage    file-listing + zip-peek -> keep-list (JSONL)           [done]
-stage 2  fetch     download archives (checksum-verified) + extract VASP   [done]
+stage 2  fetch     download (or ZIP-Range-target) + extract VASP files    [done]
 stage 3  parse     pymatgen Vasprun/Vaspout / ASE OUTCAR -> frames        [done]
 stage 4  store     sharded extxyz.gz + JSONL metadata store               [done]
 ```
@@ -59,7 +59,8 @@ archives for ~15–75 GB of final dataset), so fetch is paced rather than capped
 | Flag | Meaning |
 |---|---|
 | `--max-bytes` | skip any single file/archive larger than this; **`0` = uncapped** (the production setting — the transfer/storage lever is the disk valve, not a per-file cap) |
-| `--max-member-bytes` | cap on each *extracted* file (decompression-bomb guard). Keep it generous (~30 GB) so long-AIMD `vasprun.xml`/`OUTCAR` — the frame-richest data — are not skipped |
+| `--max-member-bytes` | cap on each *extracted* file (decompression-bomb guard; default 20 GB). Keep it generous so long-AIMD `vasprun.xml`/`OUTCAR` — the frame-richest data — are not skipped. Bounds only the whole-download + tar/rar/7z paths; targeted ZIP members are always wanted VASP files, bounded solely by the disk valve |
+| `--no-zip-stream` / `--zip-stream-max-files` | targeted ZIP fetch (ON by default) pulls only the VASP files out of a `.zip` over HTTP Range — skipping heavy CHGCAR/WAVECAR bulk and never staging the archive — falling back to a whole download when a zip is not addressable this way. `--no-zip-stream` disables it; `--zip-stream-max-files` (default 128) bounds the per-archive request count |
 | `--max-disk-bytes` | **disk budget** for the whole raw staging dir. Enforced on actual bytes as they are written (see below), so it is a hard bound |
 | `--max-disk-files` | the same budget for **inodes** — files *and* directories, since CSD3's `/rds` is Lustre and a directory costs an inode too. On CSD3 this is the binding limit: `hpc-work` allows 1 TB *and* 1M files, while measured extracted VASP trees run ~7.6 KiB *median* per file, so 1M inodes can arrive near 0.3 TB |
 | `--max-primary-bytes` | parse-side guard: refuse to *attempt* a `vasprun.xml`/`OUTCAR` bigger than this (`0` = no cap). pymatgen holds a whole trajectory in RAM, so on a batch scheduler one huge output can get the job cgroup-killed |

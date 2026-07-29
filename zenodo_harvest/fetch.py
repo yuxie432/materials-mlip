@@ -41,7 +41,7 @@ from typing import Any
 
 import requests
 
-from . import config
+from . import config, zipstream
 from .client import _parse_retry_after
 from .manifest import JsonlWriter, RejectionLogger, read_jsonl
 
@@ -67,7 +67,34 @@ except ImportError:  # pragma: no cover - optional dep
 # (the archive-level max_bytes only caps the *compressed* download). Every backend
 # writes members to disk without holding one in memory, so RAM stays ~chunk-sized
 # regardless of member size (zip/tar/tar.zst/rar stream in chunks; 7z extracts to disk).
-DEFAULT_MAX_MEMBER_BYTES = 2_000_000_000
+# NB: even with no per-member cap, the disk-budget valve (--max-disk-bytes/-files) is the
+# real bomb guard — it charges every chunk as written, so a runaway member just fills the
+# budget and the record is rolled back, whatever the cap.
+DEFAULT_MAX_MEMBER_BYTES = 20_000_000_000
+
+# --- Targeted ZIP member fetch (see zipstream.py) --------------------------------
+# A ZIP's tail central directory gives every member's byte offset, so we can pull just
+# the VASP files out of a .zip over HTTP Range instead of downloading the whole archive
+# to extract a few files and delete the rest (mentor/user 2026-07-29; the third survey
+# investigation found this the one worthwhile random-access play — tar has no index and
+# compressed tars are non-seekable). Transfer, transient staging, and time all drop. ON
+# by default (`--no-zip-stream` disables). Chosen over a whole-archive download only when
+# it is worthwhile AND the request count is bounded:
+#   * worthwhile — the archive is huge (avoid staging it whole) OR targeted fetch would
+#     skip a meaningful mass of heavy files (CHGCAR/WAVECAR/…) it would otherwise pull
+#     down and immediately discard;
+#   * bounded — at most `zip_stream_max_files` target members, since each costs ~1-2 HTTP
+#     requests and a many-small-member VASP dump is cheaper as one whole download.
+# Anything not addressable (a ZIP64/encrypted/odd-compression *target* member, enumeration
+# failure, Range not honoured, or a member that comes back corrupt) falls back to the
+# whole-archive download+extract path, so there is never a regression. Targeted fetch is
+# deliberately NOT bounded by --max-bytes/--max-member-bytes: every targeted member is a
+# wanted VASP file, so only the disk-budget valve bounds it.
+DEFAULT_ZIP_STREAM_MAX_FILES = 128
+# At/above this archive size, target it regardless of skip (avoid staging it whole).
+ZIP_STREAM_LARGE_ARCHIVE_BYTES = 10_000_000_000
+# ...otherwise target only if we would skip at least this many (compressed) heavy bytes.
+ZIP_STREAM_MIN_SKIP_BYTES = 50_000_000
 
 # Record-level rejection reasons that are terminal (re-running can't help): the
 # archive downloaded + extracted fine but held no usable VASP outputs. These recids
@@ -453,6 +480,92 @@ def _extract_zip(path: Path, dest: Path, member_cap: int,
                 extracted.append(info.filename)
             elif outcome == _COPY_NO_BUDGET:
                 break
+    return names, extracted
+
+
+def _rollback_targeted(paths: list[Path], budget: "StagingBudget | None") -> None:
+    """Delete members a targeted fetch wrote (refunding the budget) before falling back,
+    so the whole-archive re-extract does not double-charge the same files."""
+    for p in paths:
+        try:
+            if p.is_file():
+                sz = p.stat().st_size
+                p.unlink()
+                if budget is not None:
+                    budget.refund(sz, 1)
+        except OSError:  # pragma: no cover - best-effort cleanup
+            pass
+
+
+def _fetch_zip_targeted(url: str, dest: Path, session: requests.Session,
+                        budget: "StagingBudget | None",
+                        max_files: int) -> tuple[list[str], list[str]] | None:
+    """Stage a ``.zip``'s VASP files by targeted HTTP-Range fetch, or return None.
+
+    Returns ``(member_names, extracted)`` when the zip was handled here — including the
+    case where enumeration *proves* it holds no VASP file, which returns ``(names, [])``
+    and downloads nothing at all. Returns None to tell the caller to fall back to the
+    whole-archive download+extract path: the zip is not addressable this way (Range not
+    honoured, ZIP64/encrypted/odd-compression VASP member, too many members, or not worth
+    it), or a member came back corrupt and should be re-verified via the archive md5.
+
+    Members stream through :func:`_copy_capped`, so the disk budget is charged exactly as
+    bytes land and :class:`BudgetExceeded` propagates for a whole-record rollback —
+    identical to the archive extractors. Targeted fetch is intentionally NOT bounded by
+    the per-member size cap: every targeted member is a wanted VASP file.
+    """
+    entries = zipstream.remote_central_directory(url, session)
+    if entries is None:
+        return None
+    names = [e.name for e in entries]
+    targets = [e for e in entries
+               if not e.is_dir and _PARSE_RE.search(e.name.rsplit("/", 1)[-1])]
+    if not targets:
+        return names, []                    # proven no VASP inside -> no download needed
+    if any(not t.targetable for t in targets):
+        return None                          # a ZIP64/encrypted/odd VASP member -> fall back
+    if len(targets) > max_files:
+        return None                          # many members -> one whole download is cheaper
+    total_comp = sum(e.compressed_size for e in entries if not e.needs_zip64)
+    target_comp = sum(t.compressed_size for t in targets)
+    worthwhile = (any(e.needs_zip64 for e in entries)
+                  or total_comp >= ZIP_STREAM_LARGE_ARCHIVE_BYTES
+                  or (total_comp - target_comp) >= ZIP_STREAM_MIN_SKIP_BYTES)
+    if not worthwhile:
+        return None                          # small, ~all-VASP zip -> whole download simpler
+
+    extracted: list[str] = []
+    written: list[Path] = []
+    for t in targets:
+        out = dest / t.name
+        if not _is_within(dest, out):
+            continue                         # zip-slip guard
+        reader = zipstream.open_member_reader(session, url, t)
+        if reader is None:                   # Range stopped being honoured mid-way
+            _rollback_targeted(written, budget)
+            return None
+        try:
+            # Unbounded member cap: a targeted member is always a wanted VASP file; only
+            # the disk budget bounds it (charged per chunk inside _copy_capped).
+            outcome = _copy_capped(reader, out, 1 << 62, budget)
+        finally:
+            reader.close()
+        if outcome == _COPY_NO_BUDGET:
+            # Member cannot fit the whole budget: stop like the extractors do — keep what
+            # landed (the budget marked the record truncated). Do NOT fall back.
+            break
+        if outcome != _COPY_OK or not reader.complete:
+            # short/corrupt member -> abandon targeted, fall back to the md5-verified
+            # whole-archive download.
+            if out.exists():
+                sz = out.stat().st_size
+                out.unlink(missing_ok=True)
+                if budget is not None:
+                    budget.refund(sz, 1)
+            _rollback_targeted(written, budget)
+            return None
+        extracted.append(t.name)
+        written.append(out)
     return names, extracted
 
 
@@ -945,7 +1058,9 @@ def _discard_stage(dest: Path, budget: "StagingBudget | None") -> tuple[int, int
 def fetch_record(rec: dict, session: requests.Session, raw_dir: Path,
                  max_bytes: int | None, rej: RejectionLogger,
                  max_member_bytes: int = DEFAULT_MAX_MEMBER_BYTES,
-                 budget: "StagingBudget | None" = None) -> dict | None:
+                 budget: "StagingBudget | None" = None,
+                 zip_stream: bool = True,
+                 zip_stream_max_files: int = DEFAULT_ZIP_STREAM_MAX_FILES) -> dict | None:
     """Download + stage one record. Returns a fetched-manifest entry or None.
 
     ``budget`` (see :class:`StagingBudget`) is charged for every byte and file actually
@@ -953,6 +1068,11 @@ def fetch_record(rec: dict, session: requests.Session, raw_dir: Path,
     reached the record keeps whatever already landed (partial calc units still parse) and
     a ``disk_budget_reached`` rejection is logged, so the truncation is auditable and the
     caller can stop cleanly and let the pacing loop parse+purge.
+
+    ``zip_stream`` (default on) pulls only the VASP files out of a ``.zip`` over HTTP
+    Range when worthwhile, instead of downloading the whole archive (see
+    :func:`_fetch_zip_targeted`); ``zip_stream_max_files`` bounds the per-archive request
+    count before it falls back to a whole download.
     """
     recid = rec["recid"]
     dest = raw_dir / recid
@@ -966,7 +1086,7 @@ def fetch_record(rec: dict, session: requests.Session, raw_dir: Path,
     try:
         got_any, transient = _stage_record_files(
             rec, recid, dest, session, max_bytes, rej, max_member_bytes, budget,
-            availability, availability_files)
+            availability, availability_files, zip_stream, zip_stream_max_files)
     except BudgetExceeded as exc:
         # A limit was reached part way through this record. Roll it back entirely — a
         # record is staged whole or not at all — refund what it had taken, and leave it
@@ -1041,6 +1161,8 @@ def _stage_record_files(
     rec: dict, recid: str, dest: Path, session: requests.Session,
     max_bytes: int | None, rej: RejectionLogger, max_member_bytes: int,
     budget: "StagingBudget | None", availability: dict, availability_files: dict,
+    zip_stream: bool = True,
+    zip_stream_max_files: int = DEFAULT_ZIP_STREAM_MAX_FILES,
 ) -> tuple[bool, bool]:
     """Download + extract one record's files. Returns ``(got_any, transient)``.
 
@@ -1077,6 +1199,37 @@ def _stage_record_files(
             continue
 
         if kind is not None:  # a real archive to download + selectively extract
+            # Targeted ZIP fetch: pull only the VASP members over HTTP Range when it is
+            # worthwhile, instead of downloading the whole archive. Handles the record's
+            # zip entirely on success (including proving it holds no VASP without any
+            # download); returns None to fall back to the whole-archive path below.
+            # Deliberately attempted BEFORE the max_bytes check: we never download the
+            # whole archive, so an over-cap zip can still yield its sub-cap VASP files.
+            if kind == "zip" and zip_stream and url:
+                extract_dir = dest / "extracted" / _archive_subdir(base)
+                try:
+                    result = _fetch_zip_targeted(url, extract_dir, session, budget,
+                                                 zip_stream_max_files)
+                except BudgetExceeded:
+                    raise  # a disk/inode limit -> whole-record rollback (see fetch_record)
+                except _EXTRACT_ERRORS as exc:
+                    # A disk write / decode error during targeted fetch: same handling as
+                    # the whole-archive extractor path (out-of-space stays transient).
+                    rej.reject("fetch", f"{recid}:{key}", "extract_error",
+                               detail=f"{type(exc).__name__}: {exc}")
+                    if isinstance(exc, OSError) and exc.errno in _OUT_OF_SPACE_ERRNOS:
+                        transient = True
+                    continue
+                if result is not None:
+                    names, extracted = result
+                    info = _safe_members(names)
+                    for akey, aval in info["availability"].items():
+                        availability[akey] = availability[akey] or aval
+                    availability_files.update(info["availability_files"])
+                    got_any = got_any or bool(extracted)
+                    continue
+                # not addressable by targeted fetch -> fall through to whole download
+
             if max_bytes and size > max_bytes:
                 rej.reject("fetch", f"{recid}:{key}", "over_size_cap", size=size)
                 continue
@@ -1405,7 +1558,8 @@ def _fetch_parallel(
     records: Any, done: set[str], raw_dir: Path, max_bytes: int | None,
     rej: RejectionLogger, max_member_bytes: int, token: str | None,
     max_records: int | None, budget: StagingBudget, out: JsonlWriter, stats: dict,
-    workers: int,
+    workers: int, zip_stream: bool = True,
+    zip_stream_max_files: int = DEFAULT_ZIP_STREAM_MAX_FILES,
 ) -> None:
     """Record-level parallel fetch. Records are independent (each stages into its own
     ``raw_dir/<recid>/``), so a thread pool of ``workers`` overlaps their downloads.
@@ -1439,7 +1593,7 @@ def _fetch_parallel(
         try:
             entry = fetch_record(rec, _session_for_thread(), raw_dir, max_bytes,
                                  locked_rej, max_member_bytes,  # type: ignore[arg-type]
-                                 budget)
+                                 budget, zip_stream, zip_stream_max_files)
             return rec, entry
         except Exception:
             logger.exception("fetch worker crashed on %s", rec.get("recid"))
@@ -1499,6 +1653,8 @@ def fetch(
     max_disk_bytes: int | None = None,
     max_disk_files: int | None = None,
     workers: int = 1,
+    zip_stream: bool = True,
+    zip_stream_max_files: int = DEFAULT_ZIP_STREAM_MAX_FILES,
 ) -> dict:
     """Fetch all records in ``in_path`` (a triaged keep-list).
 
@@ -1604,7 +1760,8 @@ def fetch(
                                 budget.used_bytes, budget.used_files)
                     break
                 entry = fetch_record(rec, session, raw_dir, max_bytes, rej,
-                                     max_member_bytes, budget)
+                                     max_member_bytes, budget, zip_stream,
+                                     zip_stream_max_files)
                 if entry:
                     out.write(entry)
                     stats["fetched"] += 1
@@ -1617,7 +1774,7 @@ def fetch(
         with JsonlWriter(out_path) as out:
             _fetch_parallel(read_jsonl(in_path), done, raw_dir, max_bytes, rej,
                             max_member_bytes, token, max_records, budget, out, stats,
-                            workers)
+                            workers, zip_stream, zip_stream_max_files)
         # Guaranteed forward progress. If a whole parallel pass staged NOTHING and stopped
         # on the budget, then the records in flight each fitted individually but filled the
         # budget between them, and every one of them was rolled back. Handing the same
