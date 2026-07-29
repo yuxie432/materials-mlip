@@ -4,7 +4,8 @@
 #SBATCH -p icelake
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task=4              # RAM headroom (~13 GiB): verify/merge read ONE shard's
+                                       # frames into memory at a time, big for large structures
 #SBATCH --time=12:00:00
 #SBATCH -o logs/zh-merge-%j.out
 #SBATCH -e logs/zh-merge-%j.err
@@ -16,6 +17,9 @@
 # merge MOVES shards (never recompresses them) and appends metadata only once a
 # source's shards are in place, so an interrupted merge is resumable — re-running it
 # picks up from its journal instead of double-appending.
+#
+# NB: `mkdir -p logs` from the repo root before submitting — SLURM opens the -o/-e paths
+# above before this script body runs.
 set -euo pipefail
 
 # ---- ENV SETUP (edit me) --------------------------------------------------------

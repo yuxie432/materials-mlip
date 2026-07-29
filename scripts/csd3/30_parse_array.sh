@@ -1,10 +1,11 @@
 #!/bin/bash
 #SBATCH -J zh-parse
 #SBATCH -A CHANGEME-SL3-CPU            # your account — find it with: mybalance
-#SBATCH -p icelake                     # icelake-himem for very long trajectories
+#SBATCH -p icelake-himem               # 6760 MiB/core: parse (pymatgen) needs the RAM
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1              # parse is single-threaded; parallelism = the array
+#SBATCH --cpus-per-task=4              # bought for RAM (~26 GiB); parse is single-threaded,
+                                       # so the SPEEDUP is the array, not these cores
 #SBATCH --time=12:00:00
 #SBATCH --array=0-15                   # must match the --parts used by `split`
 #SBATCH -o logs/zh-parse-%A_%a.out
@@ -20,6 +21,9 @@
 #       --parts 16 --out-dir $ZENODO_HARVEST_DATA/manifests/parts
 #   ARRAY=$(sbatch --parsable scripts/csd3/30_parse_array.sh)
 #   sbatch --dependency=afterany:$ARRAY scripts/csd3/31_merge_verify.sh
+#
+# NB: `mkdir -p logs` from the repo root before submitting — SLURM opens the -o/-e paths
+# above before this script body runs.
 set -euo pipefail
 
 # ---- ENV SETUP (edit me) --------------------------------------------------------
@@ -28,7 +32,12 @@ export ZENODO_HARVEST_DATA="${ZENODO_HARVEST_DATA:-/rds/user/$USER/hpc-work/zeno
 cd "${SLURM_SUBMIT_DIR:-.}"
 # --------------------------------------------------------------------------------
 
-MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-4000000000}"   # see 20_pipeline.sh
+# RAM guard: pymatgen peak RSS is ~10x the primary file size (see 20_pipeline.sh). Sized to
+# the ~26 GiB that --cpus-per-task=4 on icelake-himem gives (0.85 x 26 GiB / 10 ~= 2 GB); no
+# concurrent fetch here (parse-only job), so this can go a little higher than the pipeline's
+# if you raise --cpus-per-task with it. Keep it EQUAL to 20_pipeline.sh's value unless you
+# are deliberately doing a high-RAM second pass for the primaries the pipeline skipped.
+MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-2000000000}"
 mkdir -p logs
 i=$(printf "%03d" "${SLURM_ARRAY_TASK_ID:-0}")
 PART="$ZENODO_HARVEST_DATA/manifests/parts/fetched.part-$i.jsonl"

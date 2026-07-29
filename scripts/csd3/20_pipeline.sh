@@ -47,15 +47,16 @@ MAX_DISK_BYTES="${MAX_DISK_BYTES:-800000000000}"
 # leaves headroom for the dataset + manifests and for the valve's in-flight overshoot.
 MAX_DISK_FILES="${MAX_DISK_FILES:-800000}"
 # Guard: refuse to ATTEMPT a primary output bigger than this (0 = attempt everything).
-# pymatgen holds a whole ionic trajectory in RAM: MEASURED peak RSS is ~8.6x the
-# vasprun.xml/OUTCAR file size (e.g. a 633 MB file peaks at ~5.4 GB). An over-budget parse
-# is a cgroup SIGKILL of the whole job (taking the in-flight fetch progress with it), NOT a
-# catchable error, so we cap the file size to cap the RAM. Memory is per core on CSD3
-# (icelake-himem = 6760 MiB/core), so --cpus-per-task=4 above gives ~26 GiB and the safe cap
-# is ~0.85 x 26 GiB / 8.6 ~= 2.5 GB. To parse bigger primaries, raise --cpus-per-task (more
-# RAM) and this value together. Confirm the real ratio on YOUR data + hardware with
-# `scripts/csd3/csd3_parse_memory.py`, then verify the peak: `sacct -j <jobid> --format=MaxRSS`.
-MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-2500000000}"
+# pymatgen holds a whole ionic trajectory in RAM: MEASURED peak RSS is ~10x the
+# vasprun.xml/OUTCAR file size (CSD3 icelake-himem: a 534 MB file peaks at ~5.6 GB). An
+# over-budget parse is a cgroup SIGKILL of the whole job (taking the in-flight fetch progress
+# with it), NOT a catchable error, so we cap the file size to cap the RAM. Memory is per core
+# on CSD3 (icelake-himem = 6760 MiB/core), so --cpus-per-task=4 above gives ~26 GiB; after
+# leaving room for the concurrent fetch (~1 GiB), the safe cap is ~0.85 x 26 GiB / 10 ~= 2 GB.
+# To parse bigger primaries, raise --cpus-per-task (more RAM) and this value together. Re-check
+# on REAL data (synthetic samples read a touch high) with `scripts/csd3/csd3_parse_memory.py`,
+# then verify the peak: `sacct -j <jobid> --format=MaxRSS`.
+MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-2000000000}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-8}"      # resubmission chain guard
 ATTEMPT="${ATTEMPT:-1}"
 # --------------------------------------------------------------------------------

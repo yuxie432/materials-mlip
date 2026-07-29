@@ -148,7 +148,7 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   ```
   python -m zenodo_harvest.cli pipeline --in data/manifests/keep.jsonl \
       --parts 40 --workers 4 --max-bytes 0 --max-member-bytes 30000000000 \
-      --max-disk-bytes 800000000000 --max-disk-files 800000 --max-primary-bytes 2500000000
+      --max-disk-bytes 800000000000 --max-disk-files 800000 --max-primary-bytes 2000000000
   ```
   `--max-disk-bytes` bounds the **whole** raw staging dir — it already covers both
   concurrently-staged batches, so size it ~0.8 × quota (leaving headroom for in-flight
@@ -156,11 +156,12 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   quota). Discovery is capped server-side at 30 req/min — single-stream by design,
   do NOT parallelise it; only `fetch` benefits from `--workers`.
   **`--max-primary-bytes` is a RAM guard, not a disk lever**: pymatgen's peak RSS is
-  ~8.6 × the vasprun.xml/OUTCAR size (measured; a 633 MB file peaks at ~5.4 GB), and an
-  over-budget parse is a cgroup SIGKILL — so run this on `icelake-himem` and size the cap to
-  the job's RAM (`0.85 × cpus-per-task × 6.76 GB ÷ 8.6`; e.g. `--cpus-per-task=4` → ~26 GiB
-  → ~2.5 GB cap). It only skips (logs `primary_too_large`, keeps the staged file) — the calc
-  can be re-parsed later on a bigger-RAM job. Calibrate with `scripts/csd3/csd3_parse_memory.py`.
+  ~10 × the vasprun.xml/OUTCAR size (measured on CSD3 icelake-himem: a 534 MB file peaks at
+  ~5.6 GB), and an over-budget parse is a cgroup SIGKILL — so run this on `icelake-himem` and
+  size the cap to the job's RAM (`~0.85 × cpus-per-task × 6.76 GB ÷ 10`, less room for the
+  concurrent fetch; e.g. `--cpus-per-task=4` → ~26 GiB → ~2.0 GB cap). It only skips (logs
+  `primary_too_large`, keeps the staged file) — the calc can be re-parsed later on a
+  bigger-RAM job. Calibrate with `scripts/csd3/csd3_parse_memory.py`.
   Parallel parse on the cluster (array-job model): `split` the fetched manifest into N parts,
   run N array tasks each parsing its part into its OWN `--dataset-dir`, then `merge-datasets`
   the per-task dirs into one, `verify` the merged dataset, and `purge-raw` the parsed archives:

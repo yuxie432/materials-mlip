@@ -57,15 +57,16 @@ is opened by SLURM before the script body (which does its own `mkdir`) runs, so 
 
 ## Parse memory (icelake-himem)
 
-`parse` (pymatgen) is the only memory-hungry stage — its peak RSS is **~8.6× the
-vasprun.xml/OUTCAR file size** (measured: a 633 MB file peaks at ~5.4 GB), and an
-over-budget parse is a cgroup **SIGKILL** of the whole job, not a catchable error. On CSD3
-memory is bundled with cores (icelake-himem = 6760 MiB/core), so `--cpus-per-task` on the
-parse/pipeline jobs is bought for **RAM, not compute** (pymatgen is single-threaded). Size
-`--max-primary-bytes` to the job's RAM: `~0.85 × cpus-per-task × 6.76 GB ÷ 8.6`
-(`--cpus-per-task=4` → ~26 GiB → ~2.5 GB). Over-cap primaries are skipped
-(`primary_too_large`) and kept on disk for a later bigger-RAM re-parse. Confirm the ratio on
-your own data/hardware first:
+`parse` (pymatgen) is the only memory-hungry stage — its peak RSS is **~10× the
+vasprun.xml/OUTCAR file size** (measured on CSD3 icelake-himem: a 534 MB file peaks at
+~5.6 GB), and an over-budget parse is a cgroup **SIGKILL** of the whole job, not a catchable
+error. On CSD3 memory is bundled with cores (icelake-himem = 6760 MiB/core), so
+`--cpus-per-task` on the parse/pipeline jobs is bought for **RAM, not compute** (pymatgen is
+single-threaded). Size `--max-primary-bytes` to the job's RAM: `~0.85 × cpus-per-task ×
+6.76 GB ÷ 10`, leaving room for the concurrent fetch (`--cpus-per-task=4` → ~26 GiB →
+~2.0 GB). Over-cap primaries are skipped (`primary_too_large`) and kept on disk for a later
+bigger-RAM re-parse. Synthetic samples read a touch high, so confirm the ratio on your own
+data/hardware:
 
 ```bash
 srun -A MYACCT-SL3-CPU -p icelake-himem --cpus-per-task=4 --time=00:20:00 \
