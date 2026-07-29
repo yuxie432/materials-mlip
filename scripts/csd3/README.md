@@ -44,10 +44,35 @@ be firewalled:
 
 ```bash
 export ZENODO_HARVEST_DATA=/rds/user/$USER/hpc-work/zenodo   # scratch, read at import
+mkdir -p logs                                                # SLURM opens -o/-e before the job runs
 sbatch scripts/csd3/10_discover.sh                            # ~1-2 h (rate-limited)
 sbatch scripts/csd3/20_pipeline.sh                            # the long one
 # optional many-core parse instead of the pipeline's serial parse:
 sbatch scripts/csd3/30_parse_array.sh
+```
+
+`mkdir -p logs` is required **before the first submit**: every script's `#SBATCH -o logs/…`
+is opened by SLURM before the script body (which does its own `mkdir`) runs, so a missing
+`logs/` makes the job fail to start.
+
+## Parse memory (icelake-himem)
+
+`parse` (pymatgen) is the only memory-hungry stage — its peak RSS is **~8.6× the
+vasprun.xml/OUTCAR file size** (measured: a 633 MB file peaks at ~5.4 GB), and an
+over-budget parse is a cgroup **SIGKILL** of the whole job, not a catchable error. On CSD3
+memory is bundled with cores (icelake-himem = 6760 MiB/core), so `--cpus-per-task` on the
+parse/pipeline jobs is bought for **RAM, not compute** (pymatgen is single-threaded). Size
+`--max-primary-bytes` to the job's RAM: `~0.85 × cpus-per-task × 6.76 GB ÷ 8.6`
+(`--cpus-per-task=4` → ~26 GiB → ~2.5 GB). Over-cap primaries are skipped
+(`primary_too_large`) and kept on disk for a later bigger-RAM re-parse. Confirm the ratio on
+your own data/hardware first:
+
+```bash
+srun -A MYACCT-SL3-CPU -p icelake-himem --cpus-per-task=4 --time=00:20:00 \
+    python scripts/csd3/csd3_parse_memory.py --raw-dir $ZENODO_HARVEST_DATA/raw --top 8
+# before any fetch, calibrate on synthetic samples instead:
+srun -A MYACCT-SL3-CPU -p icelake-himem --cpus-per-task=4 --time=00:20:00 \
+    python scripts/csd3/csd3_parse_memory.py --synthetic
 ```
 
 Discovery is hard-limited by Zenodo to 30 search requests/minute, so it is single-stream

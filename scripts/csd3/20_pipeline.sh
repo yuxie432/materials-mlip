@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH -J zh-pipeline
 #SBATCH -A CHANGEME-SL3-CPU            # your account — find it with: mybalance
-#SBATCH -p icelake                     # icelake-himem if parse needs more RAM/core
+#SBATCH -p icelake-himem               # 6760 MiB/core: parse (pymatgen) needs the RAM
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=5              # 4 download threads + 1 parse thread
+#SBATCH --cpus-per-task=4              # bought for RAM (~26 GiB), not compute — see MAX_PRIMARY_BYTES
 #SBATCH --time=12:00:00                # SL3 max; SL1/SL2 may use up to 36:00:00
 #SBATCH -o logs/zh-pipeline-%j.out
 #SBATCH -e logs/zh-pipeline-%j.err
@@ -16,6 +16,10 @@
 # The harvest can outlast one job's wallclock. Everything is resumable, so either
 # re-submit this script by hand, or set RESUBMIT=1 to have it chain a follow-on job
 # automatically:   RESUBMIT=1 sbatch scripts/csd3/20_pipeline.sh
+#
+# NB: create logs/ BEFORE you submit — SLURM opens the -o/-e paths above before this
+# script body runs, so a missing logs/ makes the job fail to start. From the repo root,
+# once: `mkdir -p logs`.
 set -euo pipefail
 
 # ---- ENV SETUP (edit me) --------------------------------------------------------
@@ -43,14 +47,15 @@ MAX_DISK_BYTES="${MAX_DISK_BYTES:-800000000000}"
 # leaves headroom for the dataset + manifests and for the valve's in-flight overshoot.
 MAX_DISK_FILES="${MAX_DISK_FILES:-800000}"
 # Guard: refuse to ATTEMPT a primary output bigger than this (0 = attempt everything).
-# pymatgen holds a whole ionic trajectory in RAM and can peak at several times the file
-# size, so one huge vasprun.xml can get the job cgroup-killed, losing the run's progress.
-# NB memory is allocated per core on CSD3 (~3.4 GB/core on icelake, ~6.8 GB on
-# icelake-himem), so --cpus-per-task=5 above gives this job only ~17 GB — a 4 GB primary
-# can approach that once expanded. If parse gets OOM-killed, either switch -p to
-# icelake-himem, raise --cpus-per-task, or lower this. Check the real peak with
-# `sacct -j <jobid> --format=MaxRSS` and tune from there.
-MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-4000000000}"
+# pymatgen holds a whole ionic trajectory in RAM: MEASURED peak RSS is ~8.6x the
+# vasprun.xml/OUTCAR file size (e.g. a 633 MB file peaks at ~5.4 GB). An over-budget parse
+# is a cgroup SIGKILL of the whole job (taking the in-flight fetch progress with it), NOT a
+# catchable error, so we cap the file size to cap the RAM. Memory is per core on CSD3
+# (icelake-himem = 6760 MiB/core), so --cpus-per-task=4 above gives ~26 GiB and the safe cap
+# is ~0.85 x 26 GiB / 8.6 ~= 2.5 GB. To parse bigger primaries, raise --cpus-per-task (more
+# RAM) and this value together. Confirm the real ratio on YOUR data + hardware with
+# `scripts/csd3/csd3_parse_memory.py`, then verify the peak: `sacct -j <jobid> --format=MaxRSS`.
+MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-2500000000}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-8}"      # resubmission chain guard
 ATTEMPT="${ATTEMPT:-1}"
 # --------------------------------------------------------------------------------
