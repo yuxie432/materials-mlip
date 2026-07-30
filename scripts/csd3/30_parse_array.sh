@@ -28,7 +28,13 @@ set -euo pipefail
 
 # ---- ENV SETUP (edit me) --------------------------------------------------------
 export ZENODO_HARVEST_DATA="${ZENODO_HARVEST_DATA:-/rds/user/$USER/hpc-work/zenodo}"
-# module load python/3.11        # or: source ~/miniforge3/bin/activate zenodo-harvest
+# Activate the harvest env BEFORE `sbatch` (sbatch captures your submit env by default):
+#   module load python/3.11.0-icl && source ~/materials-mlip/.venv/bin/activate
+# Parse copies each OUTCAR into $TMPDIR before ASE reads it; keep that on fast node-local
+# scratch (/local, auto-removed at job end) so a large temp copy neither eats the RAM budget
+# --max-primary-bytes is sized against (a tmpfs /tmp would) nor the /rds quota.
+if [[ -d /local && -w /local ]]; then export TMPDIR="/local"; else export TMPDIR="$ZENODO_HARVEST_DATA/tmp"; fi
+mkdir -p "$TMPDIR"
 cd "${SLURM_SUBMIT_DIR:-.}"
 # --------------------------------------------------------------------------------
 

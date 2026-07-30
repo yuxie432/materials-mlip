@@ -609,21 +609,35 @@ The harvest is **network/rate-limited, not CPU-limited**. Components:
 | **fetch** | **transfer ÷ throughput** — dominant | compute-node download speed (**unknown until measured**) + request throttling on small files |
 | parse | **not the bottleneck** — 47 frames/s/core, embarrassingly parallel (array job) or overlapped in `pipeline` | RAM per big vasprun (use `--max-primary-bytes` on `icelake-himem`) |
 
-**Fetch dominates.** At the peek+walk-aware ~7.5 TB (uncapped) and an assumed compute-node
-aggregate throughput (`--workers 4`):
+**Fetch dominates**, and its throughput was **measured on CSD3** (icelake compute node,
+`scripts/csd3/csd3_download_speed.py`, 2026-07-29, anonymous — no token):
 
-| aggregate speed | ~7.5 TB uncapped | ~1.1 TB @ 2 GB cap |
-|---|--:|--:|
-| 50 MB/s | ~42 h | ~6 h |
-| 200 MB/s | ~10 h | ~1.6 h |
-| 400 MB/s | ~5 h | ~0.8 h |
+| run | single-stream | aggregate | note |
+|---|--:|--:|---|
+| `--workers 4` (4 distinct files) | 28.1 MB/s | **66.5 MB/s** | clean 4-way test |
+| `--workers 8` (only 4 default URLs) | 7.5 MB/s | 47.3 MB/s | depressed: 8 workers double-fetch the same 4 files → Zenodo per-file shaping; also run-to-run variance |
 
-So an **uncapped** harvest is a **1–2 job affair** (36 h SL1/SL2 wallclock; every stage is
-resumable and `20_pipeline.sh` self-resubmits), while a **2 GB cap fits comfortably in one
-job**. **Measure the actual speed first** with `scripts/csd3/csd3_download_speed.py` (added
-this survey; verified live URLs) on a compute node, and plug it into the table. The inode
-limit (1M files) is the *other* binding constraint — the fetch→parse→purge pacing loop handles
-it, but it means the uncapped run proceeds in disk-valve-bounded waves, not one straight pull.
+Two lessons: **(1) throughput does not scale past ~4 workers** (8 was no better — the node
+egress / Zenodo per-IP shaping caps ~50–66 MB/s aggregate, so `--workers 4` is the sweet
+spot), and **(2) it is highly variable run-to-run** (single-stream swung 7.5→28 MB/s with
+Zenodo load / time-of-day). **Plan conservatively at ~50 MB/s aggregate** (Range latency
+73–85 ms confirms peek/walk are quota-bound at ~100 req/min, not latency-bound). Fetch time
+= transfer ÷ aggregate:
+
+| policy | transfer | fetch @ 66 MB/s | fetch @ 50 MB/s | + discover+peek (~1.5 h) → **total** | jobs |
+|---|--:|--:|--:|--:|---|
+| **uncapped** | ~7.5 TB | ~33 h | ~46 h | **~35–48 h** | **2** (self-resubmit) or `-long` QoS |
+| **`--max-bytes 2e9`** | ~1.1 TB | ~4.8 h | ~6.4 h | **~6–8 h** | **1** (fits 12 h SL3) |
+
+So an **uncapped** harvest is a **2-job affair** at the measured speed (36 h SL1/SL2 wallclock;
+every stage resumable, `20_pipeline.sh` self-resubmits — or request the `-long` QoS for one
+run), while a **2 GB cap fits comfortably in one job**, losing only the handful of >2 GB
+trajectories. Since the final dataset is ~5–40 GB either way, the cap costs *time*, not
+*storage* — the trade is recall vs wall-clock. **Set `ZENODO_TOKEN`** for the real run: it
+won't raise the ~66 MB/s bandwidth ceiling but it lifts the file-endpoint request quota,
+cutting 429 stalls on the peek stage and small-file fetches. The inode limit (1M files) is the
+*other* binding constraint — the fetch→parse→purge pacing loop handles it, but it means the
+uncapped run proceeds in disk-valve-bounded waves, not one straight pull.
 
 ## Resource-type necessity (dataset / software / publication)
 

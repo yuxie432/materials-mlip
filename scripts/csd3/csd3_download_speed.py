@@ -138,6 +138,10 @@ def main() -> None:
 
         # 2. N-worker aggregate (repeat the URL list to reach `workers` tasks)
         print(f"\n[2] {args.workers}-worker aggregate throughput")
+        if args.workers > len(urls):
+            print(f"    NB: only {len(urls)} distinct URL(s) for {args.workers} workers -> "
+                  f"files get double-fetched, and Zenodo's per-file shaping will DEPRESS this "
+                  f"aggregate. Pass >= {args.workers} distinct --url for a clean test.")
         tasks = [(urls[i % len(urls)], tmp / f"w{i}") for i in range(args.workers)]
         t0 = time.monotonic()
         with ThreadPoolExecutor(max_workers=args.workers) as ex:

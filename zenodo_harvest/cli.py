@@ -52,7 +52,9 @@ from .triage import triage
 
 def _add_discover(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("discover", help="stage 0: build candidate manifest from Zenodo search")
-    p.add_argument("--out", default="data/manifests/candidates.jsonl")
+    # Honour ZENODO_HARVEST_DATA like fetch/parse do (main() ran refresh_paths() already),
+    # so an ad-hoc `discover` on the cluster writes to /rds scratch, not /home's 50 GB quota.
+    p.add_argument("--out", default=str(config.MANIFEST_DIR / "candidates.jsonl"))
     p.add_argument("--query", action="append", dest="queries",
                    help="override default queries (repeatable)")
     p.add_argument("--resource-type", action="append", dest="resource_types",

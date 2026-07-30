@@ -5,7 +5,7 @@ template: edit the `#SBATCH -A` account (find yours with `mybalance`) and the EN
 block, then submit from the repo root.
 
 ```
-scripts/csd3/00_check_network.sh   # ONE-OFF: prove compute nodes can reach zenodo.org
+scripts/csd3/00_check_network.sh   # ONE-OFF: prove icelake AND icelake-himem nodes reach zenodo.org
 scripts/csd3/csd3_download_speed.py# ONE-OFF: measure compute-node download throughput (fetch-time estimate)
 scripts/csd3/10_discover.sh        # stage 0-1 (discover + triage) — network, 1 core
 scripts/csd3/20_pipeline.sh        # stage 2-4 overlapped (fetch || parse+purge) + verify
@@ -30,9 +30,20 @@ Sources: [Quick Start](https://docs.hpc.cam.ac.uk/hpc/user-guide/quickstart.html
 ## Do compute nodes have outbound internet?
 
 **The CSD3 documentation does not state this either way, so verify it before submitting
-the fetch** — run `scripts/csd3/00_check_network.sh` (a ~1 minute interactive job). The
-harvest's fetch stage needs outbound HTTPS to `zenodo.org`. If compute nodes turn out to
-be firewalled:
+the fetch** — run `scripts/csd3/00_check_network.sh` (a ~1-2 minute interactive job).
+Activate the harvest env first (so `requests` imports and `srun` propagates it):
+
+```bash
+module load python/3.11.0-icl && source ~/materials-mlip/.venv/bin/activate
+ACCOUNT=MYGROUP-SL3-CPU bash scripts/csd3/00_check_network.sh   # probes icelake AND icelake-himem
+```
+
+It probes **both** node types the harvest uses — `icelake` (discover + triage) and
+`icelake-himem` (where `20_pipeline.sh` runs the fetch) — because outbound access could in
+principle differ between them; restrict with e.g. `PARTITION=icelake`. A login-node
+pre-flight fails fast with an actionable message if `requests` is missing, so a
+not-activated env never masquerades as a firewall. The harvest's fetch/discover/triage need
+outbound HTTPS to `zenodo.org`. If compute nodes turn out to be firewalled:
 
 * check whether a proxy is published for your project (then export `https_proxy` in the
   ENV SETUP block — `requests` honours it automatically); or
@@ -44,6 +55,12 @@ be firewalled:
 ## Order of operations
 
 ```bash
+# Activate the harvest env FIRST. sbatch/srun capture your submit environment by default
+# (--export=ALL) and carry it to the compute node — including through 20_pipeline.sh's
+# RESUBMIT chain — so this one activation covers every job below. (The scripts deliberately
+# do NOT `module load` themselves: a failed load would abort the job under `set -e`.)
+module load python/3.11.0-icl && source ~/materials-mlip/.venv/bin/activate
+
 export ZENODO_HARVEST_DATA=/rds/user/$USER/hpc-work/zenodo   # scratch, read at import
 mkdir -p logs                                                # SLURM opens -o/-e before the job runs
 sbatch scripts/csd3/10_discover.sh                            # ~1-2 h (rate-limited)
@@ -55,6 +72,14 @@ sbatch scripts/csd3/30_parse_array.sh
 `mkdir -p logs` is required **before the first submit**: every script's `#SBATCH -o logs/…`
 is opened by SLURM before the script body (which does its own `mkdir`) runs, so a missing
 `logs/` makes the job fail to start.
+
+**`$TMPDIR` (node-local, not `/rds`, not `/tmp`).** `parse` copies each OUTCAR into a
+tempdir before ASE reads it, so `20_pipeline.sh` / `30_parse_array.sh` point `TMPDIR` at
+`/local` (the node's local disk, 57–131 GB, auto-removed at job end). This keeps a large
+temp copy off a possibly-tmpfs `/tmp` (which would silently eat the RAM budget that
+`--max-primary-bytes` is calibrated against) and off the `/rds` quota (the disk valve does
+not track `$TMPDIR`). When running the calibration helpers by hand, prepend `TMPDIR=/local`
+to their `srun` too (they also write a few hundred MB – ~1.6 GB of transient files).
 
 ## Parse memory (icelake-himem)
 
@@ -70,10 +95,10 @@ bigger-RAM re-parse. Synthetic samples read a touch high, so confirm the ratio o
 data/hardware:
 
 ```bash
-srun -A MYACCT-SL3-CPU -p icelake-himem --cpus-per-task=4 --time=00:20:00 \
+TMPDIR=/local srun -A MYACCT-SL3-CPU -p icelake-himem --cpus-per-task=4 --time=00:20:00 \
     python scripts/csd3/csd3_parse_memory.py --raw-dir $ZENODO_HARVEST_DATA/raw --top 8
 # before any fetch, calibrate on synthetic samples instead:
-srun -A MYACCT-SL3-CPU -p icelake-himem --cpus-per-task=4 --time=00:20:00 \
+TMPDIR=/local srun -A MYACCT-SL3-CPU -p icelake-himem --cpus-per-task=4 --time=00:20:00 \
     python scripts/csd3/csd3_parse_memory.py --synthetic
 ```
 
@@ -89,19 +114,36 @@ zenodo.org throughput** (the CSD3 docs don't state it, and it depends on the nod
 path / any proxy). Measure it directly on a compute node **before** sizing the job:
 
 ```bash
-srun -A MYACCT-SL3-CPU -p icelake --nodes=1 --ntasks=1 --cpus-per-task=4 --time=00:20:00 \
+TMPDIR=/local srun -A MYACCT-SL3-CPU -p icelake --nodes=1 --ntasks=1 --cpus-per-task=4 --time=00:20:00 \
     python scripts/csd3/csd3_download_speed.py --workers 4
 ```
 
 It reports single-stream MB/s, N-worker aggregate MB/s (the number to divide the transfer
 by), and Range round-trip latency (the peek / targeted-zip-fetch cost). Plug the aggregate
-into: **fetch time ≈ transfer ÷ aggregate MB/s**. The measured 2026-07-29 transfer to plan
-against is **~7.5 TB uncapped** (peek + zip-walk-aware) or **~1.1 TB at `--max-bytes 2e9`**
-(see `docs/survey-findings.md`), so e.g. at 200 MB/s aggregate: ~10 h uncapped (a 1–2 job,
-self-resubmitting run) vs ~1.6 h capped (one job). NB peeking and the many-small-file parts
-of fetch are **request-rate-bound**, not bandwidth-bound — Zenodo's file endpoint throttles
-hard (a full peek of ~2,200 zips absorbed 225 × HTTP 429), so budget ~1 h for triage-peek
-independent of bandwidth.
+into: **fetch time ≈ transfer ÷ aggregate MB/s**.
+
+**Measured on CSD3 (icelake compute node, 2026-07-29, anonymous):** `--workers 4` →
+single-stream 28.1 MB/s, **aggregate 66.5 MB/s**; `--workers 8` → 7.5 / 47.3 MB/s (no gain,
+and depressed because the 4 default URLs get double-fetched — pass ≥N distinct `--url`s to
+test N>4 cleanly). Two takeaways: throughput **does not scale past ~4 workers** (node egress /
+Zenodo per-IP shaping caps ~50–66 MB/s), and it is **variable run-to-run** — plan conservatively
+at **~50 MB/s aggregate**. Range latency 73–85 ms ⇒ peek/walk are quota-bound (~100 req/min),
+not latency-bound.
+
+Against the measured 2026-07-29 transfer (see `docs/survey-findings.md`) — **~7.5 TB uncapped**
+(peek + zip-walk-aware) or **~1.1 TB at `--max-bytes 2e9`** — at ~50–66 MB/s that is:
+
+| policy | fetch time | + discover+peek | total | jobs |
+|---|--:|--:|--:|---|
+| uncapped ~7.5 TB | ~33–46 h | +1.5 h | **~35–48 h** | **2** (self-resubmit) or `-long` QoS |
+| `--max-bytes 2e9` ~1.1 TB | ~5–6 h | +1.5 h | **~6–8 h** | **1** (fits 12 h SL3) |
+
+**Fetch bandwidth is the rate-limiting stage.** Discover (~51 min, search 30/min) and
+triage-peek (~1 h; request-rate-bound — a full peek of ~2,200 zips absorbed 225 × HTTP 429)
+are small fixed costs, and parse overlaps fetch in `pipeline` (47 frames/s/core → free). **Set
+`ZENODO_TOKEN`** for the real run: it won't raise the ~66 MB/s bandwidth ceiling but lifts the
+file-endpoint request quota, cutting 429 stalls on peek + small-file fetches. Use `--workers 4`
+(8 gives no benefit).
 
 ## Resuming
 

@@ -24,7 +24,16 @@ set -euo pipefail
 
 # ---- ENV SETUP (edit me) --------------------------------------------------------
 export ZENODO_HARVEST_DATA="${ZENODO_HARVEST_DATA:-/rds/user/$USER/hpc-work/zenodo}"
-# module load python/3.11        # or: source ~/miniforge3/bin/activate zenodo-harvest
+# Activate the harvest env BEFORE `sbatch` — sbatch captures your submit environment by
+# default (--export=ALL), and it is carried through the RESUBMIT chain too. Keep it OUT of
+# this script: an uncommented `module load` that fails would abort the job under `set -e`.
+#   module load python/3.11.0-icl && source ~/materials-mlip/.venv/bin/activate
+# Parse copies each OUTCAR into $TMPDIR before ASE reads it (parse.py). Point TMPDIR at fast
+# node-local scratch (/local: 57-131 GB, auto-removed at job end) so a large temp copy (up to
+# --max-primary-bytes) neither eats the RAM budget that cap is sized against — a tmpfs /tmp
+# would — nor the /rds quota (the disk valve does not track $TMPDIR). Fall back to /rds scratch.
+if [[ -d /local && -w /local ]]; then export TMPDIR="/local"; else export TMPDIR="$ZENODO_HARVEST_DATA/tmp"; fi
+mkdir -p "$TMPDIR"
 cd "${SLURM_SUBMIT_DIR:-.}"
 # --------------------------------------------------------------------------------
 
@@ -69,8 +78,11 @@ if [[ ! -s "$MAN/keep.jsonl" ]]; then
 fi
 
 echo "=== pipeline attempt $ATTEMPT/$MAX_ATTEMPTS $(date -Is) on $(hostname) ==="
-df -h "$ZENODO_HARVEST_DATA" || true
-quota -s 2>/dev/null || true
+# RDS usage vs the 1 TB / 1M-file quota. NB `df -h` shows the whole shared Lustre pool (not
+# your quota) and plain `quota` misses Lustre — prefer the CSD3 `quota` wrapper / `lfs quota`.
+# The pipeline's own peak_staged_bytes/peak_staged_files (in its JSON summary) is authoritative.
+quota 2>/dev/null || lfs quota -u "$USER" "$ZENODO_HARVEST_DATA" 2>/dev/null \
+    || df -h "$ZENODO_HARVEST_DATA" 2>/dev/null || true
 
 # Targeted ZIP member fetch is ON by default (pulls only VASP files out of a .zip over
 # HTTP Range, skipping heavy CHGCAR/WAVECAR bulk and never staging the archive). Pass
