@@ -179,6 +179,21 @@ def _add_purge_raw(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--dry-run", action="store_true", help="report only; delete nothing")
 
 
+def _add_status(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("status", help="read-only snapshot of harvest progress "
+                                      "(counts, staging vs quota, rejection reasons)")
+    p.add_argument("--manifests-dir", default=str(config.MANIFEST_DIR))
+    p.add_argument("--raw-dir", default=str(config.RAW_DIR))
+    p.add_argument("--dataset-dir", default=str(config.DATASET_DIR))
+    p.add_argument("--keep", default=None,
+                   help="keep-list for the fetch %% denominator (default: <manifests>/keep.jsonl)")
+    p.add_argument("--max-disk-bytes", type=int, default=0,
+                   help="show staging bytes as %% of this budget (match the pipeline's value)")
+    p.add_argument("--max-disk-files", type=int, default=0,
+                   help="show staging inodes as %% of this file budget (match the pipeline's value)")
+    p.add_argument("--json", action="store_true", help="machine-readable output instead of text")
+
+
 def _add_pipeline(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("pipeline", help="stage 2-4 overlapped: fetch(i+1) || parse+purge(i), "
                                         "disk-paced (bounds peak staging under a quota)")
@@ -231,6 +246,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_merge(sub)
     _add_verify(sub)
     _add_purge_raw(sub)
+    _add_status(sub)
     _add_pipeline(sub)
     args = parser.parse_args(argv)
 
@@ -297,6 +313,16 @@ def main(argv: list[str] | None = None) -> int:
         except DatasetLockError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
+    elif args.cmd == "status":
+        from .status import format_status, status_report
+        report = status_report(
+            manifests_dir=args.manifests_dir, raw_dir=args.raw_dir,
+            dataset_dir=args.dataset_dir, keep_path=args.keep,
+            max_disk_bytes=(args.max_disk_bytes or None),
+            max_disk_files=(args.max_disk_files or None),
+        )
+        print(json.dumps(report, indent=2) if args.json else format_status(report))
+        return 0  # read-only: always succeeds
     elif args.cmd == "verify":
         summary = verify_dataset(args.dataset_dir)
     elif args.cmd == "purge-raw":

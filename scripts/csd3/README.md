@@ -63,11 +63,16 @@ module load python/3.11.0-icl && source ~/materials-mlip/.venv/bin/activate
 
 export ZENODO_HARVEST_DATA=/rds/user/$USER/hpc-work/zenodo   # scratch, read at import
 mkdir -p logs                                                # SLURM opens -o/-e before the job runs
-sbatch scripts/csd3/10_discover.sh                            # ~1-2 h (rate-limited)
-sbatch scripts/csd3/20_pipeline.sh                            # the long one
+DISC=$(sbatch --parsable scripts/csd3/10_discover.sh)        # ~1-2 h (rate-limited)
+sbatch --dependency=afterok:$DISC scripts/csd3/20_pipeline.sh   # starts only if discover succeeds
 # optional many-core parse instead of the pipeline's serial parse:
 sbatch scripts/csd3/30_parse_array.sh
 ```
+
+`--dependency=afterok:$DISC` lets you queue both at once — the pipeline sits PENDING until
+discover finishes cleanly. Use `sbatch` (not `bash`): the `#SBATCH` directives only take
+effect under `sbatch`, so `bash 20_pipeline.sh` would run the whole pipeline on the login
+node (capped ~4 CPUs, wrong partition). For the self-resubmitting long run add `RESUBMIT=1`.
 
 `mkdir -p logs` is required **before the first submit**: every script's `#SBATCH -o logs/…`
 is opened by SLURM before the script body (which does its own `mkdir`) runs, so a missing
@@ -80,6 +85,45 @@ temp copy off a possibly-tmpfs `/tmp` (which would silently eat the RAM budget t
 `--max-primary-bytes` is calibrated against) and off the `/rds` quota (the disk valve does
 not track `$TMPDIR`). When running the calibration helpers by hand, prepend `TMPDIR=/local`
 to their `srun` too (they also write a few hundred MB – ~1.6 GB of transient files).
+
+## Monitoring a running job
+
+**SLURM job state** (queueing/running, and — importantly — peak RAM vs the parse budget):
+
+```bash
+squeue -u $USER                                                      # PENDING/RUNNING + why
+sacct -j <jobid> --format=JobID,JobName,State,Elapsed,MaxRSS,ExitCode  # incl. peak RSS
+tail -f logs/zh-pipeline-<jobid>.out   # live stdout   (.err for tracebacks)
+```
+
+**Harvest progress** — the `status` subcommand is a read-only snapshot (no network, no
+lock: safe to run *while* the job writes these files). It line-counts the append-only
+manifests and walks the raw/dataset trees:
+
+```bash
+python -m zenodo_harvest.cli status \
+    --max-disk-bytes 800000000000 --max-disk-files 800000    # to show staging as % of quota
+# refresh every minute:
+watch -n 60 'python -m zenodo_harvest.cli status --max-disk-bytes 800000000000 --max-disk-files 800000'
+```
+
+```
+DISCOVER  candidates: 18,742
+TRIAGE    keep-list:   6,120
+FETCH     fetched:     1,504 / 6,120  (24.6%)   calc_units: 3,880
+PARSE     parsed:      3,120 / 3,880 calc_units  (80.4%)   frames: 214,553
+STORE     shards: 22   dataset: 3.1 GiB
+STAGING   raw: 512.0 GiB / 745.1 GiB (68.7%)   inodes: 410,233 (files … + dirs …) / 800,000 (51.3%)
+ERRORS    rejections: 47  →  archive_no_vasp 31, primary_too_large 9, member_too_large 7
+```
+
+Pass the **same** `--max-disk-bytes`/`--max-disk-files` you gave the pipeline so the staging
+line reads as a % of your real quota. `--json` gives machine output; `--dataset-dir` /
+`--raw-dir` / `--manifests-dir` / `--keep` override the (env-derived) defaults. `status`
+is read-only and always exits 0. It reports **dropped** records by reason (`rejections`);
+a *hard* stage failure (e.g. a background parse crash) shows in the pipeline's
+`logs/…summary.json` and the `.err` log, not here. The staging walk touches every inode
+under `raw/`, so keep the `watch` interval modest (≥30 s) during the uncapped run.
 
 ## Parse memory (icelake-himem)
 

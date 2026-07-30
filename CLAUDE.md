@@ -117,6 +117,11 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
     unit (a huge `vasprun.xml` beside a modest `OUTCAR`) it is used instead of dropping the calc.
   - `store.py` — stage 4: `ShardedExtxyzWriter` (rotating `shard-NNNNN.extxyz.gz`) +
     `MetadataWriter` (one JSONL record per calc), joined by `calc_id`/`frame_id`.
+  - `status.py` — read-only progress snapshot: line-counts the append-only manifests +
+    walks the raw/dataset trees to report per-stage counts, fetch/parse **progress %**
+    (fetched vs keep-list; parsed calcs vs fetched calc-units), staging **bytes+inodes vs
+    quota**, and a **rejection-reason histogram**. No network, no lock — safe to run (or
+    `watch`) *while* a fetch/pipeline job is writing the same files.
   - `dataset_ops.py` — array-job glue (stages over dataset dirs, not the network):
     - `split` — round-robin a manifest into `<stem>.part-NNN.jsonl` parts, one per array task.
     - `merge-datasets` — fold per-task dataset dirs into one (rename+renumber shards, never
@@ -127,8 +132,9 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
       every array job.
     - `purge-raw` — delete `<raw-dir>/<recid>/` trees whose every calc_id is already in the
       dataset (reclaim scratch); `--dry-run` reports without deleting.
-  - `cli.py` — `python -m zenodo_harvest.cli {discover,triage,fetch,parse,pipeline,split,merge-datasets,verify,purge-raw} ...`
-    (loads `.env`; `verify`/`merge-datasets`/`pipeline` exit non-zero on an integrity failure).
+  - `cli.py` — `python -m zenodo_harvest.cli {discover,triage,fetch,parse,pipeline,split,merge-datasets,verify,purge-raw,status} ...`
+    (loads `.env`; `verify`/`merge-datasets`/`pipeline` exit non-zero on an integrity failure;
+    `status` is read-only and always exits 0, `--json` for machine output).
     Parse and merge take a `.parse.lock` on the dataset dir so two writers never corrupt one
     dir. `pipeline` always runs `verify` and prints a JSON summary — including any
     `fetch_error`/`process_errors` — even when a stage failed hard, so a long unattended run

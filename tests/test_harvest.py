@@ -2829,3 +2829,57 @@ def test_fetch_record_targeted_falls_back_and_recurses(tmp_path):
     assert any(r is None for _u, r in sess.requests)     # a whole-file (no-Range) GET happened
     raw = [p.name for p in (tmp_path / "raw").rglob("*") if p.is_file()]
     assert "vasprun.xml" in raw and "OUTCAR" in raw
+
+
+# --------------------------------------------------------------------------------------
+# status: read-only progress aggregator (status.py)
+# --------------------------------------------------------------------------------------
+def test_status_report_counts_and_pct(tmp_path):
+    from zenodo_harvest.status import format_status, status_report
+
+    man = tmp_path / "manifests"; man.mkdir()
+    ds = tmp_path / "dataset"; ds.mkdir()
+    raw = tmp_path / "raw" / "111"; raw.mkdir(parents=True)
+    (raw / "vasprun.xml").write_text("x")                     # 1 file + 2 dirs (raw, 111)
+
+    # discover: candidates_full.jsonl counts; its .hits.jsonl checkpoint must NOT
+    (man / "candidates_full.jsonl").write_text('{"recid":"1"}\n{"recid":"2"}\n')
+    (man / "candidates_full.jsonl.hits.jsonl").write_text('{"a":1}\n{"a":2}\n{"a":3}\n')
+    # triage keep-list = fetch denominator (3)
+    (man / "keep.jsonl").write_text('{"recid":"1"}\n{"recid":"2"}\n{"recid":"3"}\n')
+    # fetch: pipeline writes per-part fetched manifests; sum records + n_calc_units
+    parts = man / "keep.pipeline_parts"; parts.mkdir()
+    (parts / "keep.part-000.fetched.jsonl").write_text('{"recid":"1","n_calc_units":2}\n')
+    (parts / "keep.part-001.fetched.jsonl").write_text('{"recid":"2","n_calc_units":3}\n')
+    # parse: metadata line per calc; frames from quality
+    (ds / "metadata.jsonl").write_text(
+        '{"calc_id":"1::a","quality":{"n_frames":10,"n_frames_with_forces":8}}\n'
+        '{"calc_id":"1::b","quality":{"n_frames":5,"n_frames_with_forces":5}}\n')
+    (ds / "shard-00000.extxyz.gz").write_bytes(b"gz")
+    # rejections: fetch log (manifests) + parse log (dataset)
+    (man / "rejections.jsonl").write_text('{"stage":"fetch","id":"9","reason":"archive_no_vasp"}\n')
+    (ds / "rejections.jsonl").write_text('{"stage":"parse","id":"1::c","reason":"primary_too_large"}\n')
+
+    r = status_report(manifests_dir=man, raw_dir=tmp_path / "raw", dataset_dir=ds,
+                      max_disk_bytes=1000, max_disk_files=10)
+
+    assert r["discover"]["candidates"] == 2                   # .hits.jsonl excluded
+    assert r["triage"]["keep"] == 3
+    assert r["fetch"]["fetched_records"] == 2 and r["fetch"]["calc_units"] == 5
+    assert abs(r["fetch"]["pct"] - (2 / 3 * 100)) < 1e-6
+    assert r["parse"]["calcs_parsed"] == 2 and r["parse"]["frames"] == 15
+    assert abs(r["parse"]["pct"] - (2 / 5 * 100)) < 1e-6      # calcs vs calc_units
+    assert r["store"]["shards"] == 1
+    assert r["staging"]["files"] == 1 and r["staging"]["inodes"] == 2  # 1 file + the 111/ subdir
+    assert r["errors"]["rejections"] == 2
+    assert r["errors"]["by_reason"]["archive_no_vasp"] == 1
+    assert "FETCH" in format_status(r) and "66.7%" in format_status(r)
+
+
+def test_status_report_empty_dirs_no_crash(tmp_path):
+    from zenodo_harvest.status import format_status, status_report
+    r = status_report(manifests_dir=tmp_path / "m", raw_dir=tmp_path / "r",
+                      dataset_dir=tmp_path / "d")
+    assert r["fetch"]["pct"] is None and r["parse"]["pct"] is None   # no div-by-zero
+    assert r["discover"]["candidates"] == 0
+    assert "n/a" in format_status(r)                                 # renders cleanly
