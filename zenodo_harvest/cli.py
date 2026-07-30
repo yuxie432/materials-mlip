@@ -148,7 +148,9 @@ def _add_parse(sub: argparse._SubParsersAction) -> None:
                    help="skip (log 'primary_too_large') any vasprun.xml/vaspout.h5/OUTCAR "
                         "bigger than this; 0 = no cap. pymatgen holds a whole trajectory "
                         "in RAM, so on a batch job one huge output can get the whole job "
-                        "cgroup-killed — set this for long unattended runs, sized to --mem.")
+                        "cgroup-killed — set this for long unattended runs, sized to --mem. "
+                        "Compared against the UNCOMPRESSED size for gzip primaries "
+                        "(.xml.gz/OUTCAR.gz), since RAM tracks that, not the bytes on disk.")
     p.add_argument("--max-records", type=int, default=None)
 
 
@@ -227,8 +229,9 @@ def _add_pipeline(sub: argparse._SubParsersAction) -> None:
                         f"back to a whole download (default {DEFAULT_ZIP_STREAM_MAX_FILES})")
     p.add_argument("--max-primary-bytes", type=int, default=0,
                    help="parse guard: skip any single vasprun.xml/vaspout.h5/OUTCAR larger "
-                        "than this (0 = no cap). Recommended on a batch job so one huge "
-                        "output cannot get the whole job cgroup-killed mid-harvest.")
+                        "than this (0 = no cap; uncompressed size for gzip primaries). "
+                        "Recommended on a batch job so one huge output cannot get the whole "
+                        "job cgroup-killed mid-harvest.")
 
 
 def main(argv: list[str] | None = None) -> int:

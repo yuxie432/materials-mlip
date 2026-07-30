@@ -24,7 +24,8 @@ set -euo pipefail
 
 # ---- ENV SETUP (edit me) --------------------------------------------------------
 export ZENODO_HARVEST_DATA="${ZENODO_HARVEST_DATA:-/rds/user/$USER/hpc-work/zenodo}"
-# module load python/3.11        # or: source ~/miniforge3/bin/activate zenodo-harvest
+# Activate the harvest env BEFORE `sbatch` (sbatch captures your submit env by default):
+#   module load python/3.11.0-icl && source ~/materials-mlip/.venv/bin/activate
 cd "${SLURM_SUBMIT_DIR:-.}"
 # --------------------------------------------------------------------------------
 

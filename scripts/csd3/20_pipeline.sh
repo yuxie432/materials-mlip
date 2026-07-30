@@ -6,16 +6,23 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4              # bought for RAM (~26 GiB), not compute — see MAX_PRIMARY_BYTES
 #SBATCH --time=12:00:00                # SL3 max; SL1/SL2 may use up to 36:00:00
-#SBATCH -o logs/zh-pipeline-%j.out
-#SBATCH -e logs/zh-pipeline-%j.err
+#SBATCH --signal=B:USR1@600            # SIGUSR1 to the batch shell 10 min before wallclock
+#SBATCH -o logs/zh-pipeline-%j.out     #   -> lets RESUBMIT=1 queue a resume job before the
+#SBATCH -e logs/zh-pipeline-%j.err     #      hard SIGKILL (see the run/resubmit block below)
 #
 # Stages 2-4 in ONE overlapped, disk-paced command: fetch(batch i+1) runs while
 # parse+purge(batch i) runs, so the network is never idle during parsing. Ends with
 # `verify` (metadata<->shard bijection + coverage stats).
 #
-# The harvest can outlast one job's wallclock. Everything is resumable, so either
-# re-submit this script by hand, or set RESUBMIT=1 to have it chain a follow-on job
-# automatically:   RESUBMIT=1 sbatch scripts/csd3/20_pipeline.sh
+# The harvest can outlast one job's wallclock (a full run typically needs several 12 h
+# jobs). Everything is resumable, so either re-submit this script by hand, or set
+# RESUBMIT=1 to chain follow-on jobs automatically across wallclock kills:
+#   RESUBMIT=1 sbatch scripts/csd3/20_pipeline.sh
+# RESUBMIT is an ON/OFF switch, NOT a count — MAX_ATTEMPTS (default 8) bounds the number
+# of rounds, so the usual 3-4 rounds need no extra flags. The chain survives the wallclock
+# limit via #SBATCH --signal=B:USR1@600 + a trap (see the run block below), because at the
+# limit SLURM SIGKILLs the job and a resubmit placed only AFTER the pipeline would never
+# run on the very timeout it is meant for.
 #
 # NB: create logs/ BEFORE you submit — SLURM opens the -o/-e paths above before this
 # script body runs, so a missing logs/ makes the job fail to start. From the repo root,
@@ -89,6 +96,30 @@ quota 2>/dev/null || lfs quota -u "$USER" "$ZENODO_HARVEST_DATA" 2>/dev/null \
 # --no-zip-stream to disable, or --zip-stream-max-files N to tune the per-archive request
 # budget. --max-member-bytes below only bounds the whole-download fallback + tar/rar/7z;
 # targeted ZIP members are always wanted VASP files and are bounded solely by the disk valve.
+SUMMARY="logs/zh-pipeline-${SLURM_JOB_ID:-local}.summary.json"
+NEXT_JOBID=""
+submit_successor() {
+    # Queue ONE resume job (idempotent: USR1 may fire more than once, and the exit-code
+    # path below may also call this). --export=ALL,... so the chained job sees the
+    # incremented counter even if the site default for --export is not ALL. Enabled by any
+    # non-zero RESUBMIT (so RESUBMIT=1 AND RESUBMIT=4 both work — the ROUND count is
+    # MAX_ATTEMPTS, not this value); RESUBMIT=0 or unset disables.
+    if [[ "${RESUBMIT:-0}" != "0" && -z "$NEXT_JOBID" && "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]]; then
+        echo "=== queueing resume job (attempt $((ATTEMPT + 1))/$MAX_ATTEMPTS) $(date -Is) ==="
+        NEXT_JOBID=$(sbatch --parsable --dependency="afterany:${SLURM_JOB_ID}" \
+            --export="ALL,ATTEMPT=$((ATTEMPT + 1)),RESUBMIT=1" "$0") || NEXT_JOBID=""
+        echo "  -> successor job: ${NEXT_JOBID:-<sbatch failed; resubmit by hand>}"
+    fi
+}
+# SIGUSR1 arrives ~10 min before wallclock (see #SBATCH --signal=B:USR1@600): queue the
+# successor NOW, then keep harvesting until SLURM hard-kills this job. B: signals only the
+# batch shell, so the pipeline itself is not interrupted; a mid-batch kill loses no data
+# (every stage is resumable + idempotent — the successor continues where this job stopped).
+trap 'submit_successor' USR1
+
+# Run the pipeline in the BACKGROUND: bash defers a trap until the current FOREGROUND
+# command returns, so a foreground pipeline would swallow USR1 until the (too-late) kill.
+# stdout (the JSON summary) -> tee to $SUMMARY + the job .out; stderr (-v logs) -> job .err.
 rc=0
 python -m zenodo_harvest.cli -v pipeline \
     --in "$MAN/keep.jsonl" \
@@ -100,20 +131,37 @@ python -m zenodo_harvest.cli -v pipeline \
     --max-primary-bytes "$MAX_PRIMARY_BYTES" \
     --raw-dir "$ZENODO_HARVEST_DATA/raw" \
     --dataset-dir "$ZENODO_HARVEST_DATA/dataset" \
-    | tee "logs/zh-pipeline-${SLURM_JOB_ID:-local}.summary.json" || rc=$?
+    > >(tee "$SUMMARY") &
+PIPELINE_PID=$!
+# Wait for the pipeline. The USR1 trap interrupts `wait` (which then returns >128 while the
+# child is still alive), so re-wait until it truly exits and rc is its real status (incl.
+# 137/143 if SLURM SIGKILL/SIGTERM the child at the hard limit). Two bash subtleties:
+#   * `wait` must be a PLAIN statement, not a loop/if CONDITION — in a condition a
+#     trap-interrupted re-wait wrongly returns 0 (validated: `if wait` breaks, this works);
+#   * so it must run under `set +e`, since a non-zero `wait` would otherwise abort the job.
+set +e
+while true; do
+    wait "$PIPELINE_PID"; rc=$?
+    # rc<=128: real exit status. rc>128: either the child died from a signal (SIGKILL=137
+    # / SIGTERM=143 at the hard limit) OR `wait` was interrupted by our USR1 trap while the
+    # child runs on — the liveness check tells the two apart.
+    if [[ "$rc" -le 128 ]] || ! kill -0 "$PIPELINE_PID" 2>/dev/null; then break; fi
+done
+set -e
 
 echo "=== pipeline exit=$rc $(date -Is) ==="
 # Staged file count vs the 1M-inode quota on hpc-work (bytes are only half the limit).
 echo "staged files under raw/: $(find "$ZENODO_HARVEST_DATA/raw" -type f 2>/dev/null | wc -l)"
 
-# A non-zero exit means "not finished / something to look at" — the pipeline reports
-# process_errors + verify in its JSON summary. Since every stage is resumable, chain a
-# follow-on job when RESUBMIT=1 (bounded by MAX_ATTEMPTS so a real error cannot spin).
-if [[ "$rc" -ne 0 && "${RESUBMIT:-0}" == "1" && "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]]; then
-    echo "resubmitting (attempt $((ATTEMPT + 1))) to continue the harvest"
-    # Pass the counter explicitly: --export=ALL,... so the chained job sees it even if
-    # the site default for --export is not ALL.
-    sbatch --dependency="afterany:${SLURM_JOB_ID}" \
-           --export="ALL,ATTEMPT=$((ATTEMPT + 1)),RESUBMIT=1" "$0"
+# The USR1 trap covers the wallclock-timeout case. This covers a hard NON-ZERO EXIT before
+# the signal (a caught fetch/parse failure — pipeline reports it in the JSON summary): the
+# harvest is resumable, so chain a follow-on. submit_successor is idempotent, so if the
+# trap already queued one this is a no-op. On a CLEAN finish (rc==0), cancel any successor
+# the trap pre-queued in the last 10 min — the harvest completed inside this job.
+if [[ "$rc" -ne 0 ]]; then
+    submit_successor
+elif [[ -n "$NEXT_JOBID" ]]; then
+    echo "harvest finished cleanly; cancelling pre-queued successor $NEXT_JOBID"
+    scancel "$NEXT_JOBID" 2>/dev/null || true
 fi
 exit "$rc"

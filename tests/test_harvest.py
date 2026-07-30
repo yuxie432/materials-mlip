@@ -711,6 +711,46 @@ def test_download_resume_discards_wrong_bytes_via_checksum(tmp_path):
     assert not part.exists() and not dest.exists()
 
 
+def test_resumed_part_md5_mismatch_refunds_the_baseline_not_just_this_calls_bytes(tmp_path):
+    # Budget accounting for a RESUMED .part that then fails md5. The prior-run .part is
+    # counted in the run's budget BASELINE (fetch()'s startup walk), not in this call's
+    # charges — so deleting it must refund the baseline bytes+inode too, else they leak
+    # from the budget until the next re-baseline (safe-direction but a slow pace-down).
+    dest = tmp_path / "big.zip"
+    part = dest.with_suffix(dest.suffix + ".part")
+    stale = b"bytes-of-some-other-file"       # a superseded version's partial
+    part.write_bytes(stale)
+    # Seed the budget as fetch() would after walking raw_dir: the .part is already staged.
+    budget = fetch_mod.StagingBudget(max_bytes=1 << 30, max_files=1000,
+                                     used_bytes=len(stale), used_files=1)
+    sess = _RangeSession(_RESUME_BLOB)
+    ok, why = download_file(sess, "http://x/big.zip", dest, md5(_RESUME_BLOB).hexdigest(),
+                            budget=budget)
+    assert not ok and why == "md5_mismatch"
+    assert not part.exists() and not dest.exists()
+    # fully reconciled: the baseline bytes+inode AND this call's appended bytes are gone.
+    assert budget.used_bytes == 0 and budget.used_files == 0
+
+
+def test_resumed_part_server_ignores_range_refunds_baseline_bytes_keeps_inode(tmp_path):
+    # 200-to-a-Range-request restart: the .part is truncated and rewritten. The baseline
+    # bytes must be refunded (they're gone), the inode kept (same file), and the budget end
+    # exactly at the rewritten file's size + 1 inode — matching what is really on disk.
+    dest = tmp_path / "big.zip"
+    part = dest.with_suffix(dest.suffix + ".part")
+    stale = b"x" * 4096
+    part.write_bytes(stale)
+    budget = fetch_mod.StagingBudget(max_bytes=1 << 30, max_files=1000,
+                                     used_bytes=len(stale), used_files=1)
+    sess = _RangeSession(_RESUME_BLOB, ignore_range=True)     # answers 200 -> restart
+    ok, why = download_file(sess, "http://x/big.zip", dest, md5(_RESUME_BLOB).hexdigest(),
+                            budget=budget)
+    assert ok and why == "downloaded"
+    assert dest.read_bytes() == _RESUME_BLOB
+    on_disk = dest.stat().st_size
+    assert budget.used_bytes == on_disk and budget.used_files == 1     # tally == reality
+
+
 def test_download_no_resume_without_checksum(tmp_path):
     # With no expected md5 a bad resume would be undetectable, so resume is disabled
     # and the partial is discarded rather than appended to.
@@ -2837,9 +2877,12 @@ def test_fetch_record_targeted_falls_back_and_recurses(tmp_path):
 def test_status_report_counts_and_pct(tmp_path):
     from zenodo_harvest.status import format_status, status_report
 
-    man = tmp_path / "manifests"; man.mkdir()
-    ds = tmp_path / "dataset"; ds.mkdir()
-    raw = tmp_path / "raw" / "111"; raw.mkdir(parents=True)
+    man = tmp_path / "manifests"
+    man.mkdir()
+    ds = tmp_path / "dataset"
+    ds.mkdir()
+    raw = tmp_path / "raw" / "111"
+    raw.mkdir(parents=True)
     (raw / "vasprun.xml").write_text("x")                     # 1 file + 2 dirs (raw, 111)
 
     # discover: candidates_full.jsonl counts; its .hits.jsonl checkpoint must NOT
@@ -2848,7 +2891,8 @@ def test_status_report_counts_and_pct(tmp_path):
     # triage keep-list = fetch denominator (3)
     (man / "keep.jsonl").write_text('{"recid":"1"}\n{"recid":"2"}\n{"recid":"3"}\n')
     # fetch: pipeline writes per-part fetched manifests; sum records + n_calc_units
-    parts = man / "keep.pipeline_parts"; parts.mkdir()
+    parts = man / "keep.pipeline_parts"
+    parts.mkdir()
     (parts / "keep.part-000.fetched.jsonl").write_text('{"recid":"1","n_calc_units":2}\n')
     (parts / "keep.part-001.fetched.jsonl").write_text('{"recid":"2","n_calc_units":3}\n')
     # parse: metadata line per calc; frames from quality

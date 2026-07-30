@@ -165,9 +165,11 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   ~10 × the vasprun.xml/OUTCAR size (measured on CSD3 icelake-himem: a 534 MB file peaks at
   ~5.6 GB), and an over-budget parse is a cgroup SIGKILL — so run this on `icelake-himem` and
   size the cap to the job's RAM (`~0.85 × cpus-per-task × 6.76 GB ÷ 10`, less room for the
-  concurrent fetch; e.g. `--cpus-per-task=4` → ~26 GiB → ~2.0 GB cap). It only skips (logs
-  `primary_too_large`, keeps the staged file) — the calc can be re-parsed later on a
-  bigger-RAM job. Calibrate with `scripts/csd3/csd3_parse_memory.py`.
+  concurrent fetch; e.g. `--cpus-per-task=4` → ~26 GiB → ~2.0 GB cap). The cap is compared
+  against the **uncompressed** size for gzip primaries (`vasprun.xml.gz`/`OUTCAR.gz`, read
+  from the gzip ISIZE trailer), since RAM tracks the decompressed trajectory, not the bytes
+  on disk. It only skips (logs `primary_too_large`, keeps the staged file) — the calc can
+  be re-parsed later on a bigger-RAM job. Calibrate with `scripts/csd3/csd3_parse_memory.py`.
   Parallel parse on the cluster (array-job model): `split` the fetched manifest into N parts,
   run N array tasks each parsing its part into its OWN `--dataset-dir`, then `merge-datasets`
   the per-task dirs into one, `verify` the merged dataset, and `purge-raw` the parsed archives:

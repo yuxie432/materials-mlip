@@ -323,3 +323,33 @@ def test_shard_indexing_is_numeric_not_lexical(tmp_path):
     assert [p.name for p in existing_shard_paths(tmp_path)] == [
         "shard-00002.extxyz.gz", "shard-00010.extxyz.gz"]
     assert next_shard_index(tmp_path) == 11          # one past the highest (10), not 3
+
+
+def test_electronic_converged_none_is_omitted_not_written_as_true(tmp_path):
+    # extxyz round-trip semantics: a bare key (no ``=value``) reads back as ``True``. So an
+    # "unknown" (None) convergence verdict must be OMITTED from atoms.info, never written as
+    # None — otherwise the frame reads back as converged=True (silently mislabelling an
+    # unknown-convergence frame). True/False must survive unchanged. This is the store-layer
+    # invariant parse.py relies on (see parse._frame / parse._parse_outcar_ase); the parse
+    # side is covered by tests/test_parse_integration.py.
+    import numpy as np
+    from ase.io import read as ase_read
+
+    from zenodo_harvest.store import ShardedExtxyzWriter
+    ds = tmp_path / "ds"
+    specs = [("known_true", True), ("known_false", False), ("unknown", None)]
+    with ShardedExtxyzWriter(ds) as xyz:
+        for fid, verdict in specs:
+            a = Atoms("H", positions=[[0, 0, 0]], cell=[10, 10, 10], pbc=True)
+            a.info["frame_id"] = fid
+            a.info["REF_energy"] = -1.0
+            a.arrays["REF_forces"] = np.zeros((1, 3))
+            if verdict is not None:                 # mirror parse: write ONLY when known
+                a.info["electronic_converged"] = verdict
+            xyz.write(a)
+        xyz.flush()
+    back = {a.info["frame_id"]: a for a in
+            ase_read(next(ds.glob("shard-*.extxyz.gz")), index=":", format="extxyz")}
+    assert back["known_true"].info.get("electronic_converged") is True
+    assert back["known_false"].info.get("electronic_converged") is False
+    assert back["unknown"].info.get("electronic_converged") is None   # NOT True

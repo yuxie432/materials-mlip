@@ -9,9 +9,15 @@ calculations fall back to ASE's trajectory reader.
 Electronic convergence is recorded at two granularities. Per frame, the info keys
 ``electronic_converged``/``scf_dE`` carry *that ionic step's OWN* SCF verdict and
 magnitude (vasprun.xml exposes ``electronic_steps`` for every ionic step, so each
-frame is tagged independently — see :func:`_step_scf`). Calc-level ``quality`` keeps
-the FINAL-step verdict under the same keys with pymatgen's ``converged_electronic``
-semantics (unchanged), plus ``n_frames_scf_unconverged``. The run-type/functional,
+frame is tagged independently — see :func:`_step_scf`). ``scf_dE`` is |E[-1] − E[-2]|
+of the ionic step's last two *electronic* steps (``e_0_energy``); calc-level
+``quality.scf_dE`` is the same magnitude for the FINAL ionic step (see
+:func:`_scf_convergence`). Both ``electronic_converged`` and ``scf_dE`` are written to a
+frame ONLY when known: a None value ("unknown" — the OUTCAR/vaspout paths, or a step with
+no electronic trace) would serialise in extxyz as a bare key that ASE reads back as
+``True``, so it is omitted instead → read-back None (correctly "unknown"). Calc-level
+``quality`` keeps the FINAL-step verdict under the same keys with pymatgen's
+``converged_electronic`` semantics (unchanged), plus ``n_frames_scf_unconverged``. The run-type/functional,
 full INCAR + k-points + POTCAR spec, and availability flags for heavy data we don't
 store (charge/spin density, eigenvalues, DOS) are recorded too.
 
@@ -384,10 +390,17 @@ def _frame(structure: Any, energy: float | None, forces: Any, *, calc_id: str,
         "calc_id": calc_id,
         "frame_id": frame_id,
         "ionic_step": ionic_step,
-        # Per-frame (this ionic step's own) SCF verdict/magnitude — key names
-        # unchanged, semantics now per-frame (see _step_scf / module docstring).
-        "electronic_converged": electronic_converged,
     })
+    # Per-frame (this ionic step's OWN) SCF verdict + magnitude — same key names, per-frame
+    # semantics (see _step_scf / module docstring). Both are written ONLY when known: a
+    # None value ("unknown" — e.g. the OUTCAR/vaspout paths, or a step with no electronic
+    # trace) put into atoms.info serialises in extxyz as a BARE key with no value, which
+    # ASE reads back as ``True`` — silently relabelling an unknown-convergence frame as
+    # converged (the exact opposite of "tag, don't silently include"). Omitting it makes
+    # atoms.info.get("electronic_converged") return None on read-back (correctly "unknown"),
+    # matching metadata.jsonl's null. scf_dE was already guarded this way.
+    if electronic_converged is not None:
+        atoms.info["electronic_converged"] = electronic_converged
     if scf_dE is not None:
         atoms.info["scf_dE"] = scf_dE
     return atoms
@@ -533,15 +546,52 @@ def _calc_id(unit: dict, base_meta: dict) -> str:
 _PRIMARY_ROLES_ORDER = ("vasprun", "vaspout", "outcar")
 
 
+def _effective_primary_size(path: str) -> int:
+    """Size to compare against ``--max-primary-bytes``: the UNCOMPRESSED size when it is
+    cheaply known, else the on-disk size.
+
+    pymatgen/ASE decompress a primary in memory, so peak RSS tracks the *uncompressed*
+    size, not the bytes on disk — and fetch stages many primaries still gzip-compressed
+    (``vasprun.xml.gz``/``OUTCAR.gz``; pymatgen and the OUTCAR fallback both read them
+    directly). Guarding on the on-disk size would let a compressed long-AIMD output slip
+    under the cap and still cgroup-kill the job — the exact failure the cap exists to
+    prevent. For a gzip file the uncompressed size is the 4-byte little-endian ISIZE
+    trailer (mod 2**32; exact for < 4 GiB), so use ``max(on_disk, ISIZE)``. A wrap
+    (uncompressed >= 4 GiB) is far over any sane cap, so if a sizeable gzip reports an
+    ISIZE below its own compressed size — impossible without a wrap — treat it as >= 4 GiB.
+    Other codecs (.bz2/.xz/.zst) carry no cheap uncompressed size, so they fall back to the
+    on-disk size (a documented limitation; gzip is by far the common case on Zenodo).
+    Returns 0 if the file is missing/unreadable (the normal parse paths report that).
+    """
+    p = Path(path)
+    try:
+        size = p.stat().st_size
+    except OSError:
+        return 0
+    if p.suffix.lower() == ".gz":
+        try:
+            with p.open("rb") as fh:
+                fh.seek(-4, 2)  # 2 == SEEK_END; ISIZE is the last four bytes of a gzip
+                isize = int.from_bytes(fh.read(4), "little")
+        except OSError:
+            return size
+        if size >= (1 << 29) and isize < size:  # ISIZE wrapped -> uncompressed >= 4 GiB
+            return max(size, 1 << 32)
+        return max(size, isize)
+    return size
+
+
 def _oversized_primaries(unit: dict, max_primary_bytes: int) -> list[str]:
-    """Primary-output roles in ``unit`` whose file exceeds ``max_primary_bytes``.
+    """Primary-output roles in ``unit`` whose (effective) size exceeds ``max_primary_bytes``.
 
     pymatgen holds a run's whole ionic trajectory in memory, so a multi-GB
     ``vasprun.xml``/``OUTCAR`` (fetch stages these deliberately — long AIMD runs are the
     frame-richest data) can need many times its own size in RAM. Under a batch
     scheduler that is not a caught ``MemoryError`` but a cgroup SIGKILL of the whole
     job, losing the fetch progress too. This lets a long unattended run cap what it
-    will attempt (0 = no cap) and log the skip instead.
+    will attempt (0 = no cap) and log the skip instead. Sizing is on the *uncompressed*
+    footprint for gzip primaries (see :func:`_effective_primary_size`), since RAM tracks
+    that, not the compressed bytes on disk.
     """
     if not max_primary_bytes:
         return []
@@ -550,11 +600,8 @@ def _oversized_primaries(unit: dict, max_primary_bytes: int) -> list[str]:
         path = unit.get(role)
         if not path:
             continue
-        try:
-            if Path(path).stat().st_size > max_primary_bytes:
-                over.append(role)
-        except OSError:
-            continue  # missing/unreadable is the existing parse paths' problem, not ours
+        if _effective_primary_size(path) > max_primary_bytes:
+            over.append(role)
     return over
 
 
@@ -723,8 +770,11 @@ def _parse_outcar_ase(outcar_path: str, calc_id: str) -> tuple[list[Atoms], dict
             atoms.info["REF_stress"] = np.asarray(res["stress"], dtype=float)
             n_with_stress += 1
         atoms.info.update({"source": "zenodo", "calc_id": calc_id,
-                           "frame_id": f"{calc_id}#{i}", "ionic_step": i,
-                           "electronic_converged": None})
+                           "frame_id": f"{calc_id}#{i}", "ionic_step": i})
+        # electronic_converged is intentionally NOT written on the OUTCAR path: it is
+        # unknown here (OUTCAR exposes no per-SCF trace). Writing None would serialise as a
+        # bare extxyz key that reads back as True (see _frame); omitting it -> read-back
+        # None ("unknown"), consistent with this calc's quality.electronic_converged = None.
         frames.append(atoms)
     meta = {
         "calc_id": calc_id,
@@ -791,8 +841,11 @@ def parse(
     ``max_primary_bytes`` (0 = no cap) refuses to *attempt* a primary output bigger than
     this, logging a ``primary_too_large`` rejection instead. pymatgen holds a whole ionic
     trajectory in memory, so on a batch scheduler one huge ``vasprun.xml`` can get the
-    job cgroup-killed (taking the fetch progress with it). Set it for long unattended
-    cluster runs, sized against the job's ``--mem``; leave it 0 to attempt everything.
+    job cgroup-killed (taking the fetch progress with it). The size compared is the
+    *uncompressed* one for gzip primaries (``vasprun.xml.gz``/``OUTCAR.gz`` — read from the
+    gzip ISIZE trailer; see :func:`_effective_primary_size`), since RAM tracks that, not
+    the compressed bytes on disk. Set it for long unattended cluster runs, sized against
+    the job's ``--mem``; leave it 0 to attempt everything.
     """
     dataset_dir = Path(dataset_dir)
     raw_dir = Path(raw_dir)

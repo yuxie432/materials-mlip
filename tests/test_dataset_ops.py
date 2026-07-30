@@ -384,6 +384,35 @@ def test_oversized_primaries_flags_only_the_big_ones(tmp_path):
     assert _oversized_primaries(unit, 0) == []            # 0 == guard disabled
 
 
+def test_effective_primary_size_uses_uncompressed_size_for_gzip(tmp_path):
+    # RAM tracks the UNCOMPRESSED trajectory, and fetch stages many primaries still
+    # gzip-compressed (pymatgen/ASE read them directly), so the RAM guard must size on the
+    # uncompressed length (gzip ISIZE trailer), not the bytes on disk — else a compressed
+    # long-AIMD vasprun.xml.gz slips under --max-primary-bytes and still cgroup-kills the job.
+    import gzip
+
+    from zenodo_harvest.parse import _effective_primary_size, _oversized_primaries
+    root = tmp_path / "raw" / "1" / "extracted" / "calc"
+    root.mkdir(parents=True)
+    payload = b"<modeling>\n" + b"  <calculation/>\n" * 300_000    # ~5 MB uncompressed text
+    gz = root / "vasprun.xml.gz"
+    with gzip.open(gz, "wb") as fh:
+        fh.write(payload)
+    on_disk = gz.stat().st_size
+    assert on_disk < len(payload) // 5, "fixture must compress well for a meaningful test"
+    # ISIZE is exact below 4 GiB, so the effective size IS the uncompressed length.
+    assert _effective_primary_size(str(gz)) == len(payload)
+    # a cap between the compressed and uncompressed sizes: on-disk size would NOT flag it
+    # (the old behaviour, an OOM risk), but the uncompressed-aware guard MUST.
+    cap = (on_disk + len(payload)) // 2
+    assert on_disk < cap < len(payload)
+    assert _oversized_primaries({"dir": str(root), "vasprun": str(gz)}, cap) == ["vasprun"]
+    # a plain (uncompressed) primary still guards on its on-disk size
+    plain = root / "OUTCAR"
+    plain.write_bytes(b"y" * 2048)
+    assert _effective_primary_size(str(plain)) == 2048
+
+
 def test_parse_unit_rejects_when_every_primary_is_oversized(tmp_path):
     from zenodo_harvest.manifest import RejectionLogger
     from zenodo_harvest.parse import parse_calc_unit

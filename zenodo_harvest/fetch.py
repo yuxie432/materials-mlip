@@ -320,6 +320,29 @@ def download_file(
     tmp = dest.with_suffix(dest.suffix + ".part")
     # Resuming without a checksum would risk silently appending to unrelated bytes.
     can_resume = resume and expected_md5 is not None
+    # A .part left by a PRIOR run is already counted in this run's budget baseline
+    # (fetch()'s startup walk), NOT in this call's _take charges. Track that contribution
+    # so the paths that DELETE the .part refund it too — otherwise _give_back (which only
+    # knows THIS call's charges) leaks the baseline bytes+inode until the next re-baseline.
+    base_bytes = tmp.stat().st_size if (can_resume and tmp.is_file()) else 0
+    base_inode = 1 if (can_resume and tmp.is_file()) else 0
+
+    def _refund_baseline() -> None:
+        """Refund the prior-run .part's baseline contribution, GLOBAL-only: it was never in
+        this record's ``own`` tally (that resets per record), so a throwaway own keeps the
+        record's own-usage classification exact."""
+        nonlocal base_bytes, base_inode
+        if budget is not None and (base_bytes or base_inode):
+            budget.refund(base_bytes, base_inode, own=[0, 0])
+        base_bytes = base_inode = 0
+
+    def _drop_part() -> None:
+        """Delete the .part and refund everything it held: this call's charges (own-aware,
+        via _give_back) PLUS any prior-run baseline (via _refund_baseline)."""
+        tmp.unlink(missing_ok=True)
+        _give_back()
+        _refund_baseline()
+
     outcome = "downloaded"
     for attempt in range(3):
         have = tmp.stat().st_size if (can_resume and tmp.is_file()) else 0
@@ -343,10 +366,12 @@ def download_file(
                     mode, written = "wb", 0      # fresh (or Range ignored -> restart)
                     if have:
                         logger.info("server ignored Range for %s; restarting download", url)
-                        # Opening "wb" truncates the .part, so the bytes a previous run
-                        # charged for it are about to vanish: hand them back.
-                        if budget is not None:
-                            budget.refund(have, 0)
+                        # Opening "wb" truncates the .part, so the baseline bytes a prior
+                        # run charged are about to vanish: hand them back now (global-only).
+                        # The inode persists (same file, truncated not deleted) -> keep it.
+                        if budget is not None and base_bytes:
+                            budget.refund(base_bytes, 0, own=[0, 0])
+                        base_bytes = 0
                 else:
                     return False, f"http_{r.status_code}"  # incl. http_429 after retries
                 clen = r.headers.get("Content-Length")
@@ -360,16 +385,14 @@ def download_file(
                     for chunk in r.iter_content(1 << 20):
                         if max_bytes and written + len(chunk) > max_bytes:
                             fh.close()
-                            tmp.unlink(missing_ok=True)
-                            _give_back()
+                            _drop_part()
                             return False, "over_size_cap"
                         # Charge what is ABOUT to be written, byte-exactly. Nothing
                         # declared is trusted, so a mis-stated Content-Length or manifest
                         # size cannot put more on disk than the budget accounted for.
                         if not _take(len(chunk)):
                             fh.close()
-                            tmp.unlink(missing_ok=True)
-                            _give_back()
+                            _drop_part()
                             return False, "disk_budget_reached"
                         written += len(chunk)
                         fh.write(chunk)
@@ -378,20 +401,17 @@ def download_file(
             # from these bytes (only a checksum mismatch is allowed to discard them).
             # Kept bytes stay CHARGED — they are still occupying scratch.
             if not can_resume:
-                tmp.unlink(missing_ok=True)
-                _give_back()
+                _drop_part()
             return False, f"download_error:{type(exc).__name__}"
         except OSError as exc:
             # e.g. ENOSPC / EDQUOT (disk, or the CSD3 1M-file quota) while writing the
             # .part on cluster scratch. Treat as a TRANSIENT per-file failure (not a hard
             # crash of the whole run) so a later resume retries it.
-            tmp.unlink(missing_ok=True)
-            _give_back()
+            _drop_part()
             return False, f"write_error:{type(exc).__name__}"
         break  # a non-429 response streamed to completion
     if expected_md5 and _md5(tmp) != expected_md5:
-        tmp.unlink(missing_ok=True)  # wrong/stale bytes: never resume from them again
-        _give_back()
+        _drop_part()  # wrong/stale bytes: never resume from them (refunds baseline too)
         return False, "md5_mismatch"
     tmp.replace(dest)
     return True, outcome
