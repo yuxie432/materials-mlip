@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH -J zh-pipeline
-#SBATCH -A CHANGEME-SL3-CPU            # your account — find it with: mybalance
+# Account is NOT hardcoded (keeps per-machine/per-project accounts out of git). Before sbatch:
+#   export SBATCH_ACCOUNT=<MYGROUP>-SL3-CPU   # find yours with: mybalance; propagates to resubmits
 #SBATCH -p icelake-himem               # 6760 MiB/core: parse (pymatgen) needs the RAM
 #SBATCH --nodes=1
 #SBATCH --ntasks=1

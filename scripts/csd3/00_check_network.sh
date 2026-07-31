@@ -18,7 +18,7 @@
 # FAIL  -> see "Do compute nodes have outbound internet?" in scripts/csd3/README.md.
 set -uo pipefail
 
-ACCOUNT="${ACCOUNT:-CHANGEME-SL3-CPU}"                 # find yours with: mybalance
+ACCOUNT="${ACCOUNT:-${SBATCH_ACCOUNT:-CHANGEME-SL3-CPU}}"  # export SBATCH_ACCOUNT (or ACCOUNT=); mybalance shows yours
 PARTITIONS="${PARTITION:-icelake icelake-himem}"       # both node types the harvest uses
 
 if [[ "$ACCOUNT" == CHANGEME-* ]]; then

@@ -1,8 +1,11 @@
 # Running the harvest on CSD3
 
-Batch templates for the full Zenodo harvest on Cambridge's CSD3. Every script is a
-template: edit the `#SBATCH -A` account (find yours with `mybalance`) and the ENV SETUP
-block, then submit from the repo root.
+Batch templates for the full Zenodo harvest on Cambridge's CSD3. The account is **not**
+hardcoded in the scripts — set it once per session/machine via `export
+SBATCH_ACCOUNT=<MYGROUP>-SL3-CPU` (find yours with `mybalance`), which `sbatch` reads as
+`--account`. Keeping it in the environment (not in a tracked `#SBATCH -A` line) means the
+account never diverges between your local and CSD3 clones and never lands in git. Then edit
+the ENV SETUP block if needed and submit from the repo root.
 
 ```
 scripts/csd3/00_check_network.sh   # ONE-OFF: prove icelake AND icelake-himem nodes reach zenodo.org
@@ -64,6 +67,7 @@ outbound HTTPS to `zenodo.org`. If compute nodes turn out to be firewalled:
 # do NOT `module load` themselves: a failed load would abort the job under `set -e`.)
 module load python/3.11.0-icl && source ~/materials-mlip/.venv/bin/activate
 
+export SBATCH_ACCOUNT=<MYGROUP>-SL3-CPU                       # your account (mybalance); sbatch's --account
 export ZENODO_HARVEST_DATA=/rds/user/$USER/hpc-work/zenodo   # scratch, read at import
 mkdir -p logs                                                # SLURM opens -o/-e before the job runs
 DISC=$(sbatch --parsable scripts/csd3/10_discover.sh)        # ~1-2 h (rate-limited)

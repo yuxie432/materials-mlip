@@ -29,20 +29,31 @@ git clone <this repo> ~/materials-mlip && cd ~/materials-mlip
 module load python/3.11.0-icl
 python -m venv ~/materials-mlip/.venv && source ~/materials-mlip/.venv/bin/activate
 pip install -e '.[parse,archives]'          # parse = pymatgen+ase; archives = py7zr/rarfile/zstandard
-#   NB rarfile also needs an `unrar` or `bsdtar` BINARY on PATH for .rar records — check with
-#   `which bsdtar unrar`; without it .rar records are logged `archive_unsupported` (skipped, not fatal).
+#   `.7z` (py7zr) and `.tar.zst` (zstandard) work immediately — pure-Python, no system binary.
+#   `.rar` is different: `rarfile` is only a WRAPPER that shells out to an external
+#   unrar/unar/bsdtar binary, which pip cannot install and CSD3 does not ship on PATH. `.rar` is
+#   rare in Zenodo VASP data, so skipping it is fine — those records log a NON-FATAL
+#   `archive_unsupported` and can be re-collected later with `fetch --retry-rejected`. To add rar
+#   support (your ~/bin is already on PATH):
+#       conda create -y -p ~/arctools -c conda-forge unar libarchive
+#       ln -s ~/arctools/bin/unar ~/arctools/bin/bsdtar ~/bin/ && hash -r && which unar bsdtar
 printf 'ZENODO_TOKEN=<your token>\n' > .env  # gitignored; raises the file-endpoint request quota
 mkdir -p logs                                # SLURM opens -o/-e BEFORE the job body runs
 ```
 
-Set your account in each script's `#SBATCH -A` line (find it with `mybalance`), or override per
-submit with `sbatch -A MYGROUP-SL3-CPU …`.
+The account is **not** hardcoded in the scripts. Set it via `export
+SBATCH_ACCOUNT=<MYGROUP>-SL3-CPU` (find it with `mybalance`) — `sbatch` reads that as
+`--account`, and it propagates to `20_pipeline.sh`'s RESUBMIT chain. Put it in `~/.bashrc`
+(untracked) to persist, or export it each session (shown below). Keeping it in the environment
+rather than a tracked `#SBATCH -A` line means the account never diverges between your local and
+CSD3 clones and never lands in git.
 
 ## 1. Prove compute nodes can reach Zenodo (the one real unknown)
 
 ```bash
 module load python/3.11.0-icl && source ~/materials-mlip/.venv/bin/activate
-ACCOUNT=MYGROUP-SL3-CPU bash scripts/csd3/00_check_network.sh   # ~1-2 min; probes icelake + himem
+export SBATCH_ACCOUNT=<MYGROUP>-SL3-CPU                         # your account (mybalance)
+bash scripts/csd3/00_check_network.sh                          # ~1-2 min; probes icelake + himem
 ```
 PASS → continue. FAIL → the fetch/discover stages can't run on compute nodes; see the
 "Do compute nodes have outbound internet?" section of `scripts/csd3/README.md` (proxy / login-node
@@ -52,6 +63,7 @@ fallback). **Everything below needs this to pass.**
 
 ```bash
 module load python/3.11.0-icl && source ~/materials-mlip/.venv/bin/activate
+export SBATCH_ACCOUNT=<MYGROUP>-SL3-CPU                                # your account (mybalance)
 export ZENODO_HARVEST_DATA=/rds/user/$USER/hpc-work/zenodo_smoketest   # SEPARATE from any real harvest
 mkdir -p logs
 
@@ -92,10 +104,11 @@ non-interactively. To also see a job survive a hard SLURM kill exactly as the re
 harvest will:
 
 ```bash
-# submit the REAL production pipeline against the smoke keep-list, then kill it mid-run:
-J=$(sbatch --parsable -A MYGROUP-SL3-CPU scripts/csd3/20_pipeline.sh)   # reads $ZENODO_HARVEST_DATA/manifests/keep.jsonl
-sleep 45 && scancel $J                                                   # simulate a wallclock SIGKILL
-sbatch -A MYGROUP-SL3-CPU scripts/csd3/20_pipeline.sh                    # resume: skips done recids, prunes orphans, continues
+# submit the REAL production pipeline against the smoke keep-list, then kill it mid-run
+# (SBATCH_ACCOUNT already exported above):
+J=$(sbatch --parsable scripts/csd3/20_pipeline.sh)   # reads $ZENODO_HARVEST_DATA/manifests/keep.jsonl
+sleep 45 && scancel $J                                # simulate a wallclock SIGKILL
+sbatch scripts/csd3/20_pipeline.sh                    # resume: skips done recids, prunes orphans, continues
 # the resumed run's log shows `skipped_existing` on fetch and `parse resume: N calc(s) already done`.
 ```
 For the real harvest, `RESUBMIT=1 sbatch scripts/csd3/20_pipeline.sh` chains follow-on jobs

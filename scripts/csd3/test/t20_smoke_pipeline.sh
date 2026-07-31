@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH -J zh-t20-pipeline
-#SBATCH -A CHANGEME-SL3-CPU            # your account — find it with: mybalance
+# Account is NOT hardcoded (keeps per-machine/per-project accounts out of git). Before sbatch:
+#   export SBATCH_ACCOUNT=<MYGROUP>-SL3-CPU   # find yours with: mybalance; propagates to resubmits
 #SBATCH -p icelake                     # small parse needs little RAM; icelake schedules fast.
 #SBATCH --nodes=1                      #   switch to icelake-himem to also exercise the prod partition.
 #SBATCH --ntasks=1
