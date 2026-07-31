@@ -11,6 +11,8 @@
 #SBATCH --array=0-15                   # must match the --parts used by `split`
 #SBATCH -o logs/zh-parse-%A_%a.out
 #SBATCH -e logs/zh-parse-%A_%a.err
+#SBATCH --mail-type=END,FAIL           # ONE email for the whole array (no ARRAY_TASKS modifier -> not
+#   per-task; adding ARRAY_TASKS would email once PER task). SBATCH_MAIL_USER overrides the address.
 #
 # OPTIONAL many-core parse: parse is CPU-bound and embarrassingly parallel, so a big
 # already-fetched manifest parses far faster as an array job than inside `pipeline`.

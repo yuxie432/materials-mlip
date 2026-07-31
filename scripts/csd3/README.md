@@ -7,6 +7,12 @@ SBATCH_ACCOUNT=<MYGROUP>-SL3-CPU` (find yours with `mybalance`), which `sbatch` 
 account never diverges between your local and CSD3 clones and never lands in git. Then edit
 the ENV SETUP block if needed and submit from the repo root.
 
+Every batch script carries `#SBATCH --mail-type=END,FAIL`, so SLURM emails you when a job
+ends or fails. The address defaults to your registered CSD3 address; to send it elsewhere,
+`export SBATCH_MAIL_USER=you@example.com` before submitting — like `SBATCH_ACCOUNT`, it is an
+env var (kept out of git) that `sbatch` reads and `--export=ALL` carries through the RESUBMIT
+chain. Comment the directive out in a script to silence that job.
+
 ```
 scripts/csd3/00_check_network.sh   # ONE-OFF: prove icelake AND icelake-himem nodes reach zenodo.org
 scripts/csd3/csd3_download_speed.py# ONE-OFF: measure compute-node download throughput (fetch-time estimate)
@@ -68,6 +74,7 @@ outbound HTTPS to `zenodo.org`. If compute nodes turn out to be firewalled:
 module load python/3.11.0-icl && source ~/materials-mlip/.venv/bin/activate
 
 export SBATCH_ACCOUNT=<MYGROUP>-SL3-CPU                       # your account (mybalance); sbatch's --account
+export SBATCH_MAIL_USER=you@example.com                      # OPTIONAL: END/FAIL emails; omit -> default CSD3 address
 export ZENODO_HARVEST_DATA=/rds/user/$USER/hpc-work/zenodo   # scratch, read at import
 mkdir -p logs                                                # SLURM opens -o/-e before the job runs
 DISC=$(sbatch --parsable scripts/csd3/10_discover.sh)        # ~1-2 h (rate-limited)

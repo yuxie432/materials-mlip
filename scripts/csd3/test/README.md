@@ -48,6 +48,10 @@ SBATCH_ACCOUNT=<MYGROUP>-SL3-CPU` (find it with `mybalance`) — `sbatch` reads 
 rather than a tracked `#SBATCH -A` line means the account never diverges between your local and
 CSD3 clones and never lands in git.
 
+Every smoke-test job carries `#SBATCH --mail-type=END,FAIL`, so you get an email as each one
+ends or fails. The address defaults to your CSD3 address; override it (kept out of git, like
+the account) with `export SBATCH_MAIL_USER=you@example.com` before submitting.
+
 ## 1. Prove compute nodes can reach Zenodo (the one real unknown)
 
 ```bash
@@ -64,6 +68,7 @@ fallback). **Everything below needs this to pass.**
 ```bash
 module load python/3.11.0-icl && source ~/materials-mlip/.venv/bin/activate
 export SBATCH_ACCOUNT=<MYGROUP>-SL3-CPU                                # your account (mybalance)
+export SBATCH_MAIL_USER=you@example.com                               # OPTIONAL: END/FAIL emails (else default addr)
 export ZENODO_HARVEST_DATA=/rds/user/$USER/hpc-work/zenodo_smoketest   # SEPARATE from any real harvest
 mkdir -p logs
 

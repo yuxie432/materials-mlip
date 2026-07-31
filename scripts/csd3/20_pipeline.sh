@@ -10,6 +10,8 @@
 #SBATCH --signal=B:USR1@600            # SIGUSR1 to the batch shell 10 min before wallclock
 #SBATCH -o logs/zh-pipeline-%j.out     #   -> lets RESUBMIT=1 queue a resume job before the
 #SBATCH -e logs/zh-pipeline-%j.err     #      hard SIGKILL (see the run/resubmit block below)
+#SBATCH --mail-type=END,FAIL           # email on job END/FAIL; SBATCH_MAIL_USER overrides the address.
+#   The RESUBMIT chain re-runs $0 (this file), so you get one END/FAIL email PER round (<= MAX_ATTEMPTS).
 #
 # Stages 2-4 in ONE overlapped, disk-paced command: fetch(batch i+1) runs while
 # parse+purge(batch i) runs, so the network is never idle during parsing. Ends with

@@ -9,6 +9,7 @@
 #SBATCH --time=00:40:00
 #SBATCH -o logs/zh-t25-safety-%j.out
 #SBATCH -e logs/zh-t25-safety-%j.err
+#SBATCH --mail-type=END,FAIL           # email on job END/FAIL; SBATCH_MAIL_USER overrides the address
 #
 # SMOKE TEST for the SAFETY MEASURES + RESUMABILITY. Runs smoke_safety.py, which drives the
 # real fetch/parse/purge/verify functions on the tiny keep-list with valve limits sized

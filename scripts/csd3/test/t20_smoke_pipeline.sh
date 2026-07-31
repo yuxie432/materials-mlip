@@ -9,6 +9,7 @@
 #SBATCH --time=00:40:00
 #SBATCH -o logs/zh-t20-pipeline-%j.out
 #SBATCH -e logs/zh-t20-pipeline-%j.err
+#SBATCH --mail-type=END,FAIL           # email on job END/FAIL; SBATCH_MAIL_USER overrides the address
 #
 # SMOKE TEST stages 2-4 HAPPY PATH: run the REAL `pipeline` command (overlapped fetch ||
 # parse+purge, then verify) on the tiny keep-list, with PRODUCTION-sized limits so nothing

@@ -9,6 +9,7 @@
 #SBATCH --time=01:00:00                # small discover (~1 min) + triage peeks (429-backoff -> a few min)
 #SBATCH -o logs/zh-t10-discover-%j.out
 #SBATCH -e logs/zh-t10-discover-%j.err
+#SBATCH --mail-type=END,FAIL           # email on job END/FAIL; SBATCH_MAIL_USER overrides the address
 #
 # SMOKE TEST stage 0-1: a SMALL, real discover + triage -> a tiny keep-list for the rest of
 # the smoke test. Unlike the production 10_discover.sh this is NOT --exhaustive and is capped

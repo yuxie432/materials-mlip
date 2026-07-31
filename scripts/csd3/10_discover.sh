@@ -9,6 +9,7 @@
 #SBATCH --time=12:00:00                # SL3 max; SL1/SL2 may use up to 36:00:00
 #SBATCH -o logs/zh-discover-%j.out
 #SBATCH -e logs/zh-discover-%j.err
+#SBATCH --mail-type=END,FAIL           # email on job END/FAIL; SBATCH_MAIL_USER overrides the address
 #
 # Stage 0-1: exhaustive discovery + triage -> a keep-list for the fetch pipeline.
 # Needs outbound HTTPS (see 00_check_network.sh). Both stages are single-stream by

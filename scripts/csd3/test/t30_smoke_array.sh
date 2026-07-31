@@ -9,6 +9,7 @@
 #SBATCH --time=00:40:00
 #SBATCH -o logs/zh-t30-array-%j.out
 #SBATCH -e logs/zh-t30-array-%j.err
+#SBATCH --mail-type=END,FAIL           # email on job END/FAIL; SBATCH_MAIL_USER overrides the address
 #
 # SMOKE TEST for the ARRAY-JOB dataset path (split -> per-task parse -> merge-datasets ->
 # verify -> purge-raw), plus merge RESUME idempotency. For the smoke test the N per-task

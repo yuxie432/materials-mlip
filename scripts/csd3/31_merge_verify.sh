@@ -10,6 +10,7 @@
 #SBATCH --time=12:00:00
 #SBATCH -o logs/zh-merge-%j.out
 #SBATCH -e logs/zh-merge-%j.err
+#SBATCH --mail-type=END,FAIL           # email on job END/FAIL; SBATCH_MAIL_USER overrides the address
 #
 # Tail of the array-parse flow: fold the per-task dataset dirs into one, verify the
 # metadata<->shard integrity, then reclaim scratch. Run after 30_parse_array.sh:
