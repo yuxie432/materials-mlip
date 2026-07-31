@@ -2920,6 +2920,35 @@ def test_status_report_counts_and_pct(tmp_path):
     assert "FETCH" in format_status(r) and "66.7%" in format_status(r)
 
 
+def test_status_fetch_dedupes_recids_across_overlapping_manifests(tmp_path):
+    # When fetched manifests from more than one flow coexist under the manifests tree (a
+    # leftover --parts-dir, or the array flow's fetched.jsonl beside the pipeline's part
+    # sidecars), the SAME recid appears in two files. status must count DISTINCT recids, not
+    # sum lines, or FETCH over-counts (the observed >100% figure). Regression for finding #5.
+    from zenodo_harvest.status import status_report
+
+    man = tmp_path / "manifests"
+    (man / "keep.pipeline_parts").mkdir(parents=True)
+    (man / "keep2_parts").mkdir()
+    (man / "keep.jsonl").write_text('{"recid":"1"}\n{"recid":"2"}\n{"recid":"3"}\n')
+    # run A (parts dir 1): recids 1,2
+    (man / "keep.pipeline_parts" / "keep.part-000.fetched.jsonl").write_text(
+        '{"recid":"1","n_calc_units":2}\n')
+    (man / "keep.pipeline_parts" / "keep.part-001.fetched.jsonl").write_text(
+        '{"recid":"2","n_calc_units":3}\n')
+    # run B (parts dir 2): recids 1,2 AGAIN (overlap) + a new recid 3
+    (man / "keep2_parts" / "keep.part-000.fetched.jsonl").write_text(
+        '{"recid":"1","n_calc_units":2}\n{"recid":"3","n_calc_units":4}\n')
+    (man / "keep2_parts" / "keep.part-001.fetched.jsonl").write_text(
+        '{"recid":"2","n_calc_units":3}\n')
+
+    r = status_report(manifests_dir=man, raw_dir=tmp_path / "raw", dataset_dir=tmp_path / "d")
+    # 3 DISTINCT recids (1,2,3), not 6 lines; calc_units summed once per recid = 2+3+4 = 9.
+    assert r["fetch"]["fetched_records"] == 3
+    assert r["fetch"]["calc_units"] == 9
+    assert r["fetch"]["pct"] == 100.0                                # 3/3, not 200%
+
+
 def test_status_report_empty_dirs_no_crash(tmp_path):
     from zenodo_harvest.status import format_status, status_report
     r = status_report(manifests_dir=tmp_path / "m", raw_dir=tmp_path / "r",

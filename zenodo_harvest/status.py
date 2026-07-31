@@ -89,11 +89,22 @@ def status_report(
     keep = Path(keep_path) if keep_path else manifests_dir / "keep.jsonl"
     n_keep = _count_nonempty_lines(keep)
 
-    # FETCH — sum across every *.fetched.jsonl (pipeline writes one per part; a standalone
-    # `fetch` writes a single manifests/fetched.jsonl). rglob covers both.
+    # FETCH — aggregate across every *.fetched.jsonl (pipeline writes one per part; a
+    # standalone `fetch` writes a single manifests/fetched.jsonl). rglob covers both.
+    # DEDUPE BY recid: within one harvest the part sidecars hold DISJOINT recids (round-robin
+    # split), so deduping == summing; but if fetched manifests from more than one flow coexist
+    # under the tree (e.g. a leftover `--parts-dir`, or the array flow's fetched.jsonl beside
+    # the pipeline's part sidecars), the SAME recid appears twice and a naive sum over-counts
+    # (observed as a >100% FETCH figure). Counting distinct recids is correct in both cases.
     n_fetched = n_calc_units = 0
+    seen_recids: set[str] = set()
     for p in sorted(manifests_dir.rglob("*.fetched.jsonl")):
         for rec in read_jsonl(p):
+            recid = rec.get("recid")
+            if recid and recid in seen_recids:
+                continue  # same record already counted from another fetched manifest
+            if recid:
+                seen_recids.add(recid)
             n_fetched += 1
             n_calc_units += int(rec.get("n_calc_units", 0) or 0)
 

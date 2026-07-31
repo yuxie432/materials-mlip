@@ -260,10 +260,11 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
     pace it with `--max-disk-files` (measured: the inode limit binds before the byte one).
     `/home` is 50 GB (code only).
   - Login nodes are capped at ~4 CPUs per user — fine for a smoke test, not the real fetch.
-  - **Open question: the docs do not say whether compute nodes have outbound internet
-    access**, which the fetch stage requires. Verify with `scripts/csd3/00_check_network.sh`
-    before submitting; if they are firewalled, use a proxy (`https_proxy`, honoured by
-    `requests`) or run only `fetch` on a login node.
+  - **Compute nodes have outbound internet — VERIFIED 2026-07-31** (`00_check_network.sh`
+    PASSed on both `icelake` and `icelake-himem`), so the fetch stage runs in batch as
+    designed; no proxy / login-node fallback is needed. (Re-run the probe if the account or
+    site network policy changes; if a future node type is ever firewalled, set `https_proxy`
+    — honoured by `requests` — or run only `fetch` on a login node.)
 - Most work is Python + terminal based. Core libraries: `pymatgen`, `ase`, `mp-api`, and (for training)
   MACE or similar MLIP architectures.
 - Toolchain (declared in `pyproject.toml` `[dev]`): **pytest** (tests), **mypy** (types), **ruff** (lint).

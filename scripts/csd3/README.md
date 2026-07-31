@@ -29,9 +29,12 @@ Sources: [Quick Start](https://docs.hpc.cam.ac.uk/hpc/user-guide/quickstart.html
 
 ## Do compute nodes have outbound internet?
 
-**The CSD3 documentation does not state this either way, so verify it before submitting
-the fetch** — run `scripts/csd3/00_check_network.sh` (a ~1-2 minute interactive job).
-Activate the harvest env first (so `requests` imports and `srun` propagates it):
+**Verified YES on 2026-07-31** — `scripts/csd3/00_check_network.sh` PASSed on both
+`icelake` and `icelake-himem`, so the fetch stage runs in batch as designed and no proxy /
+login-node fallback is needed. The CSD3 docs still don't state it, so the probe below is
+kept for re-verifying if the account or site network policy ever changes. To re-run it
+(a ~1-2 minute interactive job), activate the harvest env first (so `requests` imports and
+`srun` propagates it):
 
 ```bash
 module load python/3.11.0-icl && source ~/materials-mlip/.venv/bin/activate
