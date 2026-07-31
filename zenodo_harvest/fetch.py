@@ -499,7 +499,7 @@ def _want_member(base: str) -> bool:
     (see :func:`_is_junk_member`)."""
     if _is_junk_member(base):
         return False
-    return bool(_PARSE_RE.search(base)) or _is_archive(base) is not None
+    return bool(_PARSE_RE.search(base)) or _nested_archive_kind(base) is not None
 
 
 def _member_cap_for(base: str, member_cap: int) -> int:
@@ -507,7 +507,7 @@ def _member_cap_for(base: str, member_cap: int) -> int:
     so the decompression-bomb cap does not apply to it (its own inner members are capped
     when it is recursively extracted); only the disk budget bounds it. A plain VASP file
     keeps the ``member_cap`` guard."""
-    return (1 << 62) if _is_archive(base) is not None else member_cap
+    return (1 << 62) if _nested_archive_kind(base) is not None else member_cap
 
 
 def _extract_zip(path: Path, dest: Path, member_cap: int,
@@ -581,7 +581,7 @@ def _fetch_zip_targeted(url: str, dest: Path, session: requests.Session,
     # enumeration, so targeted fetch cannot see the VASP files within it. Fall back to a
     # whole-archive download, which the recursion path (_recurse_nested_archives) then
     # unpacks. This also keeps the "proven no VASP" shortcut below sound.
-    if any(_is_archive(n.rsplit("/", 1)[-1]) is not None
+    if any(_nested_archive_kind(n.rsplit("/", 1)[-1]) is not None
            and not _is_junk_member(n) for n in names):
         return None
     targets = [e for e in entries
@@ -984,6 +984,34 @@ def _is_archive(name: str) -> str | None:
     return None
 
 
+def _nested_archive_kind(name: str) -> str | None:
+    """Archive kind for a file *inside* an archive — like :func:`_is_archive` but WITHOUT
+    the bare single-compression (``.gz``/``.bz2``/``.xz``/bare-``.zst``)-as-tar heuristic.
+
+    That heuristic is right for a record's TOP-LEVEL file (an uploader who dropped the
+    ``.tar`` off ``research_data.gz``), but wrong for a MEMBER, where a bare-compressed name
+    is virtually always a single compressed data file (``parameters.csv.bz2``,
+    ``band_data.json.gz``) rather than a misnamed tarball. Treating those as tars makes
+    every one fail ``tarfile.open`` and emit an ``extract_error`` — recid 15307432 shipped a
+    ``.tgz`` of ~158k ``parameters.csv.bz2`` and produced 158k such rejections that stalled
+    the pipeline for hours. Genuine nested archives (``.zip``, real ``.tar*``, ``.rar``,
+    ``.7z``, ``.tar.zst``) are still recognised (and recursed into); a compressed VASP
+    primary like ``OUTCAR.gz`` is matched by :data:`_PARSE_RE`, not here, so it is still
+    extracted as a VASP file rather than skipped."""
+    low = name.lower()
+    if low.endswith(".zip"):
+        return "zip"
+    if low.endswith(_TAR_SUFFIXES):
+        return "tar"
+    if low.endswith(".rar"):
+        return "rar"
+    if low.endswith(".7z"):
+        return "sevenzip"
+    if low.endswith(_ZST_TAR_SUFFIXES):
+        return "tarzst"
+    return None
+
+
 def _archive_subdir(base: str) -> str:
     """A filesystem-safe per-archive extraction subdir (avoids cross-archive
     member-path collisions when one record ships multiple archives)."""
@@ -1004,6 +1032,12 @@ def _archive_subdir(base: str) -> str:
 # types, run AFTER download (mentor/user 2026-07-29). A depth cap guards an archive-quine.
 _MAX_NEST_DEPTH = 8
 _NESTED_SUFFIX = "__extracted"
+# Hard cap on nested extract FAILURES a single record may log before it is abandoned. A
+# pathological record can otherwise emit tens of thousands of extract_error rejections and
+# grind for hours (recid 15307432 produced ~158k). The bare-compressed-member fix removes
+# the common cause; this bounds any residual/future flood. Only failures are counted, so a
+# healthy record with many good nested archives is never affected.
+_MAX_NESTED_EXTRACT_ERRORS = 1000
 
 
 def _missing_backend(kind: str | None) -> bool:
@@ -1027,6 +1061,7 @@ def _delete_refund(path: Path, budget: "StagingBudget | None") -> None:
 def _recurse_nested_archives(
     root: Path, member_cap: int, budget: "StagingBudget | None",
     rej: RejectionLogger, id_prefix: str, depth: int = 1,
+    err_budget: list[int] | None = None,
 ) -> tuple[list[str], list[str], bool]:
     """Extract any archive files staged under ``root``, recursively.
 
@@ -1036,10 +1071,18 @@ def _recurse_nested_archives(
     extracted into a sibling ``<name>__extracted`` dir and then deleted+refunded — the
     persistent footprint is its extracted VASP files, not the sub-archive. Raises
     :class:`BudgetExceeded` for a whole-record rollback, exactly like the extractors.
+
+    ``err_budget`` (a shared 1-element list) caps how many nested *extract failures* one
+    record may log before it is abandoned with a single ``nested_extract_errors_capped``
+    rejection — a hard backstop against a per-record flood.
     """
     extra_names: list[str] = []
     extra_vasp: list[str] = []
     transient = False
+    # Per-RECORD budget of nested extract FAILURES, shared across the recursion via a
+    # 1-element list (see _MAX_NESTED_EXTRACT_ERRORS).
+    if err_budget is None:
+        err_budget = [_MAX_NESTED_EXTRACT_ERRORS]
     if depth > _MAX_NEST_DEPTH:
         rej.reject("fetch", id_prefix, "archive_nesting_too_deep",
                    detail=f"stopped at depth {_MAX_NEST_DEPTH}")
@@ -1047,11 +1090,13 @@ def _recurse_nested_archives(
     # Snapshot eagerly: extraction below creates new dirs, which the recursive call (scoped
     # to each new dir) handles — so a freshly-written sub-archive is never re-processed here.
     nested = sorted(p for p in root.rglob("*")
-                    if p.is_file() and _is_archive(p.name) is not None
+                    if p.is_file() and _nested_archive_kind(p.name) is not None
                     and not _is_junk_member(p.name))
     for arc in nested:
+        if err_budget[0] <= 0:
+            break                       # this record already flooded; stop grinding it
         base = arc.name
-        kind = _is_archive(base)
+        kind = _nested_archive_kind(base)
         if kind is None:            # unreachable (nested is filtered), but narrows for mypy
             continue
         nid = f"{id_prefix}/{arc.relative_to(root).as_posix()}"
@@ -1069,16 +1114,24 @@ def _recurse_nested_archives(
         try:
             names, extracted = _EXTRACTORS[kind](arc, out_dir, member_cap, budget)
         except _EXTRACT_ERRORS as exc:
-            rej.reject("fetch", nid, "extract_error", detail=f"{type(exc).__name__}: {exc}")
+            err_budget[0] -= 1
+            if err_budget[0] <= 0:
+                rej.reject("fetch", id_prefix, "nested_extract_errors_capped",
+                           detail=(f"stopped after {_MAX_NESTED_EXTRACT_ERRORS} nested "
+                                   "extract failures under this record"))
+            else:
+                rej.reject("fetch", nid, "extract_error",
+                           detail=f"{type(exc).__name__}: {exc}")
             if isinstance(exc, OSError) and exc.errno in _OUT_OF_SPACE_ERRNOS:
                 transient = True
             _delete_refund(arc, budget)
             continue
         _delete_refund(arc, budget)   # its members are out now; drop the sub-archive
         extra_names.extend(names)
-        extra_vasp.extend(n for n in extracted if _is_archive(n.rsplit("/", 1)[-1]) is None)
+        extra_vasp.extend(n for n in extracted
+                          if _nested_archive_kind(n.rsplit("/", 1)[-1]) is None)
         sub_names, sub_vasp, sub_tr = _recurse_nested_archives(
-            out_dir, member_cap, budget, rej, nid, depth + 1)
+            out_dir, member_cap, budget, rej, nid, depth + 1, err_budget)
         extra_names.extend(sub_names)
         extra_vasp.extend(sub_vasp)
         transient = transient or sub_tr
@@ -1440,7 +1493,7 @@ def _stage_record_files(
             # A nested-archive member is a container, not a VASP file — exclude it from the
             # "did we get VASP?" verdict; its extracted contents (sub_vasp) are what count.
             vasp_extracted = [n for n in extracted
-                              if _is_archive(n.rsplit("/", 1)[-1]) is None] + sub_vasp
+                              if _nested_archive_kind(n.rsplit("/", 1)[-1]) is None] + sub_vasp
             info = _safe_members(names + sub_names)   # availability across all nesting levels
             for k, v in info["availability"].items():
                 availability[k] = availability[k] or v
