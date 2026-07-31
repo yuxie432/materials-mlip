@@ -123,7 +123,12 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
     quota**, and a **rejection-reason histogram**. No network, no lock — safe to run (or
     `watch`) *while* a fetch/pipeline job is writing the same files.
   - `dataset_ops.py` — array-job glue (stages over dataset dirs, not the network):
-    - `split` — round-robin a manifest into `<stem>.part-NNN.jsonl` parts, one per array task.
+    - `split` — split a manifest into `<stem>.part-NNN.jsonl` parts, one per array task.
+      `--weight-by records` (default) round-robins (balances record count); `--weight-by
+      calcs` LPT-bin-packs by each record's `n_calc_units` so per-task *parse cost* is
+      balanced (fixes the array-parse imbalance when records vary a lot in calc-unit count;
+      it cannot split one record across parts, and degrades to count-balancing on a
+      keep-list, which has no calc counts yet).
     - `merge-datasets` — fold per-task dataset dirs into one (rename+renumber shards, never
       recompressing them; rewrite each metadata record's `shards`; refuse locked/duplicate
       sources; post-verify the merged join).

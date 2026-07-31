@@ -2956,3 +2956,48 @@ def test_status_report_empty_dirs_no_crash(tmp_path):
     assert r["fetch"]["pct"] is None and r["parse"]["pct"] is None   # no div-by-zero
     assert r["discover"]["candidates"] == 0
     assert "n/a" in format_status(r)                                 # renders cleanly
+
+
+def test_split_manifest_weighted_balances_calc_cost(tmp_path):
+    # One calc-heavy record among many light ones: round-robin by RECORD piles the
+    # parse cost onto whichever part the heavy record lands in, LPT by calc-unit count
+    # evens it out. Regression for the array-parse wallclock imbalance (t30 put 177 of
+    # 189 calcs into one part). dataset_ops -> store -> ase, so skip without ase.
+    pytest.importorskip("ase")
+    from zenodo_harvest.dataset_ops import split_manifest
+
+    recs = [{"recid": "r0", "n_calc_units": 10}] + \
+           [{"recid": f"r{i}", "n_calc_units": 1} for i in range(1, 8)]
+    src = tmp_path / "fetched.jsonl"
+    src.write_text("".join(json.dumps(r) + "\n" for r in recs))
+
+    def run(weight_by):
+        info = split_manifest(src, 2, tmp_path / f"parts_{weight_by}", weight_by=weight_by)
+        return info, [pw["weight"] for pw in info["parts_written"]]
+
+    rr_info, rr_w = run("records")
+    lpt_info, lpt_w = run("calcs")
+
+    assert rr_info["lines_total"] == 8 and lpt_info["lines_total"] == 8   # nothing lost
+    assert sum(rr_w) == sum(lpt_w) == 17                          # 10 + 7*1 either way
+    assert max(rr_w) == 13         # round-robin: r0,r2,r4,r6 in part0 -> 10+1+1+1
+    assert max(lpt_w) == 10        # LPT: the seven light records go on the light part -> 10 vs 7
+    assert max(lpt_w) < max(rr_w)  # strictly better balance
+
+    # deterministic: same input -> identical assignment (a resumed array re-derives it)
+    again = split_manifest(src, 2, tmp_path / "parts_again", weight_by="calcs")
+    assert [pw["weight"] for pw in again["parts_written"]] == lpt_w
+
+
+def test_split_manifest_calcs_degrades_to_count_on_keeplist(tmp_path):
+    # A keep-list has no calc-unit counts, so every _split_weight is 1 and 'calcs' must
+    # balance by COUNT exactly like 'records' (within one line) — no crash, no dead knob.
+    pytest.importorskip("ase")
+    from zenodo_harvest.dataset_ops import split_manifest
+
+    src = tmp_path / "keep.jsonl"
+    src.write_text("".join(json.dumps({"recid": str(i)}) + "\n" for i in range(7)))
+    info = split_manifest(src, 3, tmp_path / "parts", weight_by="calcs")
+    assert info["lines_total"] == 7
+    assert sorted(pw["lines"] for pw in info["parts_written"]) == [2, 2, 3]
+    assert all(pw["weight"] == pw["lines"] for pw in info["parts_written"])

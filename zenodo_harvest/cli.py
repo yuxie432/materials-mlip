@@ -159,6 +159,11 @@ def _add_split(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--in", dest="in_path", required=True, help="manifest JSONL to split")
     p.add_argument("--parts", type=int, required=True, help="number of parts (array size)")
     p.add_argument("--out-dir", required=True, help="dir for <stem>.part-NNN.jsonl files")
+    p.add_argument("--weight-by", choices=["records", "calcs"], default="records",
+                   help="balance parts by record COUNT (default, round-robin) or by "
+                        "calc-unit count ('calcs': LPT bin-packing, evens out per-task "
+                        "parse cost when records vary a lot; needs a fetched manifest — "
+                        "a keep-list has no calc counts, so it degrades to 'records')")
 
 
 def _add_merge(sub: argparse._SubParsersAction) -> None:
@@ -309,7 +314,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
     elif args.cmd == "split":
-        summary = split_manifest(args.in_path, args.parts, args.out_dir)
+        summary = split_manifest(args.in_path, args.parts, args.out_dir,
+                                 weight_by=args.weight_by)
     elif args.cmd == "merge-datasets":
         try:
             summary = merge_datasets(args.into, args.sources)

@@ -21,6 +21,7 @@ decided what to write.
 from __future__ import annotations
 
 import errno
+import heapq
 import json
 import logging
 import os
@@ -87,29 +88,91 @@ def _move_shard(src_path: Path, dst_path: Path) -> None:
 # split — round-robin a manifest into N parts (one per array task)            #
 # --------------------------------------------------------------------------- #
 
-def split_manifest(in_path: str | Path, parts: int, out_dir: str | Path) -> dict:
-    """Round-robin the JSONL lines of ``in_path`` into ``parts`` sibling manifests.
+def _split_weight(rec: dict) -> int:
+    """Parse-cost proxy for one fetched record: its calc-unit count (>= 1).
+
+    A record's calc-units all parse together in one array task, so their *count* is
+    a far better balance weight than 1-per-record — record count says nothing about
+    how much pymatgen/ASE work a part holds. Reads the top-level ``n_calc_units``
+    that :func:`fetch._fetched_entry` writes, falling back to ``len(calc_units)``,
+    then to 1 (a keep-list record, or one with no counted units, still costs one
+    line/parse attempt). So on a ``keep.jsonl`` — which has no calc-unit counts yet —
+    every weight is 1 and calc-weighting degrades cleanly to count-balancing.
+    """
+    n = rec.get("n_calc_units")
+    if n is None:
+        n = len(rec.get("calc_units") or [])
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        n = 0
+    return n if n > 0 else 1
+
+
+def split_manifest(in_path: str | Path, parts: int, out_dir: str | Path,
+                   weight_by: str = "records") -> dict:
+    """Split the JSONL lines of ``in_path`` into ``parts`` sibling manifests.
 
     Output names are ``<stem>.part-000.jsonl`` … ``part-<N-1>.jsonl`` (index
     zero-padded to width 3). Reads via :func:`read_jsonl`, so a crash-torn final
     line in the source manifest is dropped cleanly rather than aborting the split.
-    Round-robin (line ``i`` -> part ``i % parts``) keeps the parts within one line
-    of each other so the array tasks are evenly loaded.
+
+    ``weight_by`` chooses how the lines are balanced across parts:
+
+    * ``"records"`` (default) — round-robin (line ``i`` -> part ``i % parts``), which
+      keeps the parts within one *line* of each other. Streams, so memory is O(1) in
+      the manifest size. Balances record COUNT.
+    * ``"calcs"`` — greedy longest-processing-time bin-packing by each record's
+      :func:`_split_weight` (its calc-unit count), so parse COST is balanced rather
+      than record count. This is what evens out array-task wallclock when records vary
+      a lot in calc-unit count (a round-robin split can pile the calc-heavy records
+      into one part). It materialises the manifest to sort by weight (metadata only —
+      small); ``read_jsonl`` still drops a torn final line. It cannot split a *single*
+      record across parts, so one record that alone holds most of the calc-units still
+      lands whole in one part. On a manifest with no calc-unit counts (a keep-list)
+      every weight is 1, so this degrades to the same count-balancing as ``"records"``.
+
+    The assignment is fully deterministic (stable sort + ``(load, part_index)`` heap
+    tie-break), so a resumed array job re-derives the identical parts.
     """
     if parts < 1:
         raise ValueError(f"parts must be >= 1, got {parts}")
+    if weight_by not in ("records", "calcs"):
+        raise ValueError(f"weight_by must be 'records' or 'calcs', got {weight_by!r}")
     in_path = Path(in_path)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = in_path.stem  # "fetched.jsonl" -> "fetched"
     paths = [out_dir / f"{stem}.part-{i:03d}.jsonl" for i in range(parts)]
-    handles = [p.open("w") for p in paths]
     counts = [0] * parts
+    weights = [0] * parts
+    handles = [p.open("w") for p in paths]
     try:
-        for i, rec in enumerate(read_jsonl(in_path)):
-            j = i % parts
-            handles[j].write(json.dumps(rec) + "\n")
-            counts[j] += 1
+        if weight_by == "records":
+            for i, rec in enumerate(read_jsonl(in_path)):
+                j = i % parts
+                handles[j].write(json.dumps(rec) + "\n")
+                counts[j] += 1
+                weights[j] += _split_weight(rec)
+        else:  # "calcs": LPT bin-packing by calc-unit count
+            records = list(read_jsonl(in_path))
+            rec_weight = [_split_weight(r) for r in records]
+            heap = [(0, i) for i in range(parts)]  # (current load, part index)
+            heapq.heapify(heap)
+            assign = [0] * len(records)
+            # Assign the heaviest records first; the min-heap always drops the next
+            # record onto the currently-lightest part. Stable descending sort +
+            # (load, part) tie-break keep the result deterministic.
+            for idx in sorted(range(len(records)),
+                              key=lambda k: rec_weight[k], reverse=True):
+                load, part = heapq.heappop(heap)
+                assign[idx] = part
+                heapq.heappush(heap, (load + rec_weight[idx], part))
+            for idx, rec in enumerate(records):  # write in original order
+                j = assign[idx]
+                handles[j].write(json.dumps(rec) + "\n")
+                counts[j] += 1
+                weights[j] += rec_weight[idx]
     finally:
         for h in handles:
             h.close()
@@ -117,8 +180,12 @@ def split_manifest(in_path: str | Path, parts: int, out_dir: str | Path) -> dict
         "in_path": str(in_path),
         "out_dir": str(out_dir),
         "parts": parts,
+        "weight_by": weight_by,
         "lines_total": sum(counts),
-        "parts_written": [{"path": str(p), "lines": c} for p, c in zip(paths, counts)],
+        "parts_written": [
+            {"path": str(p), "lines": c, "weight": w}
+            for p, c, w in zip(paths, counts, weights)
+        ],
     }
 
 
