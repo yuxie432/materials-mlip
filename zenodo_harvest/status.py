@@ -64,8 +64,8 @@ def _dir_usage(root: Path) -> tuple[int, int, int]:
     return total, n_files, n_dirs
 
 
-def _pct(num: float, den: float) -> float | None:
-    return (100.0 * num / den) if den else None
+def _pct(num: float | None, den: float | None) -> float | None:
+    return (100.0 * num / den) if (num is not None and den) else None
 
 
 def status_report(
@@ -76,8 +76,15 @@ def status_report(
     keep_path: str | Path | None = None,
     max_disk_bytes: int | None = None,
     max_disk_files: int | None = None,
+    staging_walk: bool = True,
 ) -> dict[str, Any]:
-    """Build the machine-readable status snapshot (see module docstring)."""
+    """Build the machine-readable status snapshot (see module docstring).
+
+    ``staging_walk=False`` skips the STAGING section's walk over ``raw_dir``. That walk
+    ``stat``s every inode under ``raw/``, which on Lustre with a live job is slow (minutes
+    at high inode counts); skipping it returns the rest of the report instantly. Read the
+    /rds bytes+inodes from ``lfs quota -u $USER <hpc-work>`` instead.
+    """
     manifests_dir, raw_dir, dataset_dir = Path(manifests_dir), Path(raw_dir), Path(dataset_dir)
 
     # DISCOVER — deduplicated candidate manifest(s); exclude the raw <out>.hits.jsonl checkpoint.
@@ -122,9 +129,17 @@ def status_report(
     shards = sorted(dataset_dir.glob("shard-*.extxyz.gz"))
     ds_bytes, _, _ = _dir_usage(dataset_dir)
 
-    # STAGING — raw tree usage vs the /rds quota (bytes AND inodes).
-    raw_bytes, raw_files, raw_dirs = _dir_usage(raw_dir)
-    inodes = raw_files + raw_dirs
+    # STAGING — raw tree usage vs the /rds quota (bytes AND inodes). The walk is the one
+    # expensive part of this report (every inode under raw/), so it is skippable.
+    raw_bytes: int | None
+    raw_files: int | None
+    raw_dirs: int | None
+    inodes: int | None
+    if staging_walk:
+        raw_bytes, raw_files, raw_dirs = _dir_usage(raw_dir)
+        inodes = raw_files + raw_dirs
+    else:
+        raw_bytes = raw_files = raw_dirs = inodes = None
 
     # ERRORS — rejections carry a machine reason; fetch logs to manifests/, parse to the
     # dataset dir (per-task in the array model, but the pipeline uses the shared one).
@@ -151,11 +166,12 @@ def status_report(
                   "pct": _pct(n_calcs, n_calc_units), "frames": n_frames,
                   "frames_with_forces": n_frames_forces},
         "store": {"shards": len(shards), "dataset_bytes": ds_bytes},
-        "staging": {"bytes": raw_bytes, "files": raw_files, "dirs": raw_dirs,
+        "staging": {"walked": staging_walk,
+                    "bytes": raw_bytes, "files": raw_files, "dirs": raw_dirs,
                     "inodes": inodes,
                     "max_disk_bytes": max_disk_bytes, "max_disk_files": max_disk_files,
-                    "pct_bytes": _pct(raw_bytes, max_disk_bytes) if max_disk_bytes else None,
-                    "pct_inodes": _pct(inodes, max_disk_files) if max_disk_files else None},
+                    "pct_bytes": _pct(raw_bytes, max_disk_bytes),
+                    "pct_inodes": _pct(inodes, max_disk_files)},
         "errors": {"rejections": n_rej,
                    "by_reason": dict(rej_by_reason.most_common(8)),
                    "by_stage": dict(rej_by_stage)},
@@ -188,13 +204,17 @@ def format_status(r: dict[str, Any]) -> str:
              f"PARSE     parsed:     {p['calcs_parsed']:,} / {p['calc_units_fetched']:,} calc_units  "
              f"({_pctstr(p['pct'])})   frames: {p['frames']:,}",
              f"STORE     shards: {s['shards']:,}   dataset: {_h(s['dataset_bytes'])}"]
-    bytes_part = _h(st["bytes"])
-    if st["max_disk_bytes"]:
-        bytes_part += f" / {_h(st['max_disk_bytes'])} ({_pctstr(st['pct_bytes'])})"
-    inodes_part = f"{st['inodes']:,} (files {st['files']:,} + dirs {st['dirs']:,})"
-    if st["max_disk_files"]:
-        inodes_part += f" / {st['max_disk_files']:,} ({_pctstr(st['pct_inodes'])})"
-    lines.append(f"STAGING   raw: {bytes_part}   inodes: {inodes_part}")
+    if not st.get("walked", True):
+        lines.append("STAGING   (walk skipped)  read /rds usage from: "
+                     "lfs quota -u $USER <hpc-work>")
+    else:
+        bytes_part = _h(st["bytes"])
+        if st["max_disk_bytes"]:
+            bytes_part += f" / {_h(st['max_disk_bytes'])} ({_pctstr(st['pct_bytes'])})"
+        inodes_part = f"{st['inodes']:,} (files {st['files']:,} + dirs {st['dirs']:,})"
+        if st["max_disk_files"]:
+            inodes_part += f" / {st['max_disk_files']:,} ({_pctstr(st['pct_inodes'])})"
+        lines.append(f"STAGING   raw: {bytes_part}   inodes: {inodes_part}")
     reasons = ", ".join(f"{k} {v}" for k, v in e["by_reason"].items()) or "none"
     lines.append(f"ERRORS    rejections: {e['rejections']:,}  →  {reasons}")
     return "\n".join(lines)

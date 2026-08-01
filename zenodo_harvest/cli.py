@@ -198,6 +198,9 @@ def _add_status(sub: argparse._SubParsersAction) -> None:
                    help="show staging bytes as %% of this budget (match the pipeline's value)")
     p.add_argument("--max-disk-files", type=int, default=0,
                    help="show staging inodes as %% of this file budget (match the pipeline's value)")
+    p.add_argument("--no-staging-walk", action="store_true",
+                   help="skip the STAGING walk over raw/ (the one slow part on Lustre with a live "
+                        "job); the rest returns instantly. Get /rds bytes+inodes from `lfs quota`.")
     p.add_argument("--json", action="store_true", help="machine-readable output instead of text")
 
 
@@ -329,6 +332,7 @@ def main(argv: list[str] | None = None) -> int:
             dataset_dir=args.dataset_dir, keep_path=args.keep,
             max_disk_bytes=(args.max_disk_bytes or None),
             max_disk_files=(args.max_disk_files or None),
+            staging_walk=not args.no_staging_walk,
         )
         print(json.dumps(report, indent=2) if args.json else format_status(report))
         return 0  # read-only: always succeeds
