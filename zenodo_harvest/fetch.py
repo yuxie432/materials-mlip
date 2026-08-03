@@ -101,7 +101,14 @@ ZIP_STREAM_MIN_SKIP_BYTES = 50_000_000
 # are skipped on resume so their (often large) archives aren't re-downloaded and
 # re-rejected every run. Transient reasons (download_error/http_*) are NOT here, so
 # they still retry. See --retry-rejected to override.
-_TERMINAL_REJECT_REASONS = {"no_calc_units_after_extract", "no_vasp_files_fetched"}
+# ``manually_excluded`` is the operator-supplied member: append a
+# ``{"stage": "fetch", "id": "<recid>", "reason": "manually_excluded", ...}`` line to the
+# fetch rejections log to drop a record from a running harvest WITHOUT editing keep.jsonl
+# (whose positional round-robin split would otherwise reshuffle every later record and
+# orphan the resume sidecars). Use it for records handled separately, e.g. one whose
+# extracted footprint would blow the inode budget.
+_TERMINAL_REJECT_REASONS = {"no_calc_units_after_extract", "no_vasp_files_fetched",
+                            "manually_excluded"}
 
 # Per-file failure reasons that say "the data may well be fine, we just couldn't get it
 # this time": rate limits, server errors, dropped connections, and — importantly on a

@@ -1898,6 +1898,18 @@ def test_record_with_genuinely_no_vasp_stays_terminal(tmp_path):
     assert fetch_mod._terminal_reject_recids(rej_path) == {"2"}
 
 
+def test_manually_excluded_is_terminal_and_skips_the_recid(tmp_path):
+    # An operator drops a record from a running harvest WITHOUT editing keep.jsonl (whose
+    # positional round-robin split would reshuffle every later record) by appending a
+    # manually_excluded fetch rejection; fetch then skips that recid on resume.
+    rej_path = tmp_path / "rej.jsonl"
+    with RejectionLogger(rej_path) as rej:
+        rej.reject("fetch", "20196565", "manually_excluded",
+                   note="oversized (>800k inodes); handled separately")
+    assert "manually_excluded" in fetch_mod._TERMINAL_REJECT_REASONS
+    assert fetch_mod._terminal_reject_recids(rej_path) == {"20196565"}
+
+
 
 
 # --------------------------------------------------------------------------- #

@@ -20,7 +20,10 @@ import io
 import json
 import logging
 import os
+import re
+import shutil
 import socket
+import subprocess
 import zlib
 from datetime import datetime, timezone
 from pathlib import Path
@@ -322,6 +325,78 @@ def _pid_alive(pid: Any) -> bool:
     return True
 
 
+# SLURM job states in which a lock's owning batch job is still live. Anything else — or
+# the job being absent from the controller — means it has ended.
+_SLURM_ACTIVE_STATES = frozenset({
+    "RUNNING", "PENDING", "COMPLETING", "CONFIGURING", "RESIZING", "SUSPENDED",
+    "REQUEUED", "REQUEUE_HOLD", "REQUEUE_FED", "SIGNALING", "STOPPED", "SPECIAL_EXIT",
+})
+
+
+def _slurm_job_active(job_id: Any) -> bool | None:
+    """Whether SLURM job ``job_id`` is still active — ``None`` if undeterminable.
+
+    This is what lets a *cross-host* lock be reclaimed safely: the SIGKILL-at-wallclock
+    case leaves a lock the owner never released, and the resubmitted job almost always
+    lands on a different node, where :func:`_pid_alive` cannot probe the owner. If the
+    lock records a SLURM job id, the controller can answer across nodes. Returns:
+
+    * ``True``  — an active/pending state (do NOT reclaim);
+    * ``False`` — ``squeue`` ran and the job is gone / terminal (safe to reclaim);
+    * ``None``  — undeterminable (no ``squeue`` binary, a transient error, a timeout, a
+      malformed id) — the caller must then fail safe and treat the lock as live.
+
+    Never raises: any failure collapses to ``None``, so off a SLURM cluster (no
+    ``squeue``) lock handling degrades to the old pid-only conservative behaviour.
+    """
+    if not isinstance(job_id, (str, int)):
+        return None
+    jid = str(job_id).strip()
+    if not re.fullmatch(r"\d+(?:_\d+)?", jid):  # numeric id, optionally an array task
+        return None
+    squeue = shutil.which("squeue")
+    if squeue is None:
+        return None
+    try:
+        proc = subprocess.run([squeue, "-h", "-j", jid, "-o", "%T"],
+                              capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        # squeue answers "Invalid job id specified" once a job has left the controller —
+        # i.e. it is not active. Any other non-zero exit is treated as undeterminable.
+        return False if "invalid job id" in (proc.stderr or "").lower() else None
+    states = proc.stdout.split()
+    if not states:
+        return False  # squeue ran cleanly and the job is not in the queue -> ended
+    return any(s.upper() in _SLURM_ACTIVE_STATES for s in states)
+
+
+def _lock_summary(info: dict) -> str:
+    """One-line description of a lock record for log/error messages."""
+    return (f"host {info.get('hostname')}, pid {info.get('pid')}, "
+            f"slurm job {info.get('slurm_job_id', '-')}, started {info.get('started')}")
+
+
+def _lock_is_stale(info: dict) -> bool:
+    """Whether a present lock is provably abandoned and safe to reclaim.
+
+    Reclaim only on PROOF the owner is gone. Same host: the pid is authoritative (a dead
+    pid is stale — unchanged behaviour). Different host: pids can't be probed, so the lock
+    is reclaimed only if it names a SLURM job the controller confirms has *ended*; a
+    cross-host lock with no checkable job id (and an unreadable lock) is never reclaimed,
+    failing safe exactly as before.
+    """
+    if not info:                                             # unreadable -> never reclaim
+        return False
+    if info.get("hostname") == socket.gethostname():
+        return not _pid_alive(info.get("pid"))               # same host: pid is proof
+    job = info.get("slurm_job_id")
+    if job:
+        return _slurm_job_active(job) is False               # cross host: SLURM is proof
+    return False                                             # unprovable -> assume live
+
+
 def _read_lock(path: Path) -> dict | None:
     """Parse a lock file: ``None`` if absent, ``{}`` sentinel if present-but-corrupt."""
     try:
@@ -348,29 +423,35 @@ def _lock_age_seconds(info: dict) -> float | None:
 def dataset_lock_is_live(dataset_dir: str | Path) -> dict | None:
     """Return the lock record if ``dataset_dir`` is held by a LIVE lock, else ``None``.
 
-    "Live" means: a DIFFERENT host (cross-node liveness is uncheckable, so fail
-    safe and treat it as held), an unreadable lock (ditto), or the SAME host with a
-    still-running pid. A same-host lock whose pid is dead is stale and reported as
-    ``None`` (not live). Used by merge-datasets to refuse a source dir a parse may
-    still be writing.
+    "Live" means anything not provably abandoned (see :func:`_lock_is_stale`): a same-host
+    lock with a still-running pid; a different-host lock whose recorded SLURM job the
+    controller reports still active (or that names no checkable job, since cross-node pids
+    are unprobeable); or an unreadable lock (fail safe). Stale — a dead same-host pid, or a
+    cross-host lock whose SLURM job has ended — is reported as ``None`` (not live). Used by
+    merge-datasets to refuse a source dir a parse may still be writing.
     """
     info = _read_lock(Path(dataset_dir) / LOCK_NAME)
     if info is None:
         return None
     if not info:  # unreadable -> fail safe (treat as held)
         return {"_unreadable": True}
-    if info.get("hostname") != socket.gethostname():
-        return info  # different host (or missing hostname) -> assume live
-    return info if _pid_alive(info.get("pid")) else None
+    return None if _lock_is_stale(info) else info
 
 
 class DatasetLock:
     """Advisory lock on a dataset dir, released (unlinked) on context exit / error.
 
     Acquire creates ``<dataset_dir>/.parse.lock`` with ``O_CREAT|O_EXCL`` (atomic,
-    so two racing acquirers can't both win). If it already exists: a same-host lock
-    whose pid is dead is reclaimed with a warning; anything else — a same-host live
-    pid, a different host, or an unreadable lock — aborts with a clear message.
+    so two racing acquirers can't both win). If it already exists it is reclaimed only
+    when provably abandoned (:func:`_lock_is_stale`): a same-host dead pid, or a
+    cross-host lock whose recorded SLURM job the controller reports as ended. Anything
+    else — a same-host live pid, a cross-host lock still running (or with no checkable
+    job id), or an unreadable lock — aborts with a clear message.
+
+    The lock records ``slurm_job_id`` (from ``$SLURM_JOB_ID``) when set, which is what
+    makes a cross-node stale lock reclaimable: a parse SIGKILLed at wallclock cannot
+    release its lock, and the resubmitted job usually lands on a different node where the
+    owner pid is unprobeable — but the controller can still confirm the old job has ended.
     """
 
     def __init__(self, dataset_dir: str | Path):
@@ -379,11 +460,15 @@ class DatasetLock:
         self._held = False
 
     def _payload(self) -> bytes:
-        return json.dumps({
+        rec: dict[str, Any] = {
             "pid": os.getpid(),
             "hostname": socket.gethostname(),
             "started": datetime.now(timezone.utc).isoformat(),
-        }).encode()
+        }
+        job = os.environ.get("SLURM_JOB_ID")
+        if job:
+            rec["slurm_job_id"] = job
+        return json.dumps(rec).encode()
 
     def acquire(self) -> "DatasetLock":
         self.dataset_dir.mkdir(parents=True, exist_ok=True)
@@ -394,11 +479,9 @@ class DatasetLock:
                 info = _read_lock(self.path)
                 if info is None:
                     continue  # vanished between open and read -> retry the create
-                stale = (bool(info) and info.get("hostname") == socket.gethostname()
-                         and not _pid_alive(info.get("pid")))
-                if stale and attempt == 0:
-                    logger.warning("reclaiming stale lock %s (dead pid %s, started %s)",
-                                   self.path, info.get("pid"), info.get("started"))
+                if attempt == 0 and _lock_is_stale(info):
+                    logger.warning("reclaiming stale lock %s (%s)",
+                                   self.path, _lock_summary(info))
                     self.path.unlink(missing_ok=True)
                     continue  # retry the create now the stale lock is gone
                 raise DatasetLockError(self._refusal(info))
@@ -415,14 +498,21 @@ class DatasetLock:
             return (f"{self.dataset_dir} holds an unreadable lock file {self.path}; "
                     f"refusing to write. Remove it manually if no parse is running there.")
         host, pid, started = info.get("hostname"), info.get("pid"), info.get("started")
+        job = info.get("slurm_job_id")
         age = _lock_age_seconds(info)
         age_s = f", age {age:.0f}s" if age is not None else ""
         if host == socket.gethostname():
             return (f"{self.dataset_dir} is locked by a running parse (pid {pid} on {host}, "
                     f"started {started}{age_s}). Wait for it to finish or kill that process.")
-        return (f"{self.dataset_dir} holds a lock from a DIFFERENT host ({host}, pid {pid}, "
-                f"started {started}{age_s}). Cross-node liveness cannot be checked; if you "
-                f"are certain no parse runs there, remove {self.path} manually.")
+        jobinfo = f", SLURM job {job}" if job else ""
+        if job:
+            hint = (f"SLURM job {job} still appears to be running (or could not be "
+                    f"queried); if you are certain it is not, ")
+        else:
+            hint = ("Cross-node liveness cannot be checked; if you are certain no parse "
+                    "runs there, ")
+        return (f"{self.dataset_dir} holds a lock from a DIFFERENT host ({host}, pid {pid}"
+                f"{jobinfo}, started {started}{age_s}). {hint}remove {self.path} manually.")
 
     def release(self) -> None:
         if self._held:

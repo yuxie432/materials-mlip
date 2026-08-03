@@ -24,6 +24,7 @@ pytest.importorskip("ase")
 from ase import Atoms  # noqa: E402
 from ase.io import write as ase_write  # noqa: E402
 
+from zenodo_harvest import store as store_mod  # noqa: E402
 from zenodo_harvest.store import (  # noqa: E402
     DatasetLock,
     DatasetLockError,
@@ -168,7 +169,139 @@ def test_dataset_lock_is_live_classification(tmp_path):
     assert dataset_lock_is_live(d) is None            # stale same-host -> not live
     (d / ".parse.lock").write_text(json.dumps({
         "pid": _dead_pid(), "hostname": "some-other-host", "started": "x"}))
-    assert dataset_lock_is_live(d) is not None        # different host -> assume live
+    assert dataset_lock_is_live(d) is not None        # different host, no job id -> assume live
+
+
+# --------------------------------------------------------------------------- #
+# F2b — SLURM-aware cross-host staleness (reclaim a wallclock-orphaned lock)   #
+# --------------------------------------------------------------------------- #
+
+class _FakeProc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+def _patch_squeue(monkeypatch, *, present=True, result=None, raises=None):
+    """Simulate the ``squeue`` probe inside store._slurm_job_active."""
+    monkeypatch.setattr(store_mod.shutil, "which",
+                        lambda name: "/usr/bin/squeue" if present else None)
+
+    def fake_run(cmd, **kw):
+        if raises is not None:
+            raise raises
+        return result
+
+    monkeypatch.setattr(store_mod.subprocess, "run", fake_run)
+
+
+def test_slurm_job_active_running(monkeypatch):
+    _patch_squeue(monkeypatch, result=_FakeProc(0, "RUNNING\n"))
+    assert store_mod._slurm_job_active("12345") is True
+
+
+def test_slurm_job_active_pending(monkeypatch):
+    _patch_squeue(monkeypatch, result=_FakeProc(0, "PENDING\n"))
+    assert store_mod._slurm_job_active("12345") is True
+
+
+def test_slurm_job_active_gone_empty_output_is_false(monkeypatch):
+    # squeue ran cleanly but the job is not in the queue -> it has ended.
+    _patch_squeue(monkeypatch, result=_FakeProc(0, "\n"))
+    assert store_mod._slurm_job_active("12345") is False
+
+
+def test_slurm_job_active_invalid_job_id_is_false(monkeypatch):
+    _patch_squeue(monkeypatch, result=_FakeProc(
+        1, "", "slurm_load_jobs error: Invalid job id specified"))
+    assert store_mod._slurm_job_active("12345") is False
+
+
+def test_slurm_job_active_transient_error_is_undeterminable(monkeypatch):
+    _patch_squeue(monkeypatch, result=_FakeProc(1, "", "socket timeout talking to slurmctld"))
+    assert store_mod._slurm_job_active("12345") is None
+
+
+def test_slurm_job_active_no_squeue_binary_is_undeterminable(monkeypatch):
+    _patch_squeue(monkeypatch, present=False)
+    assert store_mod._slurm_job_active("12345") is None
+
+
+def test_slurm_job_active_subprocess_raises_is_undeterminable(monkeypatch):
+    _patch_squeue(monkeypatch, raises=OSError("boom"))
+    assert store_mod._slurm_job_active("12345") is None
+
+
+def test_slurm_job_active_malformed_id_never_shells_out(monkeypatch):
+    # A non-numeric / missing id short-circuits to None before touching squeue.
+    monkeypatch.setattr(store_mod.shutil, "which",
+                        lambda name: pytest.fail("should not query squeue"))
+    assert store_mod._slurm_job_active("not-a-job") is None
+    assert store_mod._slurm_job_active(None) is None
+
+
+def test_slurm_job_active_accepts_array_task_id(monkeypatch):
+    _patch_squeue(monkeypatch, result=_FakeProc(0, "RUNNING\n"))
+    assert store_mod._slurm_job_active("12345_7") is True
+
+
+def _cross_host_lock(d: Path, job_id: str = "424242") -> None:
+    d.mkdir(exist_ok=True)
+    (d / ".parse.lock").write_text(json.dumps({
+        "pid": _dead_pid(), "hostname": socket.gethostname() + "-OTHER-NODE",
+        "slurm_job_id": job_id, "started": "2000-01-01T00:00:00+00:00"}))
+
+
+def test_lock_records_slurm_job_id_when_env_set(tmp_path, monkeypatch):
+    monkeypatch.setenv("SLURM_JOB_ID", "778899")
+    with DatasetLock(tmp_path / "ds") as lock:
+        assert json.loads(lock.path.read_text())["slurm_job_id"] == "778899"
+
+
+def test_lock_omits_slurm_job_id_when_env_unset(tmp_path, monkeypatch):
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    with DatasetLock(tmp_path / "ds") as lock:
+        assert "slurm_job_id" not in json.loads(lock.path.read_text())
+
+
+def test_lock_reclaims_cross_host_when_slurm_job_ended(tmp_path, monkeypatch):
+    # The wallclock-orphaned-lock case: a parse SIGKILLed on another node left the lock,
+    # its owning batch job is gone, and the controller confirms it -> reclaim.
+    monkeypatch.setattr(store_mod, "_slurm_job_active", lambda job: False)
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    d = tmp_path / "ds"
+    _cross_host_lock(d)
+    with DatasetLock(d):
+        assert json.loads((d / ".parse.lock").read_text())["pid"] == os.getpid()
+    assert not (d / ".parse.lock").exists()
+
+
+def test_lock_refuses_cross_host_when_slurm_job_active(tmp_path, monkeypatch):
+    monkeypatch.setattr(store_mod, "_slurm_job_active", lambda job: True)
+    d = tmp_path / "ds"
+    _cross_host_lock(d)
+    with pytest.raises(DatasetLockError) as exc:
+        DatasetLock(d).acquire()
+    assert "424242" in str(exc.value) and "DIFFERENT host" in str(exc.value)
+    assert (d / ".parse.lock").is_file()             # live lock left in place
+
+
+def test_lock_refuses_cross_host_when_slurm_undeterminable(tmp_path, monkeypatch):
+    # Uncertain (no squeue / transient error) must fail safe, never reclaim.
+    monkeypatch.setattr(store_mod, "_slurm_job_active", lambda job: None)
+    d = tmp_path / "ds"
+    _cross_host_lock(d)
+    with pytest.raises(DatasetLockError):
+        DatasetLock(d).acquire()
+    assert (d / ".parse.lock").is_file()
+
+
+def test_dataset_lock_is_live_cross_host_consults_slurm(tmp_path, monkeypatch):
+    d = tmp_path / "ds"
+    _cross_host_lock(d)
+    monkeypatch.setattr(store_mod, "_slurm_job_active", lambda job: True)
+    assert dataset_lock_is_live(d) is not None        # job active -> live
+    monkeypatch.setattr(store_mod, "_slurm_job_active", lambda job: False)
+    assert dataset_lock_is_live(d) is None            # job ended -> stale
 
 
 # --------------------------------------------------------------------------- #
