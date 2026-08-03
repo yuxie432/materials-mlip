@@ -76,6 +76,13 @@ MAX_DISK_FILES="${MAX_DISK_FILES:-800000}"
 # on REAL data (synthetic samples read a touch high) with `scripts/csd3/csd3_parse_memory.py`,
 # then verify the peak: `sacct -j <jobid> --format=MaxRSS`.
 MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-2000000000}"
+# Parse each calc unit in a child process hard-killed after this many seconds, so ONE
+# non-terminating pymatgen/ASE parse (a truncated vasprun.xml can hang for hours) is logged
+# 'parse_timeout' and skipped instead of silently freezing the whole overlapped pipeline
+# until wallclock. 1200 s (20 min) sits well above a real long trajectory (relaxations parse
+# in seconds; even long AIMD in a few minutes) and well below a true hang. A timeout is
+# non-terminal (absent from metadata), so a later run re-attempts it. 0 disables the guard.
+PARSE_TIMEOUT="${PARSE_TIMEOUT:-1200}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-8}"      # resubmission chain guard
 ATTEMPT="${ATTEMPT:-1}"
 # --------------------------------------------------------------------------------
@@ -150,6 +157,7 @@ python -m zenodo_harvest.cli -v pipeline \
     --max-disk-bytes "$MAX_DISK_BYTES" \
     --max-disk-files "$MAX_DISK_FILES" \
     --max-primary-bytes "$MAX_PRIMARY_BYTES" \
+    --parse-timeout "$PARSE_TIMEOUT" \
     --raw-dir "$ZENODO_HARVEST_DATA/raw" \
     --dataset-dir "$ZENODO_HARVEST_DATA/dataset" \
     > >(tee "$SUMMARY") &

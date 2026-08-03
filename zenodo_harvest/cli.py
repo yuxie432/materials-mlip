@@ -151,6 +151,12 @@ def _add_parse(sub: argparse._SubParsersAction) -> None:
                         "cgroup-killed — set this for long unattended runs, sized to --mem. "
                         "Compared against the UNCOMPRESSED size for gzip primaries "
                         "(.xml.gz/OUTCAR.gz), since RAM tracks that, not the bytes on disk.")
+    p.add_argument("--parse-timeout", type=float, default=1200,
+                   help="parse each calc unit in a child process hard-killed after this "
+                        "many seconds (0 = off/in-process); a non-terminating pymatgen/ASE "
+                        "parse is logged 'parse_timeout' and skipped instead of freezing the "
+                        "run. Default 1200 (20 min): well above a real long trajectory, well "
+                        "below a true hang. Re-tried on a later run (absent from metadata).")
     p.add_argument("--max-records", type=int, default=None)
 
 
@@ -240,6 +246,11 @@ def _add_pipeline(sub: argparse._SubParsersAction) -> None:
                         "than this (0 = no cap; uncompressed size for gzip primaries). "
                         "Recommended on a batch job so one huge output cannot get the whole "
                         "job cgroup-killed mid-harvest.")
+    p.add_argument("--parse-timeout", type=float, default=1200,
+                   help="parse each calc unit in a child process hard-killed after this many "
+                        "seconds (0 = off); a non-terminating parse is logged 'parse_timeout' "
+                        "and skipped instead of freezing the whole overlapped pipeline. "
+                        "Default 1200 (20 min).")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -312,6 +323,7 @@ def main(argv: list[str] | None = None) -> int:
                 frames_per_shard=args.frames_per_shard, max_records=args.max_records,
                 raw_dir=args.raw_dir, gzip_level=args.gzip_level,
                 max_primary_bytes=args.max_primary_bytes,
+                parse_timeout_s=args.parse_timeout,
             )
         except DatasetLockError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
@@ -377,7 +389,8 @@ def main(argv: list[str] | None = None) -> int:
         def process_fn(part: Path) -> None:
             fetched = str(_fetched_path(part))
             parse(fetched, dataset_dir=str(ds_dir), rejections_path=parse_rej,
-                  raw_dir=str(raw_dir), max_primary_bytes=args.max_primary_bytes)
+                  raw_dir=str(raw_dir), max_primary_bytes=args.max_primary_bytes,
+                  parse_timeout_s=args.parse_timeout)
             purge_raw(str(raw_dir), str(ds_dir), fetched=fetched)
 
         fetch_error: str | None = None

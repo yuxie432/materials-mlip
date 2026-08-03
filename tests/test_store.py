@@ -14,12 +14,16 @@ import io
 import json
 import os
 import socket
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 pytest.importorskip("ase")
+
+from zenodo_harvest import parse as parse_mod  # noqa: E402
+from zenodo_harvest.manifest import RejectionLogger, read_jsonl  # noqa: E402
 
 from ase import Atoms  # noqa: E402
 from ase.io import write as ase_write  # noqa: E402
@@ -486,3 +490,76 @@ def test_electronic_converged_none_is_omitted_not_written_as_true(tmp_path):
     assert back["known_true"].info.get("electronic_converged") is True
     assert back["known_false"].info.get("electronic_converged") is False
     assert back["unknown"].info.get("electronic_converged") is None   # NOT True
+
+
+# --------------------------------------------------------------------------- #
+# Per-calc parse timeout (isolate a non-terminating pymatgen/ASE parse)        #
+# --------------------------------------------------------------------------- #
+
+# NB these run REAL child processes via the forkserver. Targets are builtins/stdlib so the
+# forkserver never needs to import the test module; the timeout case uses 30 s vs a 1 s cap
+# and must return in ~1 s (proving the child is killed, not waited on).
+
+def test_run_with_timeout_returns_value_on_success():
+    assert parse_mod._run_with_timeout(abs, (-7,), timeout=30) == ("ok", 7)
+
+
+def test_run_with_timeout_kills_a_hanging_call():
+    t0 = time.monotonic()
+    status, val = parse_mod._run_with_timeout(time.sleep, (30,), timeout=1)
+    assert (status, val) == ("timeout", None)
+    assert time.monotonic() - t0 < 15          # killed, not waited out to 30 s
+
+
+def test_run_with_timeout_reports_child_exception():
+    status, msg = parse_mod._run_with_timeout(int, ("notanumber",), timeout=30)
+    assert status == "exc" and "ValueError" in msg
+
+
+def test_run_with_timeout_detects_a_dead_worker():
+    # os._exit skips the finally that would send a result -> parent must see "died".
+    assert parse_mod._run_with_timeout(os._exit, (0,), timeout=30) == ("died", None)
+
+
+def test_parse_one_in_process_when_timeout_disabled(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_pcu(unit, base_meta, availability, rej, mpb):
+        seen["args"] = (unit, mpb)
+        return (["FRAME"], {"calc_id": "x"})
+
+    monkeypatch.setattr(parse_mod, "parse_calc_unit", fake_pcu)
+    # Any subprocess use here would be a bug: assert we never touch it.
+    monkeypatch.setattr(parse_mod, "_run_with_timeout",
+                        lambda *a, **k: pytest.fail("must stay in-process when timeout=0"))
+    with RejectionLogger(tmp_path / "r.jsonl") as rej:
+        out = parse_mod._parse_one({"outcar": "o"}, {}, {}, rej, 7, 0, "cid")
+    assert out == (["FRAME"], {"calc_id": "x"}) and seen["args"] == ({"outcar": "o"}, 7)
+
+
+def test_parse_one_timeout_logs_parse_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(parse_mod, "_run_with_timeout", lambda fn, args, t: ("timeout", None))
+    with RejectionLogger(tmp_path / "r.jsonl") as rej:
+        out = parse_mod._parse_one({}, {}, {}, rej, 0, 600, "zenodo:1:BS/vasprun.xml")
+    assert out is None
+    r = list(read_jsonl(tmp_path / "r.jsonl"))
+    assert len(r) == 1 and r[0]["reason"] == "parse_timeout"
+    assert r[0]["id"] == "zenodo:1:BS/vasprun.xml" and r[0]["timeout_s"] == 600
+
+
+def test_parse_one_worker_died_logs_reason(tmp_path, monkeypatch):
+    monkeypatch.setattr(parse_mod, "_run_with_timeout", lambda fn, args, t: ("died", None))
+    with RejectionLogger(tmp_path / "r.jsonl") as rej:
+        assert parse_mod._parse_one({}, {}, {}, rej, 0, 600, "cid") is None
+    assert list(read_jsonl(tmp_path / "r.jsonl"))[0]["reason"] == "parse_worker_died"
+
+
+def test_parse_one_replays_child_rejections_and_returns_result(tmp_path, monkeypatch):
+    child_rej = [("parse", "zenodo:1:a/OUTCAR", "frames_no_energy", {"dropped": 2, "kept": 5})]
+    monkeypatch.setattr(parse_mod, "_run_with_timeout",
+                        lambda fn, args, t: ("ok", ((["FRAME"], {"calc_id": "y"}), child_rej)))
+    with RejectionLogger(tmp_path / "r.jsonl") as rej:
+        out = parse_mod._parse_one({}, {}, {}, rej, 0, 600, "cid")
+    assert out == (["FRAME"], {"calc_id": "y"})
+    r = list(read_jsonl(tmp_path / "r.jsonl"))[0]
+    assert r["reason"] == "frames_no_energy" and r["dropped"] == 2 and r["kept"] == 5

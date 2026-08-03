@@ -65,6 +65,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import multiprocessing as mp
+import threading
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
@@ -816,6 +818,148 @@ def _load_committed(metadata_path: Path) -> tuple[set[str], set[str]]:
     return done, frame_ids
 
 
+# --- per-calc parse timeout (isolate a non-terminating pymatgen/ASE parse) ---------
+# A single malformed vasprun.xml/OUTCAR can send pymatgen/ASE into a non-terminating (or
+# effectively endless) parse. In the overlapped pipeline that hangs a background parse
+# thread, which the orchestrator then blocks on -> the WHOLE harvest freezes, silently,
+# until wallclock. A Python-level timeout cannot help: the hang is inside a C extension
+# that ignores signals, and a stuck thread cannot be killed. So each calc unit is parsed
+# in a short-lived child PROCESS that can be hard-killed on timeout.
+#
+# The child is forked from a `forkserver` (a clean, single-threaded parent), not `fork`:
+# parse runs in a pipeline WORKER thread while fetch's download threads run too, and
+# fork() in a multithreaded process can deadlock the child on a lock (e.g. logging) held
+# by another thread at fork time. The forkserver preloads pymatgen/ase ONCE so each forked
+# child inherits them (a fresh import per child would add ~0.5 s x hundreds of thousands
+# of calcs). Preload is best-effort — a miss only costs speed, never correctness.
+_MP_CTX: Any = None
+_MP_LOCK = threading.Lock()
+_FORKSERVER_PRELOAD = ["zenodo_harvest.parse", "pymatgen.io.vasp.outputs", "ase.io"]
+
+
+def _get_mp_ctx() -> Any:
+    """A cached multiprocessing context (forkserver where available, else spawn)."""
+    global _MP_CTX
+    with _MP_LOCK:
+        if _MP_CTX is None:
+            method = "forkserver" if "forkserver" in mp.get_all_start_methods() else "spawn"
+            ctx = mp.get_context(method)
+            if method == "forkserver":
+                try:
+                    ctx.set_forkserver_preload(_FORKSERVER_PRELOAD)
+                except Exception:  # noqa: BLE001 - preload is a speed-up, never required
+                    pass
+            _MP_CTX = ctx
+        return _MP_CTX
+
+
+class _RejCollector:
+    """A pickle-safe stand-in for :class:`RejectionLogger` inside a parse child.
+
+    A ``RejectionLogger`` owns an open file handle, so it cannot cross a process boundary.
+    The child collects ``reject()`` calls into a plain list and the parent replays them
+    into the real logger (which owns the audit file) — so ``parse_calc_unit`` runs
+    unchanged in the child and no rejection line is lost.
+    """
+
+    def __init__(self) -> None:
+        self.items: list[tuple[str, str, str, dict]] = []
+
+    def reject(self, stage: str, ident: str, reason: str, **detail: Any) -> None:
+        self.items.append((stage, ident, reason, detail))
+
+
+def _parse_calc_unit_worker(unit: dict, base_meta: dict, availability: dict,
+                            max_primary_bytes: int) -> tuple[Any, list]:
+    """Module-level (picklable) child target: parse one unit, return its result plus the
+    rejections it collected, for the parent to write."""
+    coll = _RejCollector()
+    result = parse_calc_unit(unit, base_meta, availability, coll,  # type: ignore[arg-type]
+                             max_primary_bytes)
+    return result, coll.items
+
+
+def _pipe_call(send: Any, fn: Any, args: tuple) -> None:
+    """Child entry point: run ``fn(*args)`` and send its outcome back over ``send``."""
+    try:
+        send.send(("ok", fn(*args)))
+    except BaseException as exc:  # noqa: BLE001 - report ANY failure, incl. non-Exception
+        try:
+            send.send(("exc", f"{type(exc).__name__}: {exc}"))
+        except BaseException:  # noqa: BLE001 - pipe already broken; nothing else to do
+            pass
+    finally:
+        send.close()
+
+
+def _run_with_timeout(fn: Any, args: tuple, timeout: float) -> tuple[str, Any]:
+    """Run module-level ``fn(*args)`` in a child process, hard-killed after ``timeout`` s.
+
+    Returns ``(status, value)``: ``("ok", return_value)``; ``("exc", message)`` if ``fn``
+    raised; ``("timeout", None)`` if it did not finish in time (child SIGTERM'd then
+    SIGKILL'd); ``("died", None)`` if the child vanished without a result (e.g. OOM-killed).
+    """
+    ctx = _get_mp_ctx()
+    recv, send = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_pipe_call, args=(send, fn, args))
+    proc.start()
+    send.close()  # parent never sends; closing its end makes recv see EOF if the child dies
+    try:
+        if not recv.poll(timeout):
+            proc.terminate()
+            proc.join(5)
+            if proc.is_alive():
+                proc.kill()
+                proc.join()
+            return "timeout", None
+        try:
+            status, value = recv.recv()
+        except EOFError:
+            status, value = "died", None
+    finally:
+        recv.close()
+    proc.join(10)
+    if proc.is_alive():
+        proc.kill()
+        proc.join()
+    return status, value
+
+
+def _parse_one(unit: dict, base_meta: dict, availability: dict, rej: RejectionLogger,
+               max_primary_bytes: int, timeout_s: float, calc_id: str
+               ) -> tuple[list[Atoms], dict] | None:
+    """Parse one calc unit, optionally in a hard-timed child process.
+
+    ``timeout_s <= 0`` parses in-process (the historical path, used by the offline tests
+    and any caller that opts out). Otherwise the parse runs in a child killed after
+    ``timeout_s`` seconds: a non-terminating parse becomes a ``parse_timeout`` rejection
+    and the harvest moves on instead of freezing. ``parse_timeout`` is NOT terminal — the
+    calc is absent from metadata.jsonl, so a later run (a longer ``--parse-timeout``, or a
+    bigger-RAM node) re-attempts it, exactly like ``primary_too_large``.
+    """
+    if timeout_s <= 0:
+        return parse_calc_unit(unit, base_meta, availability, rej, max_primary_bytes)
+    status, value = _run_with_timeout(
+        _parse_calc_unit_worker, (unit, base_meta, availability, max_primary_bytes), timeout_s)
+    if status == "timeout":
+        logger.warning("parse timed out after %ss for %s; skipping (re-tried on a later run)",
+                       timeout_s, calc_id)
+        rej.reject("parse", calc_id, "parse_timeout", timeout_s=timeout_s)
+        return None
+    if status == "died":
+        logger.warning("parse worker died (OOM?) for %s; skipping", calc_id)
+        rej.reject("parse", calc_id, "parse_worker_died")
+        return None
+    if status == "exc":
+        # parse_calc_unit catches its own parser errors, so an escape here is unexpected.
+        rej.reject("parse", calc_id, "parse_error", detail=str(value))
+        return None
+    result, child_rejections = value
+    for stage, ident, reason, detail in child_rejections:  # replay the child's audit lines
+        rej.reject(stage, ident, reason, **detail)
+    return result
+
+
 def parse(
     in_path: str | Path,
     dataset_dir: str | Path = config.DATASET_DIR,
@@ -825,6 +969,7 @@ def parse(
     raw_dir: str | Path = config.RAW_DIR,
     gzip_level: int = 6,
     max_primary_bytes: int = 0,
+    parse_timeout_s: float = 0,
 ) -> dict:
     """Parse every fetched record into extxyz shards + a metadata JSONL.
 
@@ -846,6 +991,15 @@ def parse(
     gzip ISIZE trailer; see :func:`_effective_primary_size`), since RAM tracks that, not
     the compressed bytes on disk. Set it for long unattended cluster runs, sized against
     the job's ``--mem``; leave it 0 to attempt everything.
+
+    ``parse_timeout_s`` (0 = off) parses each calc unit in a child process hard-killed after
+    that many seconds, so one non-terminating pymatgen/ASE parse cannot silently freeze the
+    whole run (see :func:`_parse_one`). Size it well above a legitimate long trajectory: an
+    ionic relaxation is tens of steps (parses in seconds), and even a long AIMD run parses
+    in a few minutes, whereas a truly stuck parse runs for hours — so a generous value (the
+    CLI default is 20 min) clears real data while still catching hangs promptly. A timeout is
+    logged as a ``parse_timeout`` rejection and, being absent from metadata, is re-attempted
+    on a later run.
     """
     dataset_dir = Path(dataset_dir)
     raw_dir = Path(raw_dir)
@@ -880,8 +1034,11 @@ def parse(
                     if calc_id in done_calc_ids:
                         stats["skipped_existing"] += 1
                         continue
-                    result = parse_calc_unit(unit, base_meta, rec.get("availability", {}),
-                                             rej, max_primary_bytes)
+                    # Name the calc BEFORE parsing so a slow/hung parse is identifiable live
+                    # (`tail -f` the log) and by the last line if the job is killed mid-parse.
+                    logger.info("parsing %s", calc_id)
+                    result = _parse_one(unit, base_meta, rec.get("availability", {}),
+                                        rej, max_primary_bytes, parse_timeout_s, calc_id)
                     if not result:
                         continue
                     frames, meta = result

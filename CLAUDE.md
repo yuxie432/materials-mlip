@@ -115,6 +115,16 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
     `vasprun.xml` is not a catchable `MemoryError` but a cgroup SIGKILL of the entire job
     (taking the fetch progress with it). If a smaller sibling primary exists in the same
     unit (a huge `vasprun.xml` beside a modest `OUTCAR`) it is used instead of dropping the calc.
+    **`--parse-timeout`** (seconds; CLI default 1200 = 20 min, 0 = off) parses each calc unit
+    in a **forkserver child process hard-killed on timeout**, so one *non-terminating*
+    pymatgen/ASE parse (e.g. a truncated `vasprun.xml` whose OUTCAR fallback loops for hours)
+    is logged `parse_timeout` and skipped rather than silently **freezing the whole overlapped
+    pipeline** until wallclock — a Python-level timeout can't help (the hang is in a C
+    extension that ignores signals, and a stuck thread can't be killed). It also isolates a
+    parse OOM into the child instead of a cgroup-kill of the job. A `parse_timeout` is
+    non-terminal (absent from metadata), so a later/longer run re-attempts it, like
+    `primary_too_large`. Each calc is logged (`INFO parsing <calc_id>`) *before* it starts, so
+    a slow/hung parse is identifiable live via `tail -f` and by the last log line on a kill.
   - `store.py` — stage 4: `ShardedExtxyzWriter` (rotating `shard-NNNNN.extxyz.gz`) +
     `MetadataWriter` (one JSONL record per calc), joined by `calc_id`/`frame_id`.
   - `status.py` — read-only progress snapshot: line-counts the append-only manifests +
