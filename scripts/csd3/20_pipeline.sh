@@ -94,6 +94,24 @@ echo "=== pipeline attempt $ATTEMPT/$MAX_ATTEMPTS $(date -Is) on $(hostname) ===
 quota 2>/dev/null || lfs quota -u "$USER" "$ZENODO_HARVEST_DATA" 2>/dev/null \
     || df -h "$ZENODO_HARVEST_DATA" 2>/dev/null || true
 
+# ---- CLEAR A STALE PARSE LOCK ---------------------------------------------------
+# The RESUBMIT chain is STRICTLY SEQUENTIAL (--dependency=afterany: a successor only
+# starts once its predecessor has ENDED), so when THIS job starts no other job of this
+# harvest is running. A parse SIGKILLed at the previous job's wallclock cannot release its
+# DatasetLock (SIGKILL is untrappable), and because the successor almost always lands on a
+# DIFFERENT compute node that lock can never be auto-reclaimed (cross-node liveness is
+# uncheckable — see store.py:DatasetLock). Every parse then fails with DatasetLockError,
+# staging is never purged, and the whole pipeline stalls re-staging+rolling-back the same
+# records until wallclock — silently, for the rest of the run. Any lock present at startup
+# is therefore provably stale, so remove it. NB: this is only safe BECAUSE the chain is
+# sequential — do NOT run a separate parse/array job against this SAME --dataset-dir at the
+# same time as the pipeline (the array flow uses per-task dirs + merge, so it never does).
+DATASET_DIR="$ZENODO_HARVEST_DATA/dataset"
+if [[ -e "$DATASET_DIR/.parse.lock" ]]; then
+    echo "clearing leftover parse lock (sequential resubmit chain => stale): $(cat "$DATASET_DIR/.parse.lock" 2>/dev/null)"
+    rm -f "$DATASET_DIR/.parse.lock"
+fi
+
 # Targeted ZIP member fetch is ON by default (pulls only VASP files out of a .zip over
 # HTTP Range, skipping heavy CHGCAR/WAVECAR bulk and never staging the archive). Pass
 # --no-zip-stream to disable, or --zip-stream-max-files N to tune the per-archive request
