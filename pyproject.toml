@@ -7,8 +7,11 @@ requires-python = ">=3.10"
 dependencies = ["requests>=2.31"]
 
 [project.optional-dependencies]
-# fetch/parse/store; pymatgen 2026.5.4 is the latest PyPI release (core 2026.5.18)
-parse = ["pymatgen>=2026.5.4", "ase>=3.25"]
+# fetch/parse/store; pymatgen 2026.5.4 is the latest PyPI release (core 2026.5.18).
+# h5py is REQUIRED for the vaspout.h5 path: pymatgen's Vaspout hard-raises
+# "h5py must be installed to read vaspout.h5" without it, so every vaspout.h5 calc would
+# be (recoverably) rejected as vaspout_parse_error on a venv that lacks it.
+parse = ["pymatgen>=2026.5.4", "ase>=3.25", "h5py>=3.9"]
 parquet = ["pyarrow>=15"]
 # optional archive backends; rarfile also needs an `unrar`/`bsdtar` binary on PATH
 archives = ["py7zr>=0.21", "rarfile>=4", "zstandard>=0.21"]
