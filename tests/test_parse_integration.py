@@ -199,3 +199,36 @@ def test_parse_then_verify_end_to_end(tmp_path):
     assert vr["provenance"]["record_id"] == "vr" and vr["provenance"]["file_path"]
     assert vr["calc_parameters"]["run_type"] and "incar" in vr["calc_parameters"]
     assert "potcar_set_hash" in vr["calc_parameters"]
+
+
+def test_resume_skips_previously_rejected_calc(tmp_path):
+    """A calc that fails to parse must be re-skipped on resume, not re-run + re-rejected."""
+    import json
+    raw = tmp_path / "raw"
+    calc = raw / "bad" / "extracted" / "c"
+    calc.mkdir(parents=True)
+    (calc / "OUTCAR").write_text("this is not a valid OUTCAR\n" * 3)  # ASE cannot parse -> rejected
+    manifest = tmp_path / "fetched.jsonl"
+    manifest.write_text(json.dumps({
+        "recid": "bad",
+        "provenance": {"source": "zenodo", "record_id": "bad",
+                       "license": "cc-by-4.0", "resource_type": "dataset"},
+        "local_dir": "bad", "n_calc_units": 1,
+        "calc_units": [{"dir": "bad/extracted/c", "outcar": "bad/extracted/c/OUTCAR"}],
+        "availability": {}}) + "\n")
+    ds, rej = tmp_path / "dataset", tmp_path / "rej.jsonl"
+
+    s1 = parse(manifest, dataset_dir=ds, rejections_path=rej, raw_dir=raw)
+    assert s1["calcs_parsed"] == 0 and s1["skipped_rejected"] == 0
+    r1 = list(read_jsonl(rej))
+    assert len(r1) == 1 and r1[0]["reason"] in {"outcar_parse_error", "no_frames"}
+
+    # resume: the known-bad calc is SKIPPED (not re-parsed), no new rejection line appended
+    s2 = parse(manifest, dataset_dir=ds, rejections_path=rej, raw_dir=raw)
+    assert s2["skipped_rejected"] == 1 and s2["calcs_parsed"] == 0
+    assert len(list(read_jsonl(rej))) == 1
+
+    # retry_rejected re-attempts it (and re-rejects, appending one more line)
+    s3 = parse(manifest, dataset_dir=ds, rejections_path=rej, raw_dir=raw, retry_rejected=True)
+    assert s3["skipped_rejected"] == 0
+    assert len(list(read_jsonl(rej))) == 2

@@ -818,6 +818,31 @@ def _load_committed(metadata_path: Path) -> tuple[set[str], set[str]]:
     return done, frame_ids
 
 
+# Parse rejections a re-parse would reproduce identically (same file + same pymatgen/ASE):
+# skip these on resume instead of re-running the parser on known-bad calcs every time —
+# measured wasting minutes per resume on a big bad record (e.g. one with ~7k unparseable
+# OUTCARs) and appending DUPLICATE rejection lines each run (inflating the counts). NOT
+# terminal, so kept retryable: parse_timeout (retry with a longer --parse-timeout),
+# primary_too_large / parse_worker_died (retry on a bigger-RAM node), parse_error (an
+# unexpected escape, possibly transient). frames_no_energy is a KEPT calc's audit line, not
+# a rejection, so it is not here either. Override with retry_rejected=True after a
+# pymatgen/ase upgrade that might now parse a previously-failing file.
+_PARSE_TERMINAL_REJECT_REASONS = frozenset({
+    "vasprun_parse_error", "vaspout_parse_error", "outcar_parse_error", "no_frames",
+})
+
+
+def _rejected_calc_ids(rejections_path: Path) -> set[str]:
+    """calc_ids already rejected with a DETERMINISTIC parse failure — skipped on resume so
+    the parser is not re-run on files it has already proven it cannot parse."""
+    if not rejections_path.is_file():
+        return set()
+    return {r["id"] for r in read_jsonl(rejections_path)
+            if r.get("stage") == "parse"
+            and r.get("reason") in _PARSE_TERMINAL_REJECT_REASONS
+            and isinstance(r.get("id"), str)}
+
+
 # --- per-calc parse timeout (isolate a non-terminating pymatgen/ASE parse) ---------
 # A single malformed vasprun.xml/OUTCAR can send pymatgen/ASE into a non-terminating (or
 # effectively endless) parse. In the overlapped pipeline that hangs a background parse
@@ -970,6 +995,7 @@ def parse(
     gzip_level: int = 6,
     max_primary_bytes: int = 0,
     parse_timeout_s: float = 0,
+    retry_rejected: bool = False,
 ) -> dict:
     """Parse every fetched record into extxyz shards + a metadata JSONL.
 
@@ -1000,23 +1026,31 @@ def parse(
     CLI default is 20 min) clears real data while still catching hangs promptly. A timeout is
     logged as a ``parse_timeout`` rejection and, being absent from metadata, is re-attempted
     on a later run.
+
+    On resume, calcs already rejected with a *deterministic* parse failure (see
+    :data:`_PARSE_TERMINAL_REJECT_REASONS`) are **skipped** rather than re-parsed — re-running
+    the parser on files it has already proven unparseable wastes minutes per resume on a big
+    bad record and duplicates rejection lines. ``retry_rejected=True`` re-attempts them (use
+    after a pymatgen/ase upgrade).
     """
     dataset_dir = Path(dataset_dir)
     raw_dir = Path(raw_dir)
     metadata_path = dataset_dir / "metadata.jsonl"
     stats: dict[str, Any] = {"records": 0, "calc_units": 0, "calcs_parsed": 0,
-                             "skipped_existing": 0, "frames": 0}
+                             "skipped_existing": 0, "skipped_rejected": 0, "frames": 0}
 
     # Hold the dataset-dir lock across prune + all writes: two parse tasks sharing
     # one --dataset-dir would interleave shard/metadata writes and corrupt both
     # (the parallel model is one dataset dir per array task; merge afterwards).
     with DatasetLock(dataset_dir):
         done_calc_ids, committed_frame_ids = _load_committed(metadata_path)
+        rejected_calc_ids = set() if retry_rejected else _rejected_calc_ids(Path(rejections_path))
         pruned = prune_uncommitted_frames(dataset_dir, committed_frame_ids)
         start_index = next_shard_index(dataset_dir)  # after pruning may drop shards
-        if done_calc_ids or pruned["frames_dropped"]:
-            logger.info("parse resume: %d calc(s) already done, pruned %s, new shards from %05d",
-                        len(done_calc_ids), pruned, start_index)
+        if done_calc_ids or rejected_calc_ids or pruned["frames_dropped"]:
+            logger.info("parse resume: %d calc(s) already done, %d previously rejected "
+                        "(skipped), pruned %s, new shards from %05d",
+                        len(done_calc_ids), len(rejected_calc_ids), pruned, start_index)
 
         with RejectionLogger(rejections_path) as rej, \
                 ShardedExtxyzWriter(dataset_dir, frames_per_shard, start_index=start_index,
@@ -1033,6 +1067,9 @@ def parse(
                     calc_id = _calc_id(unit, base_meta)
                     if calc_id in done_calc_ids:
                         stats["skipped_existing"] += 1
+                        continue
+                    if calc_id in rejected_calc_ids:  # known-bad; don't re-run the parser
+                        stats["skipped_rejected"] += 1
                         continue
                     # Name the calc BEFORE parsing so a slow/hung parse is identifiable live
                     # (`tail -f` the log) and by the last line if the job is killed mid-parse.

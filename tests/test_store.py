@@ -563,3 +563,29 @@ def test_parse_one_replays_child_rejections_and_returns_result(tmp_path, monkeyp
     assert out == (["FRAME"], {"calc_id": "y"})
     r = list(read_jsonl(tmp_path / "r.jsonl"))[0]
     assert r["reason"] == "frames_no_energy" and r["dropped"] == 2 and r["kept"] == 5
+
+
+# --------------------------------------------------------------------------- #
+# Skip previously-rejected calcs on resume (don't re-run the parser)           #
+# --------------------------------------------------------------------------- #
+
+def test_rejected_calc_ids_selects_only_deterministic_parse_failures(tmp_path):
+    rp = tmp_path / "rej.jsonl"
+    with RejectionLogger(rp) as rej:
+        rej.reject("parse", "zenodo:1:a/vasprun.xml", "vasprun_parse_error", detail="x")
+        rej.reject("parse", "zenodo:1:b/OUTCAR", "outcar_parse_error", detail="x")
+        rej.reject("parse", "zenodo:1:c/vaspout.h5", "vaspout_parse_error", detail="x")
+        rej.reject("parse", "zenodo:1:d/OUTCAR", "no_frames")
+        # retryable reasons must NOT be skipped:
+        rej.reject("parse", "zenodo:1:e/vasprun.xml", "parse_timeout", timeout_s=600)
+        rej.reject("parse", "zenodo:1:f/vasprun.xml", "primary_too_large")
+        rej.reject("parse", "zenodo:1:g/OUTCAR", "parse_worker_died")
+        rej.reject("parse", "zenodo:1:h/OUTCAR", "frames_no_energy", dropped=1, kept=2)
+        rej.reject("fetch", "zenodo:1:i", "no_vasp_files_fetched")   # wrong stage
+    assert parse_mod._rejected_calc_ids(rp) == {
+        "zenodo:1:a/vasprun.xml", "zenodo:1:b/OUTCAR",
+        "zenodo:1:c/vaspout.h5", "zenodo:1:d/OUTCAR"}
+
+
+def test_rejected_calc_ids_empty_when_file_absent(tmp_path):
+    assert parse_mod._rejected_calc_ids(tmp_path / "nope.jsonl") == set()

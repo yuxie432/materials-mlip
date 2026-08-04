@@ -157,6 +157,11 @@ def _add_parse(sub: argparse._SubParsersAction) -> None:
                         "parse is logged 'parse_timeout' and skipped instead of freezing the "
                         "run. Default 1200 (20 min): well above a real long trajectory, well "
                         "below a true hang. Re-tried on a later run (absent from metadata).")
+    p.add_argument("--retry-rejected", action="store_true",
+                   help="re-attempt calcs previously rejected with a deterministic parse "
+                        "error (vasprun/vaspout/outcar_parse_error, no_frames) instead of "
+                        "skipping them on resume. Default: skip them (they fail identically). "
+                        "Use after upgrading pymatgen/ase.")
     p.add_argument("--max-records", type=int, default=None)
 
 
@@ -324,6 +329,7 @@ def main(argv: list[str] | None = None) -> int:
                 raw_dir=args.raw_dir, gzip_level=args.gzip_level,
                 max_primary_bytes=args.max_primary_bytes,
                 parse_timeout_s=args.parse_timeout,
+                retry_rejected=args.retry_rejected,
             )
         except DatasetLockError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)

@@ -125,6 +125,12 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
     non-terminal (absent from metadata), so a later/longer run re-attempts it, like
     `primary_too_large`. Each calc is logged (`INFO parsing <calc_id>`) *before* it starts, so
     a slow/hung parse is identifiable live via `tail -f` and by the last log line on a kill.
+    On resume, calcs already rejected with a **deterministic** parse failure
+    (`vasprun`/`vaspout`/`outcar_parse_error`, `no_frames`) are **skipped** rather than
+    re-parsed (`_rejected_calc_ids`) — re-running the parser on a proven-unparseable file
+    wastes minutes per resume on a big bad record and duplicated rejection lines;
+    `--retry-rejected` re-attempts them (use after a pymatgen/ase upgrade). `parse_timeout`/
+    `primary_too_large`/`parse_worker_died` stay retryable (absent from the skip set).
   - `store.py` — stage 4: `ShardedExtxyzWriter` (rotating `shard-NNNNN.extxyz.gz`) +
     `MetadataWriter` (one JSONL record per calc), joined by `calc_id`/`frame_id`.
   - `status.py` — read-only progress snapshot: line-counts the append-only manifests +
