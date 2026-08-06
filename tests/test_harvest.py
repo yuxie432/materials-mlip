@@ -3013,3 +3013,24 @@ def test_split_manifest_calcs_degrades_to_count_on_keeplist(tmp_path):
     assert info["lines_total"] == 7
     assert sorted(pw["lines"] for pw in info["parts_written"]) == [2, 2, 3]
     assert all(pw["weight"] == pw["lines"] for pw in info["parts_written"])
+
+
+def test_prune_unreferenced_files_drops_noncalc_and_empty_dirs(tmp_path):
+    """Files no calc unit references (KPOINTS/OSZICAR, primary-less-dir inputs) are pruned
+    right after fetch, so purge-raw's structural residual never accumulates. Files a unit
+    references (incl. a later-retried unparsed unit's) are kept."""
+    from zenodo_harvest.fetch import _prune_unreferenced_files
+    ex = tmp_path / "extracted"
+    (ex / "c1").mkdir(parents=True)
+    for f in ("OUTCAR", "POSCAR", "KPOINTS", "OSZICAR"):
+        (ex / "c1" / f).write_text("x")
+    (ex / "inputs_only").mkdir()          # a directory with no primary output
+    for f in ("POSCAR", "INCAR"):
+        (ex / "inputs_only" / f).write_text("x")
+    units = [{"dir": str(ex / "c1"), "outcar": str(ex / "c1" / "OUTCAR"),
+              "poscar": str(ex / "c1" / "POSCAR")}]
+    files, dirs = _prune_unreferenced_files(ex, units, None)
+    assert (ex / "c1" / "OUTCAR").is_file() and (ex / "c1" / "POSCAR").is_file()   # referenced kept
+    assert not (ex / "c1" / "KPOINTS").exists() and not (ex / "c1" / "OSZICAR").exists()
+    assert not (ex / "inputs_only").exists()   # primary-less dir emptied then pruned
+    assert files == 4 and dirs == 1

@@ -1242,6 +1242,44 @@ def _find_calc_units(root: Path) -> list[dict[str, str]]:
     return units
 
 
+def _prune_unreferenced_files(extracted_root: Path, units: list[dict],
+                              budget: "StagingBudget | None") -> tuple[int, int]:
+    """Delete extracted files that NO calc unit references, right after the units are found.
+
+    ``_want_member`` extracts every VASP-named file, but ``_find_calc_units`` only builds a
+    unit for a directory that holds a primary output, and a unit records only ONE file per
+    role slot (:func:`_assign_role`). So KPOINTS/OSZICAR (no role slot), inputs sitting in a
+    directory with no primary, and duplicate-name files never picked into a unit are left on
+    disk yet are **never parsed** (parse reads only a unit's role-slotted files) and can
+    **never be reclaimed by** ``purge-raw`` (it frees only a unit's own files and prunes only
+    empty dirs). Over a long harvest they pin inodes monotonically — the binding CSD3 quota.
+    Pruning them here keeps staging to exactly what parse and a later ``--retry-rejected``
+    need, and refunds the staging budget so its live tally stays accurate. A file an unparsed
+    (later-retried) unit references is in ``units`` and so is kept. Returns
+    ``(files_removed, dirs_pruned)``.
+    """
+    if not extracted_root.is_dir():
+        return 0, 0
+    referenced = {Path(v) for u in units for k, v in u.items() if k != "dir"}
+    files = dirs = 0
+    for f in list(extracted_root.rglob("*")):
+        if f.is_file() and f not in referenced and not _is_junk_member(f.name):
+            _delete_refund(f, budget)
+            files += 1
+    # Empty directories still consume inodes on Lustre — prune them bottom-up.
+    for d in sorted((p for p in extracted_root.rglob("*") if p.is_dir()),
+                    key=lambda p: len(p.parts), reverse=True):
+        try:
+            if not any(d.iterdir()):
+                d.rmdir()
+                if budget is not None:
+                    budget.refund(0, 1)
+                dirs += 1
+        except OSError:  # raced/permission — inode housekeeping only, leave it
+            continue
+    return files, dirs
+
+
 def _worth_keeping(dest: Path, transient: bool, truncated: bool) -> bool:
     """Whether to leave an unrecorded record's staging tree on disk for the next run.
 
@@ -1377,6 +1415,9 @@ def fetch_record(rec: dict, session: requests.Session, raw_dir: Path,
                    transient=(transient or truncated) or None,
                    detail=_budget_detail(kept=False) if truncated else None)
         return None
+    # Drop extracted files no calc unit references (KPOINTS/OSZICAR, primary-less-dir inputs,
+    # unpicked duplicates): never parsed, and purge-raw can't reclaim them later.
+    _prune_unreferenced_files(dest / "extracted", units, budget)
     return _fetched_entry(rec, recid, dest, raw_dir, units, availability, availability_files)
 
 
