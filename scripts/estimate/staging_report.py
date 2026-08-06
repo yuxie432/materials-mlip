@@ -110,6 +110,10 @@ def main() -> int:
     ap.add_argument("--with-bytes", action="store_true", help="also sum bytes (slower)")
     ap.add_argument("--inflight-min", type=int, default=30,
                     help="an orphan dir touched within N min is flagged possibly in-flight")
+    ap.add_argument("--explain", default=None, metavar="RECID",
+                    help="print sample file paths per category for ONE record (to eyeball "
+                         "what 'stray'/'orphan' actually are before deleting)")
+    ap.add_argument("--examples", type=int, default=8, help="sample paths per category for --explain")
     args = ap.parse_args()
 
     raw, ds, man = Path(args.raw), Path(args.dataset), Path(args.manifests)
@@ -165,6 +169,32 @@ def main() -> int:
                 while a != child and a.parent != a:
                     skeleton.add(a)
                     a = a.parent
+
+        if args.explain and recid == args.explain:
+            samples: dict[str, list[str]] = collections.defaultdict(list)
+
+            def _cat(path: Path, is_dir: bool) -> str:
+                p = path if is_dir else path.parent
+                while True:
+                    if p in unit_status:
+                        return unit_status[p]
+                    if p == child or p.parent == p:
+                        break
+                    p = p.parent
+                return "structural" if (is_dir and path in skeleton) else "stray"
+
+            for f in child.rglob("*"):
+                is_d = f.is_dir()
+                c = _cat(f, is_d) if rec is not None else "orphan"
+                if len(samples[c]) < args.examples:
+                    samples[c].append(str(f.relative_to(child)) + ("/" if is_d else ""))
+            print(f"\n--- EXPLAIN recid {recid}  status={ 'orphan' if rec is None else '' } ---")
+            for cat_name in ("stray", "orphan", "redundant", "recoverable", "pending", "structural"):
+                if samples.get(cat_name):
+                    print(f"  [{cat_name}] e.g.:")
+                    for s in samples[cat_name]:
+                        print(f"      {s}")
+            print("--- end explain ---\n")
 
         inodes, nbytes = walk_counts(child, unit_status, skeleton, args.with_bytes)
         rec_inodes = sum(inodes.values())
