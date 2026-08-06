@@ -110,12 +110,23 @@ def main() -> int:
     ap.add_argument("--inflight-min", type=int, default=30,
                     help="skip orphan dirs modified within N minutes (in-flight guard)")
     ap.add_argument("--audit", default=None, help="write a JSONL list of deletions here")
+    ap.add_argument("--force", action="store_true",
+                    help="apply even if a parse lock is present (NOT recommended)")
     args = ap.parse_args()
 
     raw, ds, man = Path(args.raw), Path(args.dataset), Path(args.manifests)
     if not raw.is_dir():
         print(f"raw dir not found: {raw}", file=sys.stderr)
         return 1
+
+    # Hard safety gate: never delete under a running parse/pipeline. A live parse is
+    # mid-reading calc files; deleting one produces a spurious parse error and lost data.
+    lock = ds / ".parse.lock"
+    if args.apply and lock.exists() and not args.force:
+        print(f"REFUSING --apply: {lock} exists — a parse/pipeline may be running. Stop the "
+              f"job (squeue -u $USER) first, or pass --force if you are certain it is idle.",
+              file=sys.stderr)
+        return 2
 
     parsed = {r["calc_id"] for r in load_jsonl(ds / "metadata.jsonl") if r.get("calc_id")}
     terminal = {r["id"] for r in load_jsonl(ds / "rejections.jsonl")
@@ -131,6 +142,8 @@ def main() -> int:
     now = time.time()
     freed = collections.Counter()          # inodes by category
     n_recs = collections.Counter()
+    n_preserved_dirs = 0                    # recoverable/pending unit dirs kept
+    n_safety_violations = 0                 # deletions under a kept unit dir (must stay 0)
     audit = open(args.audit, "w") if args.audit else None
     RANK = {"pending": 2, "recoverable": 1}  # any kept unit -> keep the dir
 
@@ -177,6 +190,19 @@ def main() -> int:
                 unit_status[udir] = st       # a kept unit in a shared dir wins
 
         del_files, del_dirs = plan_record(child, unit_status, keep_files)
+
+        # SAFETY SELF-CHECK: no deletion may fall under a recoverable/pending unit dir.
+        kept_dirs = [d for d, st in unit_status.items() if st in ("recoverable", "pending")]
+        n_preserved_dirs += len(kept_dirs)
+        for _cat, fp in del_files:
+            if any(_is_within(kd, fp) or fp == kd for kd in kept_dirs) or fp in keep_files:
+                n_safety_violations += 1
+                print(f"  !! SAFETY VIOLATION: would delete {fp} under a kept unit — "
+                      f"skipping this record", file=sys.stderr)
+        if any(any(_is_within(kd, fp) or fp == kd for kd in kept_dirs) or fp in keep_files
+               for _cat, fp in del_files):
+            continue  # refuse to touch a record whose plan overlaps a recovery source
+
         if not del_files and not del_dirs:
             continue
         n_recs["cleaned"] += 1
@@ -212,9 +238,12 @@ def main() -> int:
         print("  (--drop-recoverable: failed-calc recovery sources INCLUDED)")
     print(f"  TOTAL reclaimable:           {total:>10,} inodes   "
           f"across {n_recs['cleaned']} fetched + {n_recs['orphan']} orphan records")
+    print(f"  SAFETY: {n_preserved_dirs:,} recoverable/pending calc dirs preserved; "
+          f"{n_safety_violations} deletions under a recovery source "
+          f"({'OK' if n_safety_violations == 0 else 'ABORTED those records'})")
     if args.audit:
         print(f"  audit list: {args.audit}")
-    return 0
+    return 1 if n_safety_violations else 0
 
 
 if __name__ == "__main__":
