@@ -67,16 +67,24 @@ def plan_record(child: Path, unit_status: dict[Path, str], keep_files: set[Path]
     fully_del: set[Path] = set()
 
     def file_cat(fp: Path) -> str | None:
+        """redundant/stray if deletable, else None (keep). Walks the WHOLE ancestor chain:
+        a file under ANY recoverable/pending calc dir is kept (protect the entire recovery
+        subtree — NEB nests a parsed image dir inside a failed parent dir), so we only ever
+        delete files whose nearest owning calc is parsed, or that no calc owns at all."""
         if fp in keep_files:
             return None
         p = fp.parent
+        nearest = None
         while True:
             if p in unit_status:
-                return "redundant" if unit_status[p] == "parsed" else None
+                if unit_status[p] in ("recoverable", "pending"):
+                    return None                      # inside a recovery-source subtree: keep
+                if nearest is None:
+                    nearest = unit_status[p]          # nearest owning calc is parsed
             if p == child or p.parent == p:
                 break
             p = p.parent
-        return "stray"  # under no unit dir
+        return "redundant" if nearest == "parsed" else "stray"
 
     for dirpath, dirnames, filenames in os.walk(child, topdown=False):
         dp = Path(dirpath)
