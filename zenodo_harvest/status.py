@@ -95,6 +95,14 @@ def status_report(
     # TRIAGE — the keep-list is the fetch denominator.
     keep = Path(keep_path) if keep_path else manifests_dir / "keep.jsonl"
     n_keep = _count_nonempty_lines(keep)
+    # Record ids on the keep-list, so record-level progress can be counted against the
+    # SAME set the fetch works over (and never exceed 100% from a stale rejection recid).
+    keep_recids: set[str] = set()
+    if keep.is_file():
+        for rec in read_jsonl(keep):
+            rid = rec.get("recid")
+            if rid:
+                keep_recids.add(str(rid))
 
     # FETCH — aggregate across every *.fetched.jsonl (pipeline writes one per part; a
     # standalone `fetch` writes a single manifests/fetched.jsonl). rglob covers both.
@@ -118,12 +126,22 @@ def status_report(
     # PARSE — one metadata line per parsed calc; frames come from each calc's quality block.
     meta = dataset_dir / "metadata.jsonl"
     n_calcs = n_frames = n_frames_forces = 0
+    parsed_recids: set[str] = set()  # distinct RECORDS that produced >=1 stored calc
     if meta.is_file():
         for rec in read_jsonl(meta):
             n_calcs += 1
             q = rec.get("quality") or {}
             n_frames += int(q.get("n_frames", 0) or 0)
             n_frames_forces += int(q.get("n_frames_with_forces", 0) or 0)
+            # record id: from provenance if present, else the calc_id (zenodo:<recid>:<path>).
+            rid = (rec.get("provenance") or {}).get("record_id")
+            if not rid:
+                cid = rec.get("calc_id") or ""
+                if cid:
+                    parts = cid.split(":")
+                    rid = parts[1] if cid.startswith("zenodo:") and len(parts) > 1 else parts[0]
+            if rid:
+                parsed_recids.add(str(rid))
 
     # STORE — shard count + total dataset footprint.
     shards = sorted(dataset_dir.glob("shard-*.extxyz.gz"))
@@ -145,6 +163,7 @@ def status_report(
     # dataset dir (per-task in the array model, but the pipeline uses the shared one).
     rej_by_reason: Counter = Counter()
     rej_by_stage: Counter = Counter()
+    fetch_reject_recids: set[str] = set()  # RECORD-level fetch rejects (id has no ':')
     n_rej = 0
     for rp in (manifests_dir / "rejections.jsonl", dataset_dir / "rejections.jsonl"):
         if rp.is_file():
@@ -152,6 +171,22 @@ def status_report(
                 n_rej += 1
                 rej_by_reason[str(rec.get("reason", "?"))] += 1
                 rej_by_stage[str(rec.get("stage", "?"))] += 1
+                rid = rec.get("id")
+                # A record-level fetch rejection (per-file ids are "<recid>:<key>",
+                # parse ids are "zenodo:<recid>:<path>" — both carry ':').
+                if rec.get("stage") == "fetch" and isinstance(rid, str) and ":" not in rid:
+                    fetch_reject_recids.add(rid)
+
+    # RECORD-level progress: a record is "attempted" once it is fetched (yielded VASP) or
+    # record-level rejected at fetch. This is the denominator status previously lacked —
+    # fetched_records alone hides the ~2/3 of the keep-list that is attempted-but-rejected.
+    attempted_recids = seen_recids | fetch_reject_recids
+    if keep_recids:  # count only records actually on the keep-list (no stale-recid overshoot)
+        attempted_recids &= keep_recids
+    n_attempted = len(attempted_recids)
+    n_fetched_in_keep = len(seen_recids & keep_recids) if keep_recids else n_fetched
+    n_fetch_rejected = max(0, n_attempted - n_fetched_in_keep)
+    n_untouched = max(0, n_keep - n_attempted)
 
     return {
         "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -162,6 +197,10 @@ def status_report(
         "triage": {"keep": n_keep},
         "fetch": {"fetched_records": n_fetched, "to_fetch": n_keep,
                   "pct": _pct(n_fetched, n_keep), "calc_units": n_calc_units},
+        "records": {"keep": n_keep, "attempted": n_attempted,
+                    "pct": _pct(n_attempted, n_keep), "fetched": n_fetched_in_keep,
+                    "fetch_rejected": n_fetch_rejected, "untouched": n_untouched,
+                    "with_frames": len(parsed_recids)},
         "parse": {"calcs_parsed": n_calcs, "calc_units_fetched": n_calc_units,
                   "pct": _pct(n_calcs, n_calc_units), "frames": n_frames,
                   "frames_with_forces": n_frames_forces},
@@ -196,11 +235,15 @@ def format_status(r: dict[str, Any]) -> str:
     """Render the report dict as a compact human-readable block."""
     d, t, f = r["discover"], r["triage"], r["fetch"]
     p, s, st, e = r["parse"], r["store"], r["staging"], r["errors"]
+    rc = r["records"]
     lines = [f"harvest status @ {r['generated']}   ({r['data']['dataset']})",
              f"DISCOVER  candidates: {d['candidates']:,}",
              f"TRIAGE    keep-list:  {t['keep']:,}",
              f"FETCH     fetched:    {f['fetched_records']:,} / {f['to_fetch']:,}  "
              f"({_pctstr(f['pct'])})   calc_units: {f['calc_units']:,}",
+             f"RECORDS   attempted:  {rc['attempted']:,} / {rc['keep']:,}  ({_pctstr(rc['pct'])})"
+             f"   fetched {rc['fetched']:,} · fetch-rejected {rc['fetch_rejected']:,} · "
+             f"untouched {rc['untouched']:,}   in-dataset {rc['with_frames']:,}",
              f"PARSE     parsed:     {p['calcs_parsed']:,} / {p['calc_units_fetched']:,} calc_units  "
              f"({_pctstr(p['pct'])})   frames: {p['frames']:,}",
              f"STORE     shards: {s['shards']:,}   dataset: {_h(s['dataset_bytes'])}"]
