@@ -155,11 +155,14 @@ def main() -> int:
     audit = open(args.audit, "w") if args.audit else None
     RANK = {"pending": 2, "recoverable": 1}  # any kept unit -> keep the dir
 
-    for child in sorted(raw.iterdir()):
-        if not child.is_dir():
-            continue
+    record_dirs = [c for c in sorted(raw.iterdir()) if c.is_dir()]
+    n_total = len(record_dirs)
+    for i, child in enumerate(record_dirs, 1):
         recid = child.name
         rec = fetched.get(recid)
+        # Progress to stderr: the walk is I/O-bound on Lustre, so show it advancing (and
+        # which record is eating the time) rather than sitting silent for minutes.
+        print(f"  [{i}/{n_total}] {recid} ...", end="\r", file=sys.stderr, flush=True)
 
         if rec is None:  # ORPHAN — whole tree, unless possibly in-flight
             if (now - child.stat().st_mtime) < args.inflight_min * 60:
@@ -232,6 +235,7 @@ def main() -> int:
                 except OSError:
                     pass
 
+    print(f"  [{n_total}/{n_total}] done" + " " * 20, file=sys.stderr)  # clear the \r line
     if audit:
         audit.close()
     total = freed["redundant"] + freed["stray"] + freed["orphan"] + freed["dirs_pruned"]
