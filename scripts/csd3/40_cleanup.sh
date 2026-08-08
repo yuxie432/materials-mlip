@@ -4,7 +4,7 @@
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH -c 1
-#SBATCH -t 4:00:00                      # a full raw/ walk + deletes; raise if it needs longer
+#SBATCH -t 8:00:00                      # a full raw/ walk + deletes (31044's ~129k-inode walk is slow); resumable
 #SBATCH -o logs/zh-cleanup-%j.out
 #SBATCH -e logs/zh-cleanup-%j.err
 #
@@ -31,6 +31,7 @@ MODE="DRY-RUN"
 FLAGS=(--audit "$ZENODO_HARVEST_DATA/cleanup_audit-${SLURM_JOB_ID:-local}.jsonl")
 if [[ "${APPLY:-0}" == "1" ]]; then FLAGS+=(--apply); MODE="APPLY"; fi
 if [[ "${DROP_RECOVERABLE:-0}" == "1" ]]; then FLAGS+=(--drop-recoverable); fi
+if [[ "${ONLY_ORPHANS:-0}" == "1" ]]; then FLAGS+=(--only-orphans); fi
 
 echo "=== zh-cleanup $MODE  $(date -Is)  on $(hostname) ==="
 echo "raw usage BEFORE:"; lfs quota -u "$USER" /rds/user/"$USER"/hpc-work 2>/dev/null || true
