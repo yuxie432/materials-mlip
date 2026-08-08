@@ -115,6 +115,9 @@ def main() -> int:
     ap.add_argument("--apply", action="store_true", help="actually delete (default: dry-run)")
     ap.add_argument("--drop-recoverable", action="store_true",
                     help="ALSO delete failed-calc recovery sources (last resort)")
+    ap.add_argument("--only-orphans", action="store_true",
+                    help="fast unblock: delete ONLY orphan trees (records in no fetched.jsonl); "
+                         "skips the slow per-fetched-record walk entirely")
     ap.add_argument("--inflight-min", type=int, default=30,
                     help="skip orphan dirs modified within N minutes (in-flight guard)")
     ap.add_argument("--audit", default=None, help="write a JSONL list of deletions here")
@@ -176,6 +179,9 @@ def main() -> int:
                                         "path": str(child), "inodes": n}) + "\n")
             if args.apply:
                 shutil.rmtree(child, ignore_errors=True)
+            continue
+
+        if args.only_orphans:      # fast path: skip the (slow) per-fetched-record walk
             continue
 
         base_meta = {"provenance": rec["provenance"],
