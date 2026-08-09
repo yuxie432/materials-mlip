@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import errno
 import logging
+import lzma
 import os
 import re
 import shutil
@@ -950,11 +951,19 @@ _EXTRACTORS = {"zip": _extract_zip, "tar": _extract_tar, "rar": _extract_rar,
 _EXTRACT_ERRORS: tuple[type[BaseException], ...] = (
     zipfile.BadZipFile, tarfile.TarError, EOFError, OSError, ValueError,
     RuntimeError, AttributeError,
+    # A corrupt .xz/.tar.xz raises lzma.LZMAError (NOT an OSError/TarError), so without it
+    # a bad xz crashes the whole fetch worker; the record then has no rejection logged and
+    # is re-attempted (re-downloaded) on every pass — an unbounded spin. Catch -> one clean
+    # extract_error, then the record terminates as no_vasp/no_calc and is skipped on resume.
+    lzma.LZMAError,
 )
 if zstandard is not None:  # pragma: no branch - trivial
     _EXTRACT_ERRORS = (*_EXTRACT_ERRORS, zstandard.ZstdError)
 if py7zr is not None:  # pragma: no branch - trivial
-    _EXTRACT_ERRORS = (*_EXTRACT_ERRORS, py7zr.exceptions.ArchiveError)
+    # PasswordRequired (an encrypted .7z) is NOT a subclass of ArchiveError, so it must be
+    # listed explicitly — else an encrypted archive crashes the worker and spins like above.
+    _EXTRACT_ERRORS = (*_EXTRACT_ERRORS, py7zr.exceptions.ArchiveError,
+                       py7zr.exceptions.PasswordRequired)
 if rarfile is not None:  # pragma: no branch - trivial
     _EXTRACT_ERRORS = (*_EXTRACT_ERRORS, rarfile.Error)
 

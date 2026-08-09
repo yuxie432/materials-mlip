@@ -3034,3 +3034,22 @@ def test_prune_unreferenced_files_drops_noncalc_and_empty_dirs(tmp_path):
     assert not (ex / "c1" / "KPOINTS").exists() and not (ex / "c1" / "OSZICAR").exists()
     assert not (ex / "inputs_only").exists()   # primary-less dir emptied then pruned
     assert files == 4 and dirs == 1
+
+
+def test_extract_errors_catches_corrupt_xz_and_encrypted_7z():
+    """A corrupt .xz (LZMAError) and an encrypted .7z (py7zr PasswordRequired) must be in
+    the caught set, so they log one clean extract_error instead of crashing the fetch worker
+    and being re-attempted (re-downloaded) forever."""
+    import lzma
+    from zenodo_harvest.fetch import _EXTRACT_ERRORS
+    try:
+        lzma.decompress(b"this is not a valid xz stream")
+    except Exception as exc:                       # noqa: BLE001
+        assert isinstance(exc, _EXTRACT_ERRORS)    # the real LZMAError is now caught
+    else:
+        raise AssertionError("expected an LZMAError from corrupt xz input")
+    try:
+        import py7zr
+    except ImportError:
+        return
+    assert issubclass(py7zr.exceptions.PasswordRequired, _EXTRACT_ERRORS)
