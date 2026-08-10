@@ -16,13 +16,15 @@ live, it is reproducible from the `curl` snippets given. Anything unverified is 
 | Question | Recommendation |
 |---|---|
 | Is NOMAD worth harvesting? | **Yes.** ~**14.7M** public VASP entries, CC BY 4.0, one well-documented paginated REST API. |
-| Raw VASP files, or NOMAD's parsed "archive"? | **Primary: download the raw `vasprun.xml`/`OUTCAR` and run them through the *existing* `parse.py`.** Keeps the NOMAD dataset byte-for-byte schema-identical to the Zenodo one (same `REF_*` keys, same quality tags, trivially mergeable). Use the normalized archive only for *metadata filtering/dedup*, not as the bulk label source (it's ~0.7 s/entry — far too slow at 14.7M). |
-| Biggest risk? | **Deduplication.** ~52% of VASP entries are bulk ingests of **AFLOW (6.79M) / OQMD (0.57M) / Materials Project (0.28M)** — and MP overlaps your *own* planned `mp-api` harvest. Decide inclusion + dedup *before* scaling. |
-| How to find VASP-DFT-with-forces | `results.method.simulation.program_name = "VASP"` + `results.method.method_name = "DFT"`, then `results.properties.available_properties` contains `trajectory` (multi-step) — confirm forces per entry at parse time. |
+| **Scope (mentor 2026-08-10)** | **Direct uploads only** — exclude AFLOW/OQMD/Materials Project (52% of VASP; MP is also harvested directly via `mp-api`). **~7,110,950** VASP-DFT direct-upload entries remain (live-verified). Dedup those against the already-fetched Zenodo records. |
+| Raw VASP files, or NOMAD's parsed "archive"? | **Raw `vasprun.xml`, re-parsed by the *existing* `parse.py`** (mentor: preserve all metadata). Keeps the NOMAD dataset byte-for-byte schema-identical to the Zenodo one. The archive is rejected as the label source: no drop-in σ→0 energy (`energy.total_t0` anomalous), undocumented stress sign, and ~0.7 s/entry. |
+| **Estimated size** (measured 2026-08-05) | ~7.1M calcs → **~30M frames** (median **1** / mean **~4.6** ionic steps/entry; range ~15–100M — AIMD tail is the uncertainty). Final on disk **~10 GB** extxyz.gz + **~15–20 GB** `metadata.jsonl`. Transient download **~6.5 TB** vasprun-only over the whole run (deleted after parse); **do not fetch OUTCAR wholesale** (~170 TB — its mean is 23 MB with a 412 MB tail). |
+| Biggest risk? | **Deduplication.** Handled by (a) the `not external_db` scope filter (drops AFLOW/OQMD/MP), and (b) scanning each entry's `references` for `zenodo.org`/DOI overlap with the Zenodo dataset. |
+| How to find VASP DFT | `results.method.simulation.program_name = "VASP"` + `results.method.method_name = "DFT"`. **Do NOT filter on the `trajectory` available-property** — measured, it tags only ~0.1% of direct uploads yet most ARE multi-step; the ionic steps live in the raw vasprun and are recovered at parse time. |
 | Pagination | **Keyset** (`page_after_value`/`next_page_after_value`), never offset (offset is hard-capped at 10 000, exactly like Zenodo's window). |
 | Auth | **Not required** for public reads. `owner="public"` selects published, non-embargoed data. |
-| Licence | Default **CC BY 4.0** → redistributing a derived training set is explicitly allowed *with attribution to submitter + source*. Read the per-entry `license` field and keep only CC-BY. |
-| Client | Hand-rolled `requests` client mirroring `client.py` (resumable, disk-paced), **not** the heavyweight `nomad-lab` package. |
+| Licence | Default **CC BY 4.0** → redistributing a derived training set is explicitly allowed *with attribution to submitter + source*. Read the per-entry `license` field and keep only CC-BY. NB: `license` is a **derived** field — it can't go in `required.include` (422); use `required: {"exclude": ["quantities"]}` on a discover scan. |
+| Code | A separate **`nomad_harvest/` package** (stages 0-2) that *imports* the shared `zenodo_harvest` stages 3-5 (`parse`/`store`/`verify`) unmodified. Hand-rolled `requests` client, **not** the heavyweight `nomad-lab` package. |
 
 ---
 
@@ -164,11 +166,15 @@ Query fields (all live-verified):
 
 - **Code:** `results.method.simulation.program_name = "VASP"` (fixed vocabulary — exact spelling).
 - **DFT only (exclude GW/BSE/DMFT):** `results.method.method_name = "DFT"`.
-- **Per-ionic-step data (for trajectories):** `results.properties.available_properties`
-  contains `"trajectory"` (2.34M entries). ⚠ **There is no first-class "has per-step
-  forces" flag** — the only force-named searchable value is `final_force_maximum`
-  (single-point). Forces live in the archive/raw file, so **confirm forces at parse
-  time** (exactly the Zenodo "reject at parse time, not search time" rule).
+- **Multi-step / forces — do NOT try to pre-filter.** ⚠ The
+  `results.properties.available_properties` value `"trajectory"` is **not** a "multi-step"
+  proxy: measured on the direct-upload subset it tags only **7,143 (0.1%)** of entries, yet
+  the archive sample shows a **median of 1** and **mean of ~4.6** ionic steps/entry — most
+  are single-point or short relaxations, and the step count lives in the raw vasprun, not in
+  a searchable flag. There is likewise no first-class "has forces" flag (only
+  `final_force_maximum`, single-point). So take all VASP-DFT direct uploads and **recover
+  steps + confirm forces at parse time** (the Zenodo "reject at parse time, not search time"
+  rule).
 - **Chemistry (optional):** `results.material.elements` with `any`/`all`/`none`
   (e.g. `{"results.material.elements": {"all": ["Ti","O"]}}`).
 - **Public only:** top-level `owner: "public"` (do **not** filter `with_embargo=false`
@@ -208,9 +214,40 @@ matters three ways:
   the dataset's provenance record (satisfies the mandatory-provenance rule and gives
   correct CC-BY attribution).
 
-**Decision to take to the mentor (see §9):** include AFLOW/OQMD at all, or scope the
-first NOMAD harvest to **direct uploads + selected element systems**? At 14.7M entries
-you *cannot and should not* pull everything — filter hard, pace with the disk/inode valve.
+**Decision (mentor 2026-08-10): direct uploads only.** Exclude AFLOW/OQMD/MP via the
+`not external_db:any` clause (their high-throughput, low-diversity bulk is set aside, and
+MP is harvested via `mp-api`), leaving ~**7.1M** direct-upload VASP-DFT entries. Even that
+is far more than one quota holds, so scope further (element systems, or a cap) and pace with
+the disk/inode valve — see the size estimate next.
+
+### Size estimate — measured 2026-08-05
+
+Sampled ~140 direct-upload entries spread across the `entry_id` keyspace (≈140 distinct
+uploads; `entry_id` is a hash, so a keyset scan spreads across uploads). Per entry:
+
+| per entry | median | mean | tail |
+|---|---|---|---|
+| ionic steps (= frames) | **1** | **~4.6** | p90 = 11, max 98 (AIMD tail higher) |
+| atoms / frame | 6 | ~9 | max 32 |
+| `vasprun.xml` as stored (often `.bz2`/`.gz`) | 0.36 MB | ~0.9 MB | max 14 MB |
+| `OUTCAR` | 0.03 MB | ~23 MB | **max 412 MB** |
+
+The 7.11M entries come from only **~3,792 uploads** (~1,875 entries each), which is why
+per-upload bulk fetch is cheap on request count. Extrapolated to the full harvest (pre-dedup):
+
+| | estimate |
+|---|---|
+| frames | **~30M** (mean 4.6 steps); range **~15–100M** — the AIMD tail is the whole uncertainty |
+| final `extxyz.gz` | **~10 GB** (cells are small) — robustly tens of GB even at 100M frames |
+| `metadata.jsonl` | **~15–20 GB** (one record/calc × 7.1M — this *dominates* the payload) |
+| **final total on disk** | **~25–40 GB** |
+| transient download, vasprun-only | **~6.5 TB** over the whole run (deleted after each parse) |
+| transient download +OUTCAR | ~170 TB → **don't**; OUTCAR is dominated by a 412 MB tail |
+| peak staging disk | disk/inode-valve budget (e.g. 200–800 GB) + the growing dataset — **fits the 1 TB / 1M-inode CSD3 quota** |
+
+Unit economics for scoping a subset: **per 100k entries** ≈ 0.5M frames, ~90 GB vasprun
+download, ~1 GB `extxyz.gz`. Re-measure on your own sample with
+`python -m nomad_harvest.smoke -n 200 --keep` (it prints this calibration live).
 
 ---
 
@@ -229,23 +266,45 @@ you *cannot and should not* pull everything — filter hard, pace with the disk/
 
 ---
 
-## 7. Proposed pipeline (mapped onto the existing package)
+## 7. Pipeline — the `nomad_harvest/` package (built)
 
-NOMAD becomes a **source adapter** feeding the same stages 3–4. Reuse is high:
+NOMAD lives in a **separate top-level package** `nomad_harvest/` (stages 0-2) that
+**imports the shared `zenodo_harvest` stages 3-5 unmodified** (parse → store → merge/verify),
+so both sources produce one schema-identical dataset. Nothing in `zenodo_harvest/` is changed.
 
-| Stage | Zenodo module | NOMAD plan |
+| Stage | Zenodo module | `nomad_harvest/` |
 |---|---|---|
-| 0 discover | `discover.py` (keyword search) | **new** `nomad_discover` — keyset-paginate `entries/query` (VASP+DFT [+filters]) → candidate manifest (`entry_id`, `mainfile`, `external_db`, `references`, `license`, elements, available_properties). Single-stream, self-throttled ≤30 req/s. |
-| 1 triage | `triage.py` (peek-into-zip) | **simpler** — no peek needed. Filter `method_name=DFT`, `license` CC-BY, `available_properties ⊇ trajectory`, **dedup** vs MP-plan + Zenodo (§5). |
-| 2 fetch | `fetch.py` (download+extract VASP from archives) | **new thin** `nomad_fetch` — pull only the VASP files with **server-side** `files.glob_pattern="*vasprun.xml*"` (also catches AFLOW's `.relax1/.relax2`; `include_files` matches exact names only so it misses those). Either bulk `POST /entries/raw/query` (one zip for a whole batch) or per-file `GET /entries/{id}/raw/{path}` (supports `offset`/`length`/`decompress`), into the **same** `raw_dir/<entry_id>/`. `GET /entries/{id}/rawdir` lists files first if you want to inspect. Reuse the **disk/inode valve** (`StagingBudget`) and resumability. |
-| 3 parse | `parse.py` | **unchanged** — pymatgen `Vasprun` on the downloaded `vasprun.xml*`. One tweak: accept NOMAD mainfile names (`vasprun.xml.relax1`, `OUTCAR` variants). |
-| 4 store | `store.py` | **unchanged** — `REF_energy/forces/stress`, `metadata.jsonl`. |
-| join/verify | `dataset_ops.py` | **unchanged** — `merge-datasets` folds NOMAD task dirs into the Zenodo dataset; `verify` gates it. |
+| 0 discover | `discover.py` (keyword search) | `client.iter_entries` keyset-paginates `entries/query` (the direct-upload VASP-DFT query); `harvest.discover_candidates` license-gates + Zenodo-dedups inline and writes a **slimmed** keep-list. ~700 requests total — trivial. |
+| 1 triage | `triage.py` (peek-into-zip) | **folded into discover** — no zip-peek. `is_reusable_license` (reused) + `references`→Zenodo dedup, both audited to a rejection log. |
+| 2 fetch | `fetch.py` (download+extract archives) | `harvest.fetch_candidates` → per entry, `rawdir` then `download_raw_file` the vasprun under a **canonical name** (handles `.bz2`/`.gz` + odd naming); groups via the shared `_find_calc_units`; writes `nomad_fetched.jsonl`. Heavy outputs → availability only, never fetched. |
+| 3 parse | `parse.py` | **reused unmodified**: `python -m zenodo_harvest.cli parse --in nomad_fetched.jsonl --dataset-dir data/dataset/nomad`. |
+| 4 store | `store.py` | **reused** — `REF_energy/forces/stress` + `metadata.jsonl`. |
+| join/verify | `dataset_ops.py` | **reused** — `verify` gates it; `merge-datasets` folds the NOMAD dataset into the Zenodo one. |
 
-New code is essentially: **`nomad_client.py`** (throttled/retrying REST client with
-keyset pagination + 503 backoff, mirroring `client.py`) and **`nomad_discover.py` +
-`nomad_fetch.py`**. Parse/store/merge/verify/status are reused as-is. Optionally add
-`nomad_archive.py` (Option B metainfo→frame adapter) as a fallback.
+What the Zenodo pipeline needs that NOMAD does **not**: keyword-recall discover + date-bisection,
+zip-peek triage, archive download/selective-extract, nested-archive recursion, zip-stream — all
+gone. NOMAD's indexed metadata + per-file raw API replace them.
+
+**One deferred shared-core change (Phase 3, at merge time).** The shared parser hard-codes
+`calc_id = "zenodo:<recid>:…"` and tags frames `source="zenodo"`. The authoritative source is
+already correct in `metadata.jsonl` (`provenance.source="nomad"`), so for an *isolated* NOMAD
+dataset this is cosmetic; but before *merging* into the combined dataset the parser should gain a
+small backward-compatible `source` parameter so NOMAD calc_ids namespace as `nomad:…` (no
+cross-source id collision in `verify`'s bijection). Prototyped and then reverted per your
+instruction to keep `zenodo_harvest/` untouched — it's a ~7-line change to make then.
+
+### Rate-limiting process during the run
+
+- **Not discovery** (~700 keyset requests for all 7.1M) and **not request count** — the 7.1M
+  entries come from only **~3,792 uploads**, so fetch can batch per upload.
+- The bottleneck is a race between **fetch throughput** (~6.5 TB pulled under NOMAD's
+  ~10-concurrent / ~30-req/s ceiling *and* its 5xx flakiness — 502/503/504 all appear under
+  load, no `Retry-After` headers, so conservative self-throttle + exponential backoff) and
+  **parse CPU** (~7.1M pymatgen parses ≈ tens of CPU-days). Parse parallelises across array-job
+  cores; fetch is capped by NOMAD's limits and can't. **So fetch is the rate-limiting stage**,
+  with parse the close second that parallelism keeps hidden behind it (same fetch∥parse overlap
+  as the Zenodo `pipeline`). Final storage (~25-40 GB) is a non-issue; peak *staging* disk is
+  bounded by the valve.
 
 **Complementary path — OPTIMADE.** NOMAD implements OPTIMADE at
 `https://nomad-lab.eu/prod/v1/optimade/v1` (18.8M structures). Standardized
@@ -257,43 +316,45 @@ forces/energies, so it's a discovery/dedup aid only, never a label source.
 
 ## 8. Worth noting (consolidated gotchas)
 
-1. **Dedup before scale** (§5) — MP double-count vs your `mp-api` plan; Zenodo overlap via `references`; AFLOW/OQMD volume-vs-diversity.
+1. **Dedup** (§5) — the scope filter drops AFLOW/OQMD/MP; a `references` scan catches Zenodo overlap. MP also comes from `mp-api`, so don't double-harvest it.
 2. **Keyset pagination only** — offset dies at 10 000 (HTTP 422), just like Zenodo.
-3. **Archive query is slow (~0.7 s/entry)** — not a bulk label source; use raw+existing parser.
-4. **No "has per-step forces" search flag** — filter on `trajectory`, confirm at parse time.
-5. **SI units** in the archive (J/N/m/Pa) — only relevant if you ever use Option B; Option A (pymatgen) sidesteps it.
-6. **Archive label caveats (Option B only)** — verified: `energy.free`=VASP F, `energy.total`=energy-without-entropy E, and `energy.total_t0` is **anomalous** (not σ→0), so there's **no drop-in `e_0_energy`**; and the **stress sign is undocumented**. Validate both against a raw re-parse before trusting archive labels. Option A (pymatgen) avoids this entirely.
-7. **Mainfile naming** — `vasprun.xml.relax1` etc.; `parse.py`/`classify_files` must match `vasprun.xml*`.
-8. **AFLOW multi-segment relaxations** — a 2-stage relax can appear as *separate* entries (`.relax1`, `.relax2`), with `.relax2` also present as an aux file in the `.relax1` entry's dir. Harvest both for the full trajectory, but **dedup** so a segment isn't double-counted.
-9. **Ionic-step index** — `calculation.step` is unpopulated (`None`); use the array index (`calculation[k]`↔`system[k]` linked by `system_ref`).
-10. **Self-throttle** — ~30 req/s, ≤10 concurrent, 503-backoff, no headers to read; email support before millions of requests.
-11. **Raw files can be missing/partial** for some entries — check `rawdir`; fall back to archive (Option B) or skip+log.
-12. **Read the per-entry `license`** — keep only CC-BY, log the rest.
-13. **`nomad-lab` PyPI client** wraps this API (`from nomad.client.archive import ArchiveQuery`) and handles pagination/auth/parallelism — but it's a **heavy dependency** and returns the *archive*, not raw files. Prefer the hand-rolled `requests` client for a resumable, disk-paced HPC harvest (consistent with `client.py`).
-14. **Scale reality** — 14.7M ≫ the Zenodo harvest. Filter hard; never "pull everything."
+3. **`license` is a DERIVED field** — it 422s inside `required.include`; use `required: {"exclude": ["quantities"]}` on a discover scan (keeps `license`/`references`/`results`) and slim the keep-list yourself (`slim_candidate`) so manifest size ≠ response size. *(caught by the smoke test)*
+4. **`raw/{path}` is relative to the mainfile's DIRECTORY**, not the upload root — the full path 404s, the mainfile-dir-relative path 200s (`raw_path_rel`). *(caught by the smoke test — every fetch failed until fixed)*
+5. **No multi-step / forces search flag** — the `trajectory` property tags only ~0.1% of direct uploads (median 1, mean ~4.6 steps); **don't pre-filter on it** — recover steps + confirm forces at parse time.
+6. **Compression + naming** — NOMAD stores files `.bz2`/`.gz` under varied names (`GEO3_vasprun.xml.bz2`, `vasprun.xml.relax1`); stage under a **canonical name** (`vasprun.xml[.bz2]`) so `_find_calc_units` + pymatgen `zopen` read them unchanged. Do **not** rely on the server-side `decompress` param — it doesn't handle `.bz2`. *(smoke verifies compressed-kept == locally-decompressed)*
+7. **Self-throttle + 5xx backoff** — ~30 req/s, ≤10 concurrent, no `Retry-After`; **502/503/504 all appear under load** (seen repeatedly in the smoke). The client backs off exponentially. Email support before a multi-million pull.
+8. **Archive label caveats (only if you ever use the normalized archive)** — `energy.free`=F, `energy.total`=E, `energy.total_t0` anomalous (no drop-in σ→0), stress sign undocumented, `calculation.step`=None. This is *why* we re-parse raw vasprun instead.
+9. **Raw files can be missing/partial** — `rawdir` first; skip+log an entry with no vasprun/OUTCAR primary.
+10. **Read the per-entry `license`** — keep only CC-BY, log the rest.
+11. **calc_id namespacing before merge** — the shared parser prefixes `zenodo:`; add a small `source` param (§7) before merging NOMAD into the combined dataset so ids can't collide.
+12. **`nomad-lab` PyPI client** returns the *archive* (not raw files) and is a heavy dependency — prefer the hand-rolled `requests` client.
+13. **Scale** — even scoped to ~7.1M direct uploads it's ≫ the Zenodo harvest. Filter hard (elements / a cap); pace with the disk/inode valve.
 
 ---
 
 ## 9. Concrete next steps
 
-- **Phase 0 — smoke test (½ day).** Pull ~20 VASP entries' raw `vasprun.xml*` via
-  `GET /entries/{id}/raw/{path}`, run them through the *current* `parse.py`, and confirm
-  frames match the Zenodo frame schema. Validates the mainfile-naming tweak end-to-end.
-- **Phase 1 — client + discover.** Write `nomad_client.py` (keyset, 503-backoff) and
-  `nomad_discover.py`; produce a candidate manifest for a **bounded** subset (one
-  element system, or direct-uploads-only) to keep it small.
-- **Phase 2 — triage + dedup.** Implement the `(external_db, external_id)` + `references`
-  dedup against the Zenodo `metadata.jsonl` and the MP plan; settle inclusion policy with mentor.
-- **Phase 3 — fetch + scale on CSD3.** `nomad_fetch.py` reusing the disk/inode valve;
-  run stages 3–4 with the existing `pipeline`/array-job tooling; `merge-datasets` into
-  the combined dataset. Notify `support@nomad-lab.eu` if the pull is large.
+- **Phase 0 — smoke test — ✅ BUILT & PASSING.** `python -m nomad_harvest.smoke -n 12`
+  runs the whole path live in an isolated dir (discover → dedup → fetch → decompress →
+  **existing pymatgen parser** → store → `verify`) with PASS/FAIL checks + size calibration.
+  Validated 2026-08-10: 6/6 real NOMAD vaspruns parsed → 113 frames, forces+stress present,
+  `verify` ok, `.bz2` handled. Offline logic: `pytest tests/test_nomad.py` (30 tests).
+- **Phase 1 — scoped discover + fetch.** `python -m nomad_harvest.cli discover --elements … \
+  --out data/manifests/nomad_keep.jsonl`, then `… fetch --in nomad_keep.jsonl`; parse + verify
+  with `zenodo_harvest.cli`. Start with one element system or a `--max-entries` cap.
+- **Phase 2 — dedup review.** discover already dedups against the Zenodo `metadata.jsonl`
+  (`--zenodo-metadata`, default path); review `nomad_rejections.jsonl` with the mentor.
+- **Phase 3 — scale on CSD3.** Add the `source` calc_id param (§7), batch fetch per `upload_id`
+  (~3,792 batches), reuse the disk/inode valve + array-job parse; `merge-datasets` into the
+  combined dataset. Notify `support@nomad-lab.eu` if the pull is large.
 
 ## 10. Open questions for the mentor
 
-- Include the AFLOW/OQMD/MP **ingests**, or scope NOMAD to **direct uploads** (paper-backed, more diverse)?
-- **MP**: harvest via `mp-api` *or* via NOMAD — not both. Which?
-- Target **size / element coverage** for the NOMAD slice?
-- **Trust NOMAD's archive** labels (fast, Option B) anywhere, or always **re-parse raw** (Option A)?
+- Target **size / element coverage** for the first scoped NOMAD slice? (7.1M is too big for one pass.)
+- Also fetch **OUTCAR** (per-atom charges/spins) for the subset where it's small, or **vasprun-only** everywhere? (Wholesale OUTCAR ≈ 170 TB — see §5.)
+- Add the `source` calc_id param to the shared parser now, or keep NOMAD in its **own** dataset dir until an explicit merge?
+
+*(Resolved 2026-08-10: scope = direct uploads only; MP via `mp-api` not NOMAD; raw re-parse, not the normalized archive.)*
 
 ## 11. References (official)
 
