@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -J zh-verify
-#SBATCH -p icelake                      # CPU-bound frame parsing; streams one shard at a time (low RAM)
+#SBATCH -p icelake-himem                # holds the full ~11.8M frame_id multiset + all metadata in RAM (several GB)
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH -c 1
+#SBATCH -c 4                            # ~27 GiB (icelake-himem 6.76 GiB/core) — verify's frame-id maps need it
 #SBATCH -t 8:00:00                       # parses ~11.8M frames single-threaded; read-only, so overrun only wastes queue
 #SBATCH -o logs/zh-verify-%j.out
 #SBATCH -e logs/zh-verify-%j.err
