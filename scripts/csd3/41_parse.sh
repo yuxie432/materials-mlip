@@ -7,6 +7,7 @@
 #SBATCH -t 12:00:00
 #SBATCH -o logs/zh-parse-%j.out
 #SBATCH -e logs/zh-parse-%j.err
+#SBATCH --mail-type=END,FAIL
 #
 # Mop-up parse: collect frames from FETCHED-but-not-yet-parsed calcs (the ~498 "unaccounted"
 # calcs harvest_audit reported) and re-attempt the non-terminal skips (primary_too_large,

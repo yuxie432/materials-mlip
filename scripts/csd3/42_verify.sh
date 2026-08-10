@@ -7,6 +7,7 @@
 #SBATCH -t 8:00:00                       # parses ~11.8M frames single-threaded; read-only, so overrun only wastes queue
 #SBATCH -o logs/zh-verify-%j.out
 #SBATCH -e logs/zh-verify-%j.err
+#SBATCH --mail-type=END,FAIL
 #
 # Read-only dataset integrity check: the metadata<->shard frame_id bijection + curation stats.
 # It parses EVERY frame (one shard at a time), so it is long and CPU-bound — run on a compute

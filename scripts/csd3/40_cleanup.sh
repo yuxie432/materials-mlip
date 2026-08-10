@@ -7,6 +7,7 @@
 #SBATCH -t 8:00:00                      # a full raw/ walk + deletes (31044's ~129k-inode walk is slow); resumable
 #SBATCH -o logs/zh-cleanup-%j.out
 #SBATCH -e logs/zh-cleanup-%j.err
+#SBATCH --mail-type=END,FAIL
 #
 # Reclaim raw/ staging INODES on a COMPUTE node. The login node kills a long metadata walk
 # (and contends with a running harvest), so run this stage in batch instead. DRY-RUN by
