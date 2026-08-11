@@ -89,3 +89,8 @@ htmlcov/
 *.swp
 .DS_Store
 Thumbs.db
+
+# CSD3 harvest artifacts pulled down for offline evaluation (logs, manifests, metadata)
+dataset_csd3/
+manifests_csd3/
+logs_csd3/
