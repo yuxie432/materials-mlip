@@ -276,7 +276,8 @@ so both sources produce one schema-identical dataset. Nothing in `zenodo_harvest
 |---|---|---|
 | 0 discover | `discover.py` (keyword search) | `client.iter_entries` keyset-paginates `entries/query` (the direct-upload VASP-DFT query); `harvest.discover_candidates` license-gates + Zenodo-dedups inline and writes a **slimmed** keep-list. ~700 requests total — trivial. |
 | 1 triage | `triage.py` (peek-into-zip) | **folded into discover** — no zip-peek. `is_reusable_license` (reused) + `references`→Zenodo dedup, both audited to a rejection log. |
-| 2 fetch | `fetch.py` (download+extract archives) | `harvest.fetch_candidates` → per entry, `rawdir` then `download_raw_file` the vasprun under a **canonical name** (handles `.bz2`/`.gz` + odd naming); groups via the shared `_find_calc_units`; writes `nomad_fetched.jsonl`. Heavy outputs → availability only, never fetched. |
+| 2 fetch | `fetch.py` (download+extract archives) | `harvest.fetch_candidates` → per entry, `rawdir` then `download_raw_file` the vasprun under a **canonical name** (handles `.bz2`/`.gz` + odd naming); groups via the shared `_find_calc_units`; writes `nomad_fetched.jsonl`. Heavy outputs → availability only, never fetched. **Now production-paced:** reuses the shared `StagingBudget` (bytes **and** inodes) as the disk/inode valve, `--workers` concurrent downloads, resume by manifest; returns `stopped_disk_budget` so the pipeline can reclaim + resume. |
+| pipeline 2-4 | `pipeline.py` | **reused** — `nomad_harvest.cli pipeline` splits the keep-list into parts and drives the shared `run_pipeline` (fetch batch *i+1* ∥ parse+purge batch *i*), disk-paced. One command for a long CSD3 job (`scripts/csd3/nomad/20_pipeline.sh`). |
 | 3 parse | `parse.py` | **reused unmodified**: `python -m zenodo_harvest.cli parse --in nomad_fetched.jsonl --dataset-dir data/dataset/nomad`. |
 | 4 store | `store.py` | **reused** — `REF_energy/forces/stress` + `metadata.jsonl`. |
 | join/verify | `dataset_ops.py` | **reused** — `verify` gates it; `merge-datasets` folds the NOMAD dataset into the Zenodo one. |
@@ -285,13 +286,15 @@ What the Zenodo pipeline needs that NOMAD does **not**: keyword-recall discover 
 zip-peek triage, archive download/selective-extract, nested-archive recursion, zip-stream — all
 gone. NOMAD's indexed metadata + per-file raw API replace them.
 
-**One deferred shared-core change (Phase 3, at merge time).** The shared parser hard-codes
-`calc_id = "zenodo:<recid>:…"` and tags frames `source="zenodo"`. The authoritative source is
-already correct in `metadata.jsonl` (`provenance.source="nomad"`), so for an *isolated* NOMAD
-dataset this is cosmetic; but before *merging* into the combined dataset the parser should gain a
-small backward-compatible `source` parameter so NOMAD calc_ids namespace as `nomad:…` (no
-cross-source id collision in `verify`'s bijection). Prototyped and then reverted per your
-instruction to keep `zenodo_harvest/` untouched — it's a ~7-line change to make then.
+**The one shared-core change — DONE (2026-08-11).** The shared parser previously hard-coded
+`calc_id = "zenodo:<recid>:…"` and tagged frames `source="zenodo"`. It now derives the source
+from `base_meta["provenance"]["source"]` (`_source_of`, defaulting to `"zenodo"` for older
+manifests), so NOMAD frames are tagged `source="nomad"` and calc_ids namespace as
+`nomad:<entry_id>:…` — no cross-source id collision in `verify`'s bijection or at
+`merge-datasets`. The change is **backward-compatible and byte-identical for Zenodo** (its
+`provenance.source` is always `"zenodo"`, verified across all 176,739 existing records) and
+needs **no CLI flag** (the authoritative provenance field drives it). `purge-raw`, which
+re-derives calc_ids via the same `_calc_id`, follows automatically.
 
 ### Rate-limiting process during the run
 
@@ -339,14 +342,26 @@ forces/energies, so it's a discovery/dedup aid only, never a label source.
   **existing pymatgen parser** → store → `verify`) with PASS/FAIL checks + size calibration.
   Validated 2026-08-10: 6/6 real NOMAD vaspruns parsed → 113 frames, forces+stress present,
   `verify` ok, `.bz2` handled. Offline logic: `pytest tests/test_nomad.py` (30 tests).
-- **Phase 1 — scoped discover + fetch.** `python -m nomad_harvest.cli discover --elements … \
-  --out data/manifests/nomad_keep.jsonl`, then `… fetch --in nomad_keep.jsonl`; parse + verify
-  with `zenodo_harvest.cli`. Start with one element system or a `--max-entries` cap.
+- **Phase 1 — scoped discover + fetch — ✅ BUILT.** `python -m nomad_harvest.cli discover
+  --max-entries N [--elements …] --out data/manifests/nomad_keep.jsonl`, then either the
+  overlapped `pipeline` (below) or `… fetch --in nomad_keep.jsonl` + the shared parse/verify.
 - **Phase 2 — dedup review.** discover already dedups against the Zenodo `metadata.jsonl`
   (`--zenodo-metadata`, default path); review `nomad_rejections.jsonl` with the mentor.
-- **Phase 3 — scale on CSD3.** Add the `source` calc_id param (§7), batch fetch per `upload_id`
-  (~3,792 batches), reuse the disk/inode valve + array-job parse; `merge-datasets` into the
-  combined dataset. Notify `support@nomad-lab.eu` if the pull is large.
+- **Phase 3 — scale on CSD3 — ✅ BUILT (2026-08-11).** The `source` calc_id param is done (§7);
+  the fetch is disk/inode-valve-paced with `--workers`; `nomad_harvest.cli pipeline` runs the
+  overlapped fetch∥parse+purge disk-paced, and `scripts/csd3/nomad/{10_discover,20_pipeline}.sh`
+  wrap it as self-resubmitting SLURM jobs (mirroring the Zenodo templates). `merge-datasets`
+  folds the NOMAD dataset (`data/dataset/nomad`) into the combined one. Notify
+  `support@nomad-lab.eu` before a multi-million-entry pull.
+
+**Run it (bounded sample):**
+```bash
+python -m nomad_harvest.cli discover --max-entries 200000 --out data/manifests/nomad_keep.jsonl
+python -m nomad_harvest.cli pipeline --in data/manifests/nomad_keep.jsonl \
+    --parts 40 --workers 4 --dataset-dir data/dataset/nomad \
+    --max-disk-bytes 800000000000 --max-disk-files 800000 --max-primary-bytes 2000000000
+python -m zenodo_harvest.cli verify --dataset-dir data/dataset/nomad
+```
 
 ## 10. Open questions for the mentor
 
@@ -355,6 +370,7 @@ forces/energies, so it's a discovery/dedup aid only, never a label source.
 - Add the `source` calc_id param to the shared parser now, or keep NOMAD in its **own** dataset dir until an explicit merge?
 
 *(Resolved 2026-08-10: scope = direct uploads only; MP via `mp-api` not NOMAD; raw re-parse, not the normalized archive.)*
+*(Resolved 2026-08-11: first slice = a **bounded sample** via `--max-entries` (default 200k in the CSD3 script; a keyset scan spreads it across uploads); **vasprun-only** everywhere (OUTCAR excluded — its 412 MB tail is ~170 TB wholesale); the **`source` param was added** to the shared parser now — backward-compatible, byte-identical for Zenodo — so NOMAD namespaces `nomad:…` and can merge cleanly.)*
 
 ## 11. References (official)
 

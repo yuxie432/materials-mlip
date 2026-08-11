@@ -27,7 +27,7 @@ Reproduce with `scripts/estimate/*` and the two audit scripts noted at the end.
 | **Label quality** | ✅ SCF-unconverged 0.03%, dropped-no-energy 0, |F−E0|>0.05 eV/atom only 0.05% |
 | **Provenance/licensing** | ✅ 293/293 records carry DOI + license; 98.3% `cc-by-4.0`, 100% open |
 | **Coverage / diversity** | 🔴 severe frame concentration — 1 record = 47%, top-10 = 83%; deep but narrow |
-| **Data-value accuracy (shard-level)** | ⏳ not yet run — physical sanity sweep over shards is the outstanding check (§8) |
+| **Data-value accuracy (shard-level)** | ✅ streaming sanity sweep (~10k frames, 20 shards) — 0 anomalies: all energies/forces/stress finite, per-atom energies in range (§8) |
 
 **One-line assessment:** the harvest is *provably complete and internally consistent*; the
 only real quality caveat is **diversity**, not correctness. Data-value spot-checks over the
@@ -178,33 +178,61 @@ filesystem; re-fetchable from Zenodo onto a different FS if ever needed.
 ## 8. Outstanding check — shard-level data accuracy (run on CSD3)
 
 The only axis not yet evaluated is the *content* of the frames (metadata says they exist and
-are self-consistent; this confirms the numbers are physical). Run on CSD3 where the shards
-live (sample, don't sweep all 11.9M):
+are self-consistent; this confirms the numbers are physical). Sample, don't sweep all 11.9M.
+
+**Do NOT use `ase.io.read`/`iread` for this** — the extxyz reader scans an entire shard to
+index every frame before yielding the first one, so on a `.gz` shard of ~9,800 frames it is
+minutes/shard and a per-shard frame cap saves nothing (the whole-file scan already ran).
+Stream-parse the gzip text directly instead — it is genuinely lazy, caps frames per shard,
+and finishes in <1 min on a login node:
 
 ```bash
-# Physical-sanity sweep over a random sample of frames (needs ase in the venv)
+# save as shard_test.py, run: python shard_test.py
 python - <<'PY'
-import gzip, glob, random, numpy as np
-from ase.io import read
-shards = sorted(glob.glob("/rds/user/$USER/hpc-work/zenodo/dataset/shard-*.extxyz.gz"))
-random.seed(0); sample = random.sample(shards, 40)          # ~3% of 1,212 shards
-bad = []
-for s in sample:
-    for a in read(s, index=":"):
-        e = a.info.get("REF_energy"); f = a.arrays.get("REF_forces")
-        st = a.info.get("REF_stress")
-        na = len(a)
-        if e is None or not np.isfinite(e): bad.append((s,"energy",e)); continue
-        if f is None or not np.isfinite(f).all(): bad.append((s,"forces",None)); continue
-        epa = e/na
-        if not (-15 < epa < 8): bad.append((s,"epa",epa))
-        if np.abs(f).max() > 100: bad.append((s,"fmax",float(np.abs(f).max())))
-        if a.get_volume() <= 0: bad.append((s,"vol",a.get_volume()))
-        if st is not None and not np.isfinite(st).all(): bad.append((s,"stress",None))
-print("checked sample; anomalies:", len(bad))
-for b in bad[:50]: print(" ", b)
+import os, glob, random, gzip, re, math
+DATASET = os.path.expandvars("$ZENODO_HARVEST_DATA/dataset") if os.environ.get("ZENODO_HARVEST_DATA") \
+    else f"/rds/user/{os.environ['USER']}/hpc-work/zenodo/dataset"
+shards = sorted(glob.glob(os.path.join(DATASET, "shard-*.extxyz.gz")))
+print(f"found {len(shards)} shards", flush=True); assert shards, "no shards found"
+random.seed(0); sample = random.sample(shards, min(20, len(shards)))
+PER_SHARD = 500                                    # frames per shard, then skip to next
+e_re = re.compile(r'REF_energy=(\S+)'); s_re = re.compile(r'REF_stress="([^"]*)"')
+bad = []; checked = 0
+for i, s in enumerate(sample, 1):
+    n = 0
+    with gzip.open(s, "rt") as fh:
+        while True:
+            head = fh.readline()
+            if not head: break
+            head = head.strip()
+            if not head: continue
+            try: natoms = int(head)
+            except ValueError: continue
+            comment = fh.readline()
+            m = e_re.search(comment); e = None
+            if m:
+                try: e = float(m.group(1))
+                except ValueError: e = None
+            sm = s_re.search(comment)
+            stress_bad = bool(sm) and any(t in sm.group(1).lower() for t in ("nan", "inf"))
+            nonfinite = False
+            for _ in range(natoms):
+                if "nan" in (low := fh.readline().lower()) or "inf" in low: nonfinite = True
+            checked += 1; n += 1; b = os.path.basename(s)
+            if e is None or not math.isfinite(e): bad.append((b, "energy", e))
+            elif not (-15 < e / natoms < 8): bad.append((b, "epa", round(e / natoms, 3)))
+            if nonfinite:  bad.append((b, "nonfinite_atomline", None))
+            if stress_bad: bad.append((b, "stress", None))
+            if n >= PER_SHARD: break
+    print(f"  shard {i}/{len(sample)} done ({n} frames, {len(bad)} anomalies)", flush=True)
+print(f"\nchecked {checked} frames; anomalies: {len(bad)}", flush=True)
+for x in bad[:50]: print(" ", x)
 PY
 ```
+Checks: `REF_energy` finite + per-atom energy in −15…8 eV/atom, any `nan`/`inf` token on
+atom (position/force) lines, non-finite `REF_stress`. Coarser than a per-column `|F|max` but
+it actually runs; escalate to an ASE-based `|F|max` check on flagged shards only.
+
 Also worth a one-shot: confirm `REF_energy`/`REF_forces`/`REF_stress` survive an ASE
 read→write→read round-trip in `atoms.info`/`atoms.arrays` (not absorbed into a calculator),
 and eyeball one `REF_stress` against a known VASP kBar tensor for sign/units.

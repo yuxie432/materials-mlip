@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from urllib.parse import quote
 
 import requests
@@ -203,7 +203,8 @@ class NomadClient:
             return r.json().get("data", {})
 
     def download_raw_file(self, entry_id: str, path: str, dest: Path,
-                          decompress: bool = False) -> int:
+                          decompress: bool = False,
+                          on_chunk: "Callable[[int], None] | None" = None) -> int:
         """Stream one raw file (``GET /entries/{id}/raw/{path}``) to ``dest``.
 
         Returns bytes written. ``path`` is relative to the mainfile's directory (its
@@ -212,6 +213,12 @@ class NomadClient:
         handles it locally (also covers ``.bz2``, which server-side decompress does not).
         Writes via a ``.part`` then renames, so an interrupted transfer never leaves a
         half-file under the final name.
+
+        ``on_chunk(n_bytes)`` — if given — is invoked with each chunk's size *before* it is
+        written; it may raise to abort the download (the disk-budget valve uses this to
+        charge bytes as they land and stop cleanly at a limit). Its exception propagates
+        after the partial ``.part`` is removed, so a budget-aborted transfer never leaves a
+        stray file behind. Kept deliberately generic so the client has no budget dependency.
         """
         rel = f"/entries/{quote(entry_id, safe='')}/raw/{quote(path, safe='/')}"
         params = {"decompress": "true"} if decompress else None
@@ -222,6 +229,8 @@ class NomadClient:
                 written = 0
                 with tmp.open("wb") as fh:
                     for chunk in r.iter_content(1 << 20):
+                        if on_chunk is not None:
+                            on_chunk(len(chunk))
                         fh.write(chunk)
                         written += len(chunk)
             tmp.replace(dest)

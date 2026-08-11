@@ -228,6 +228,46 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   parser paths) fingerprints the pseudopotential set — a real cross-record consistency key, since
   absolute VASP energies are only comparable within an identical POTCAR set + functional + settings.
 
+## Second data source: NOMAD (`nomad_harvest/`)
+
+A second source adapter harvests VASP data from **NOMAD** (https://nomad-lab.eu) into the
+*same* `data/dataset/` schema, so both sources feed one MLIP training set. Full design +
+live-verified API facts: `docs/NOMAD_HARVEST.md`. Scope (mentor): **direct uploads only**
+(~7.1M VASP-DFT entries; AFLOW/OQMD/MP excluded — MP is harvested via `mp-api`), **raw
+`vasprun.xml` re-parsed by the existing `parse.py`** (not NOMAD's normalized archive, whose
+σ→0 energy label and stress sign are unreliable), **vasprun-only** (no wholesale OUTCAR — its
+tail is ~170 TB).
+
+- `nomad_harvest/` imports the shared `zenodo_harvest` **stages 3-5 (parse/store/verify/merge)
+  unmodified**; only stages 0-2 are NOMAD-specific:
+  - `client.py` — throttled, retrying NOMAD v1 REST client (anonymous reads; **keyset
+    pagination only** — offset caps at 10k; self-throttle + exponential backoff on
+    502/503/504, which appear under load with no `Retry-After`). `download_raw_file` takes a
+    generic `on_chunk` hook (no budget coupling).
+  - `harvest.py` — stage 0 discover (keyset-scan the direct-upload VASP-DFT query →
+    license-gate + Zenodo-`references`-dedup → slimmed keep-list) and stage 2 fetch. **The
+    fetch is production-paced:** it reuses the shared `StagingBudget` (bytes **and** inodes) as
+    the disk/inode valve, `--workers` concurrent downloads, and manifest-level resume, and it
+    returns `stopped_disk_budget` so the pipeline reclaims + resumes. NOMAD stages files
+    verbatim (no archive expansion), so the rawdir-declared `size` is the exact on-disk size —
+    the valve reserves it up front. Heavy outputs → availability only, never fetched.
+  - `cli.py` — `python -m nomad_harvest.cli {discover,fetch,pipeline,smoke}`. `pipeline` splits
+    the keep-list and drives the **shared** `run_pipeline` (fetch batch *i+1* ∥ parse+purge
+    batch *i*), disk-paced, into its own `data/dataset/nomad` dir; `merge-datasets` folds it in.
+  - `smoke.py` — live end-to-end Phase-0 validation in an isolated temp dir.
+- **The shared parser namespaces by source.** `parse._calc_id`/`_frame` derive the source from
+  `provenance.source` (`_source_of`, default `"zenodo"`), so NOMAD frames are tagged
+  `source="nomad"` and calc_ids are `nomad:<entry_id>:…` — byte-identical for Zenodo, no
+  cross-source id collision at `verify`/`merge-datasets`. No CLI flag; the provenance field
+  drives it.
+- CSD3 batch templates: `scripts/csd3/nomad/{10_discover,20_pipeline}.sh` (mirror the Zenodo
+  templates: single-stream discover, then the overlapped disk-paced pipeline, self-resubmitting).
+  Full harvest of 7.1M is a multi-week, many-job campaign gated by NOMAD's fetch rate (not
+  CSD3) — scope with `--max-entries`; email `support@nomad-lab.eu` before a large pull.
+- Offline tests: `tests/test_nomad.py` (network-free — query builder, keyset paging, backoff,
+  dedup, staging-name/primary logic, and the fetch valve/workers/resume against an in-memory
+  client). Live path: `python -m nomad_harvest.cli smoke -n 12`.
+
 ## Scope and starting point
 
 - Start with **VASP calculations only** (most common DFT code in materials science). Main output files

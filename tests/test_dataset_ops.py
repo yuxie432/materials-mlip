@@ -440,7 +440,7 @@ def test_parse_unit_falls_back_to_smaller_sibling_primary(tmp_path):
     import zenodo_harvest.parse as parse_mod
     orig = parse_mod._parse_outcar_ase
 
-    def spy(outcar_path, calc_id):
+    def spy(outcar_path, calc_id, source="zenodo"):
         seen["outcar"] = outcar_path
         raise RuntimeError("stop here: we only assert which path was chosen")
 
@@ -470,8 +470,9 @@ def test_parse_unit_trim_keeps_the_original_calc_id_for_resume(tmp_path):
     seen = {}
     orig = parse_mod._parse_outcar_ase
 
-    def spy(outcar_path, calc_id):
+    def spy(outcar_path, calc_id, source="zenodo"):
         seen["calc_id"] = calc_id                        # capture the id the OUTCAR path got
+        seen["source"] = source                          # ...and the source tag it was given
         raise RuntimeError("stop after capturing calc_id")
 
     parse_mod._parse_outcar_ase = spy
@@ -483,6 +484,7 @@ def test_parse_unit_trim_keeps_the_original_calc_id_for_resume(tmp_path):
         rej.close()
     # the OUTCAR fallback parsed under the vasprun-keyed id, NOT "zenodo:42:calc/OUTCAR"
     assert seen["calc_id"] == expected
+    assert seen["source"] == "zenodo"                    # source derives from provenance
 
 
 # --------------------------------------------------------------------------- #

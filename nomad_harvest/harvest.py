@@ -15,18 +15,39 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
+import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-# Shared, UNMODIFIED helpers from the Zenodo pipeline (reuse, not copy).
+# Shared, UNMODIFIED helpers from the Zenodo pipeline (reuse, not copy). The disk/inode
+# valve (StagingBudget) + its charged-mkdir/dir-usage helpers are generic byte/inode
+# accountants, so the NOMAD fetch paces itself against the CSD3 quota with the exact same,
+# already-hardened machinery the Zenodo fetch uses.
 from zenodo_harvest import config
-from zenodo_harvest.fetch import _find_calc_units, _safe_members
+from zenodo_harvest.fetch import (
+    BudgetExceeded,
+    StagingBudget,
+    _charged_mkdir,
+    _dir_usage,
+    _find_calc_units,
+    _safe_members,
+)
 from zenodo_harvest.manifest import JsonlWriter, RejectionLogger, read_jsonl
 from zenodo_harvest.models import is_reusable_license
 
 from .client import CANDIDATE_REQUIRED, NomadClient, direct_upload_vasp_query
 
 logger = logging.getLogger(__name__)
+
+
+class RecordTooBig(Exception):
+    """One entry's own footprint exceeds the WHOLE disk/inode budget — no parse+purge can
+    make room, so it is skipped (logged ``record_exceeds_disk_budget``) rather than
+    deferred, which would livelock the pacing loop. For NOMAD this only bites under an
+    absurdly small ``--max-disk-bytes``/``--max-disk-files`` (a single vasprun is tiny),
+    but it keeps the valve's forward-progress guarantee identical to the Zenodo fetch."""
 
 
 # --- provenance / dedup ---------------------------------------------------------
@@ -192,14 +213,74 @@ def raw_path_rel(full_path: str, mainfile: str | None) -> str:
     return full_path.rsplit("/", 1)[-1]
 
 
+def _rawdir_size(rawdir_listing: dict[str, Any], path: str) -> int:
+    """Declared size (bytes) of a file in a rawdir listing, 0 if absent/unknown.
+
+    NOMAD serves raw files verbatim and we stage them byte-for-byte (never decompressing),
+    so the declared size equals the on-disk size — which makes it an *exact* pre-flight
+    check against the disk budget (unlike a Zenodo archive, whose extracted size the header
+    cannot predict; hence Zenodo charges as-written and NOMAD can also check up front)."""
+    for f in rawdir_listing.get("files") or []:
+        if (f.get("path") or "") == path:
+            try:
+                return int(f.get("size") or 0)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def _byte_charger(budget: StagingBudget | None,
+                  own: list[int] | None) -> Callable[[int], None] | None:
+    """An ``on_chunk`` hook that charges the disk-byte budget as each chunk lands.
+
+    Returns None when there is no active budget (the client then streams unmetered). A
+    refused charge raises :class:`BudgetExceeded` — for the reclaimable case
+    ``StagingBudget.charge`` raises it itself; the returned-False (unfittable) case is
+    turned into the same signal here, which after the up-front :meth:`StagingBudget.check`
+    pre-flight in :func:`stage_entry` is effectively unreachable (a defensive belt)."""
+    if budget is None or not budget.enabled:
+        return None
+
+    def on_chunk(n_bytes: int) -> None:
+        if not budget.charge(n_bytes, 0, own=own):
+            raise BudgetExceeded("disk-byte budget reached mid-file")
+
+    return on_chunk
+
+
+def _refund_and_delete(dest: Path, budget: StagingBudget | None,
+                       own: list[int] | None) -> None:
+    """Roll a staged entry back: refund its EXACT reservation (``own`` — bytes+inodes
+    charged, which reverses cleanly whether the tree is whole or partial) and delete its
+    tree. One entry stages under its own ``<raw_dir>/<entry_id>/``, so a worker rolling one
+    back never touches another's data."""
+    if budget is not None and own is not None:
+        budget.refund(own[0], own[1], own=own)
+    shutil.rmtree(dest, ignore_errors=True)
+
+
 def stage_entry(client: NomadClient, entry: dict[str, Any], raw_dir: Path,
-                want_outcar: bool = False) -> tuple[Path, dict[str, Any]] | None:
+                want_outcar: bool = False,
+                budget: StagingBudget | None = None) -> tuple[Path, dict[str, Any]] | None:
     """Download an entry's primary VASP file (+ optional OUTCAR) into the staging tree.
 
     Lays files out as ``<raw_dir>/<entry_id>/extracted/calc/<canonical-name>`` — exactly
     the layout the shared parser expects (``local_dir=<entry_id>``, primary under
     ``extracted/``). Returns ``(dest_dir, rawdir_listing)`` or None if no VASP primary is
     present. Heavy-output availability is derived from the listing, never fetched.
+
+    ``budget`` (:class:`StagingBudget`, thread-safe) paces staging against the CSD3 disk
+    **and inode** quota. Every directory (``_charged_mkdir``), every file inode, and every
+    byte (per chunk, via :func:`_byte_charger`) is charged as it lands and tracked in this
+    record's own tally, so a rollback refunds *exactly* what was charged. Two failure modes:
+
+    * budget full of OTHER records' data → :class:`BudgetExceeded` propagates (the entry is
+      rolled back whole and the caller defers it to after a parse+purge reclaim);
+    * this entry alone exceeds the whole budget → :class:`RecordTooBig` (skip + log, never
+      deferred, so the pacing loop cannot spin on it).
+
+    Either way the partial tree is rolled back and its reservation refunded before the
+    exception leaves, so a deferred/skipped entry leaves nothing staged.
     """
     entry_id = entry["entry_id"]
     rd = client.rawdir(entry_id)
@@ -207,18 +288,43 @@ def stage_entry(client: NomadClient, entry: dict[str, Any], raw_dir: Path,
     primary = choose_primary(rd)
     if primary is None:
         return None
-    remote_path, role = primary
-    dest = raw_dir / entry_id
-    calc_dir = dest / "extracted" / "calc"
-    client.download_raw_file(entry_id, raw_path_rel(remote_path, mainfile),
-                             calc_dir / canonical_staged_name(remote_path, role))
-    if want_outcar and role == "vasprun":
+    to_stage: list[tuple[str, str]] = [primary]  # (remote_path, role)
+    if want_outcar and primary[1] == "vasprun":
         for f in rd.get("files") or []:
             p = f.get("path") or ""
             if _OUTCAR_RE.search(p.rsplit("/", 1)[-1]):
-                client.download_raw_file(entry_id, raw_path_rel(p, mainfile),
-                                         calc_dir / canonical_staged_name(p, "outcar"))
+                to_stage.append((p, "outcar"))
                 break
+
+    dest = raw_dir / entry_id
+    calc_dir = dest / "extracted" / "calc"
+    own: list[int] | None = None
+    if budget is not None and budget.enabled:
+        budget.begin_record()          # per-thread own-usage tally (workers stage in parallel)
+        own = budget.own_handle()
+    try:
+        # Inodes for the staging dirs (charged before creation; raises/False if over budget).
+        if not _charged_mkdir(calc_dir, budget, own):
+            raise RecordTooBig(f"{entry_id}: staging dirs exceed the whole inode budget")
+        # Up-front fit check on the declared footprint (exact for NOMAD — see _rawdir_size):
+        # unfittable => RecordTooBig (skip); budget full of others => BudgetExceeded (defer).
+        if budget is not None and budget.enabled:
+            declared = sum(_rawdir_size(rd, p) for p, _role in to_stage)
+            if not budget.check(declared, len(to_stage), own=own):
+                raise RecordTooBig(
+                    f"{entry_id}: {declared} B / {len(to_stage)} file(s) exceed the whole "
+                    f"disk budget")
+        for remote_path, role in to_stage:
+            if (budget is not None and budget.enabled
+                    and not budget.charge(0, 1, own=own)):   # one inode for this file
+                raise BudgetExceeded("inode budget reached before staging a raw file")
+            client.download_raw_file(
+                entry_id, raw_path_rel(remote_path, mainfile),
+                calc_dir / canonical_staged_name(remote_path, role),
+                on_chunk=_byte_charger(budget, own))
+    except BaseException:
+        _refund_and_delete(dest, budget, own)
+        raise
     return dest, rd
 
 
@@ -329,43 +435,178 @@ def fetch_candidates(client: NomadClient, in_path: str | Path,
                      raw_dir: str | Path = config.RAW_DIR,
                      out_path: str | Path | None = None,
                      want_outcar: bool = False,
-                     max_records: int | None = None) -> dict[str, Any]:
+                     max_records: int | None = None,
+                     max_disk_bytes: int | None = None,
+                     max_disk_files: int | None = None,
+                     workers: int = 1) -> dict[str, Any]:
     """Stage 2: stage each candidate's vasprun (+optional OUTCAR) -> ``fetched.jsonl``.
 
     Resumable (entries already in ``out_path`` are skipped) and audited (every failure is
     logged with a reason, never silently dropped). Output is consumed unchanged by
     ``zenodo_harvest.parse``.
+
+    ``max_disk_bytes`` / ``max_disk_files`` (``None`` = unbounded) are the **disk/inode
+    valve**: staging stops cleanly once the raw tree reaches a limit, setting
+    ``stopped_disk_budget`` in the returned stats, so the overlapped ``pipeline`` can
+    ``parse``+``purge-raw`` to reclaim and then resume this batch. This is how a harvest far
+    bigger than the CSD3 quota (1 TB **and** 1M inodes) runs inside it — paced, not capped
+    on total volume. ``workers`` > 1 downloads that many entries concurrently (entries are
+    independent; :class:`StagingBudget` is thread-safe), which matters because NOMAD's raw
+    endpoint is latency-bound and allows ~10 concurrent. ``max_records`` caps entries newly
+    staged THIS run (resumed skips don't count).
+
+    The returned stats carry ``staged``/``failed``/``skipped_existing``,
+    ``stopped_disk_budget``/``stopped_on``, and the budget's high-water marks
+    (``peak_staged_bytes``/``peak_staged_files``) so a run is auditable from its summary.
     """
     raw_dir = Path(raw_dir)
-    out = Path(out_path) if out_path else raw_dir.parent / "manifests" / "nomad_fetched.jsonl"
+    manifests = raw_dir.parent / "manifests"
+    manifests.mkdir(parents=True, exist_ok=True)
+    out = Path(out_path) if out_path else manifests / "nomad_fetched.jsonl"
+    out.parent.mkdir(parents=True, exist_ok=True)
     done = {rec["recid"] for rec in read_jsonl(out)} if out.is_file() else set()
-    rej = RejectionLogger(raw_dir.parent / "manifests" / "nomad_fetch_rejections.jsonl")
-    staged = failed = 0
-    with JsonlWriter(out) as w:
-        for i, entry in enumerate(read_jsonl(in_path)):
-            if max_records is not None and i >= max_records:
-                break
-            eid = entry["entry_id"]
-            if eid in done:
-                continue
-            try:
-                res = stage_entry(client, entry, raw_dir, want_outcar=want_outcar)
-                if res is None:
-                    rej.reject("nomad_fetch", eid, "no_vasp_primary")
-                    failed += 1
+    rej = RejectionLogger(manifests / "nomad_fetch_rejections.jsonl")
+    stats: dict[str, Any] = {"records": 0, "staged": 0, "failed": 0, "skipped_existing": 0,
+                             "stopped_disk_budget": False, "stopped_on": ""}
+
+    # Create the staging root FIRST (it is the accounting root; a walk of it never counts
+    # the root itself), then seed the budget with whatever a prior, not-yet-purged run left
+    # staged (resume-aware). From here the accounting is incremental and exact.
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    base_bytes, base_files = (_dir_usage(raw_dir) if (max_disk_bytes or max_disk_files)
+                              else (0, 0))
+    budget = StagingBudget(max_disk_bytes, max_disk_files, base_bytes, base_files)
+
+    def _build(entry: dict[str, Any]) -> tuple[dict[str, Any] | None, tuple[str, str] | None]:
+        """Stage + assemble one entry. Returns ``(fetched_entry|None, (reason,detail)|None)``.
+        Raises :class:`BudgetExceeded` to signal a defer (budget full of reclaimable data)."""
+        try:
+            res = stage_entry(client, entry, raw_dir, want_outcar=want_outcar, budget=budget)
+        except RecordTooBig as exc:
+            return None, ("record_exceeds_disk_budget", str(exc))
+        if res is None:
+            return None, ("no_vasp_primary", "")
+        dest, rd = res
+        fe = build_fetched_entry(entry, raw_dir, dest, rd)
+        if fe is None:  # staged a primary but no calc unit resolved: reclaim its space now
+            _refund_and_delete(dest, budget, budget.own_handle() if budget.enabled else None)
+            return None, ("no_calc_units_after_stage", "")
+        return fe, None
+
+    def _serial(count_records: bool) -> None:
+        with JsonlWriter(out) as w:
+            for entry in read_jsonl(in_path):
+                if count_records:
+                    stats["records"] += 1
+                eid = entry["entry_id"]
+                if eid in done:
+                    if count_records:
+                        stats["skipped_existing"] += 1
                     continue
-                dest, rd = res
-                fe = build_fetched_entry(entry, raw_dir, dest, rd)
+                if max_records and stats["staged"] >= max_records:
+                    break
+                if budget.full():  # stop before starting a new record once a limit is hit
+                    stats["stopped_disk_budget"], stats["stopped_on"] = True, budget.hit_limit
+                    break
+                try:
+                    fe, reject = _build(entry)
+                except BudgetExceeded:
+                    stats["stopped_disk_budget"] = True
+                    stats["stopped_on"] = budget.pause or budget.hit_limit
+                    break
+                except Exception as exc:  # noqa: BLE001 - one bad entry must not abort the run
+                    rej.reject("nomad_fetch", eid, "fetch_error",
+                               detail=f"{type(exc).__name__}: {exc}")
+                    stats["failed"] += 1
+                    continue
                 if fe is None:
-                    rej.reject("nomad_fetch", eid, "no_calc_units_after_stage")
-                    failed += 1
+                    assert reject is not None
+                    rej.reject("nomad_fetch", eid, reject[0], detail=reject[1])
+                    stats["failed"] += 1
                     continue
                 w.write(fe)
-                staged += 1
-            except Exception as exc:  # noqa: BLE001 - one bad entry must not abort the run
-                rej.reject("nomad_fetch", eid, "fetch_error",
-                           detail=f"{type(exc).__name__}: {exc}")
-                failed += 1
+                done.add(eid)
+                stats["staged"] += 1
+
+    def _parallel(count_records: bool) -> None:
+        rej_lock = threading.Lock()
+
+        def _proc(entry: dict[str, Any]) -> tuple[str, str, Any]:
+            eid = entry["entry_id"]
+            try:
+                fe, reject = _build(entry)
+                return ("ok", eid, fe) if fe is not None else ("reject", eid, reject)
+            except BudgetExceeded:
+                return ("defer", eid, None)
+            except Exception as exc:  # noqa: BLE001
+                return ("error", eid, f"{type(exc).__name__}: {exc}")
+
+        def _collect(fut: Any, w: JsonlWriter) -> None:
+            kind, eid, payload = fut.result()
+            if kind == "ok":
+                w.write(payload)
+                done.add(eid)
+                stats["staged"] += 1
+            elif kind == "reject":
+                with rej_lock:
+                    rej.reject("nomad_fetch", eid, payload[0], detail=payload[1])
+                stats["failed"] += 1
+            elif kind == "error":
+                with rej_lock:
+                    rej.reject("nomad_fetch", eid, "fetch_error", detail=payload)
+                stats["failed"] += 1
+            # "defer": budget full, nothing staged; the post-loop budget check reports it.
+
+        with JsonlWriter(out) as w, ThreadPoolExecutor(max_workers=workers) as ex:
+            inflight: set = set()
+            submitted = 0
+            for entry in read_jsonl(in_path):
+                if count_records:
+                    stats["records"] += 1
+                eid = entry["entry_id"]
+                if eid in done:
+                    if count_records:
+                        stats["skipped_existing"] += 1
+                    continue
+                if max_records and submitted >= max_records:
+                    break
+                if budget.full():
+                    stats["stopped_disk_budget"], stats["stopped_on"] = True, budget.hit_limit
+                    break
+                inflight.add(ex.submit(_proc, entry))
+                submitted += 1
+                if len(inflight) >= workers * 2:  # bound memory + refresh admission decisions
+                    finished, inflight = wait(inflight, return_when=FIRST_COMPLETED)
+                    for f in finished:
+                        _collect(f, w)
+            for f in wait(inflight)[0]:  # drain the rest
+                _collect(f, w)
+
+    if workers > 1:
+        _parallel(count_records=True)
+        # Forward-progress guard (mirrors the Zenodo fetch): if a whole parallel pass staged
+        # NOTHING and stopped on the budget, the in-flight entries each fitted alone but
+        # filled the budget between them and were all rolled back — handing the same batch
+        # back would repeat that forever. Retry serially against the just-emptied budget,
+        # where each entry either stages or is recognised as too big for the whole budget.
+        if stats["staged"] == 0 and budget.full():
+            logger.warning("nomad parallel fetch staged nothing (%s limit); retrying "
+                           "serially so the pacing loop cannot stall", budget.hit_limit)
+            budget.pause = ""
+            stats["stopped_disk_budget"], stats["stopped_on"] = False, ""
+            _serial(count_records=False)
+    else:
+        _serial(count_records=True)
+
     rej.close()
-    logger.info("nomad fetch: staged %d, failed %d", staged, failed)
-    return {"out": str(out), "staged": staged, "failed": failed}
+    # Authoritative post-loop check: a worker can fill the budget after the submit loop's
+    # last admission decision (or the very last record can), and stopped_disk_budget is what
+    # tells `pipeline` to reclaim + resume this part (deferred entries are absent from the
+    # manifest, so they are re-fetched).
+    if budget.full():
+        stats["stopped_disk_budget"] = True
+        stats["stopped_on"] = budget.pause or budget.hit_limit
+    stats.update(budget.stats())
+    stats["items_over_whole_budget"] = budget.unfittable
+    logger.info("nomad fetch: %s", stats)
+    return {"out": str(out), **stats}

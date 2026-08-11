@@ -20,7 +20,13 @@ scripts/csd3/10_discover.sh        # stage 0-1 (discover + triage) — network, 
 scripts/csd3/20_pipeline.sh        # stage 2-4 overlapped (fetch || parse+purge) + verify
 scripts/csd3/30_parse_array.sh     # OPTIONAL: many-core array parse of a fetched manifest
 scripts/csd3/31_merge_verify.sh    #   ...then merge the per-task dirs + verify + purge
+scripts/csd3/nomad/                # SECOND SOURCE: NOMAD harvest templates (see its README)
 ```
+
+**NOMAD** (the second data source) has its own templates in `scripts/csd3/nomad/`
+(`10_discover.sh` + `20_pipeline.sh`) — same conventions, same scratch root, same shared
+parse/verify/merge. See `scripts/csd3/nomad/README.md`. It writes to `dataset/nomad/`, which
+`merge-datasets` later folds into the combined `dataset/`.
 
 ## CSD3 facts these scripts are built around
 

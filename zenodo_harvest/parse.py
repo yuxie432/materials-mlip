@@ -369,7 +369,7 @@ def _site_props_from_outcar(outcar_path: str, natoms: int) -> dict:
 
 def _frame(structure: Any, energy: float | None, forces: Any, *, calc_id: str,
            frame_id: str, ionic_step: int, electronic_converged: bool | None,
-           scf_dE: float | None,
+           scf_dE: float | None, source: str = "zenodo",
            magmoms: list | None = None, charges: list | None = None) -> Atoms:
     from pymatgen.io.ase import AseAtomsAdaptor
     atoms = AseAtomsAdaptor.get_atoms(structure)
@@ -388,7 +388,7 @@ def _frame(structure: Any, energy: float | None, forces: Any, *, calc_id: str,
     if charges is not None:
         atoms.arrays["dft_charge"] = np.asarray(charges, dtype=float)
     atoms.info.update({
-        "source": "zenodo",
+        "source": source,
         "calc_id": calc_id,
         "frame_id": frame_id,
         "ionic_step": ionic_step,
@@ -409,12 +409,13 @@ def _frame(structure: Any, energy: float | None, forces: Any, *, calc_id: str,
 
 
 def _frames_and_meta(v: Any, calc_id: str, outcar_path: str | None,
-                     parser: str) -> tuple[list[Atoms], dict]:
+                     parser: str, source: str = "zenodo") -> tuple[list[Atoms], dict]:
     """Build frames + metadata from a parsed pymatgen object.
 
     Shared by :func:`parse_vasprun` and :func:`parse_vaspout`: ``Vaspout``
     subclasses ``Vasprun`` and exposes the same API, so only the constructor and
-    the recorded ``parser`` tag differ.
+    the recorded ``parser`` tag differ. ``source`` (``zenodo``/``nomad``/…) is the
+    provenance tag written into each frame's ``info["source"]`` (see :func:`_frame`).
     """
     conv = _scf_convergence(v)  # calc-level final-step verdict (keys/semantics unchanged)
     steps = v.ionic_steps
@@ -444,7 +445,7 @@ def _frames_and_meta(v: Any, calc_id: str, outcar_path: str | None,
         frame = _frame(
             st["structure"], energy, forces,
             calc_id=calc_id, frame_id=f"{calc_id}#{i}", ionic_step=i,
-            electronic_converged=econv, scf_dE=scf_dE,
+            electronic_converged=econv, scf_dE=scf_dE, source=source,
             magmoms=site["magmoms"] if last else None,
             charges=site["charges"] if last else None,
         )
@@ -496,16 +497,18 @@ def _frames_and_meta(v: Any, calc_id: str, outcar_path: str | None,
     return frames, meta
 
 
-def parse_vasprun(vasprun_path: str, calc_id: str, outcar_path: str | None) -> tuple[list[Atoms], dict]:
+def parse_vasprun(vasprun_path: str, calc_id: str, outcar_path: str | None,
+                  source: str = "zenodo") -> tuple[list[Atoms], dict]:
     """Parse one vasprun.xml into (frames, calc_metadata)."""
     from pymatgen.io.vasp.outputs import Vasprun
     v = Vasprun(vasprun_path, parse_dos=False, parse_eigen=False,
                 parse_projected_eigen=False, parse_potcar_file=False,
                 exception_on_bad_xml=False)
-    return _frames_and_meta(v, calc_id, outcar_path, "pymatgen.Vasprun")
+    return _frames_and_meta(v, calc_id, outcar_path, "pymatgen.Vasprun", source)
 
 
-def parse_vaspout(vaspout_path: str, calc_id: str, outcar_path: str | None) -> tuple[list[Atoms], dict]:
+def parse_vaspout(vaspout_path: str, calc_id: str, outcar_path: str | None,
+                  source: str = "zenodo") -> tuple[list[Atoms], dict]:
     """Parse one vaspout.h5 (VASP's HDF5 output) into (frames, calc_metadata).
 
     Uses pymatgen's ``Vaspout`` (a ``Vasprun`` subclass). DOS/eigenvalues and
@@ -515,7 +518,7 @@ def parse_vaspout(vaspout_path: str, calc_id: str, outcar_path: str | None) -> t
     from pymatgen.io.vasp.outputs import Vaspout
     v = Vaspout(vaspout_path, parse_dos=False, parse_eigen=False,
                 parse_projected_eigen=False, store_potcar=False)
-    return _frames_and_meta(v, calc_id, outcar_path, "pymatgen.Vaspout")
+    return _frames_and_meta(v, calc_id, outcar_path, "pymatgen.Vaspout", source)
 
 
 def _resolve(raw_dir: Path, stored: str) -> Path:
@@ -532,17 +535,32 @@ def _resolve(raw_dir: Path, stored: str) -> Path:
     return raw_dir / stored
 
 
+def _source_of(base_meta: dict) -> str:
+    """Provenance source (``zenodo``/``nomad``/…) for calc_id namespacing and the frame
+    ``source`` tag.
+
+    Read from the authoritative ``provenance.source`` the fetch stage wrote (Zenodo's
+    ``_fetched_entry`` writes ``"zenodo"``, NOMAD's ``build_fetched_entry`` writes
+    ``"nomad"``). Defaults to ``"zenodo"`` for older manifests predating the field, so
+    their output stays byte-identical. This is what lets a second source (NOMAD) namespace
+    its calc_ids as ``nomad:<id>:…`` and tag frames ``source="nomad"`` without any collision
+    against the Zenodo dataset at ``merge-datasets`` time.
+    """
+    return (base_meta.get("provenance") or {}).get("source") or "zenodo"
+
+
 def _calc_id(unit: dict, base_meta: dict) -> str:
-    """Stable id for a calc unit: ``zenodo:<recid>:<path-of-primary-file>``.
+    """Stable id for a calc unit: ``<source>:<recid>:<path-of-primary-file>``.
 
     Keyed on the primary file (vasprun.xml, else vaspout.h5, else OUTCAR) — the
     same precedence :func:`parse_calc_unit` parses with — so the id is identical
     whether we are parsing the unit or checking whether a prior run already did.
+    The ``<source>`` prefix (``zenodo``/``nomad``/…) namespaces ids per data source.
     """
     recid = base_meta["provenance"]["record_id"]
     root = Path(base_meta["_extracted_root"])
     primary = unit.get("vasprun") or unit.get("vaspout") or unit["outcar"]
-    return f"zenodo:{recid}:{Path(primary).relative_to(root)}"
+    return f"{_source_of(base_meta)}:{recid}:{Path(primary).relative_to(root)}"
 
 
 _PRIMARY_ROLES_ORDER = ("vasprun", "vaspout", "outcar")
@@ -629,6 +647,7 @@ def parse_calc_unit(unit: dict, base_meta: dict, availability: dict,
     # `--max-primary-bytes` this is the common case (long-AIMD vasprun.xml beside a modest
     # OUTCAR), so calc_id must NOT depend on which primary survives trimming.
     calc_id = _calc_id(unit, base_meta)
+    source = _source_of(base_meta)  # frame `source` tag; matches calc_id's prefix
     if max_primary_bytes:
         over = _oversized_primaries(unit, max_primary_bytes)
         if over:
@@ -659,7 +678,7 @@ def parse_calc_unit(unit: dict, base_meta: dict, availability: dict,
     fallback_from: str | None = None
     if vasprun:
         try:
-            frames, meta = parse_vasprun(vasprun, calc_id, outcar)
+            frames, meta = parse_vasprun(vasprun, calc_id, outcar, source)
         except Exception as exc:
             if not outcar:
                 rej.reject("parse", calc_id, "vasprun_parse_error", detail=f"{type(exc).__name__}: {exc}")
@@ -668,7 +687,7 @@ def parse_calc_unit(unit: dict, base_meta: dict, availability: dict,
             fallback_from = "vasprun"
     elif vaspout:
         try:
-            frames, meta = parse_vaspout(vaspout, calc_id, outcar)
+            frames, meta = parse_vaspout(vaspout, calc_id, outcar, source)
         except Exception as exc:
             if not outcar:
                 rej.reject("parse", calc_id, "vaspout_parse_error", detail=f"{type(exc).__name__}: {exc}")
@@ -679,7 +698,7 @@ def parse_calc_unit(unit: dict, base_meta: dict, availability: dict,
     if frames is None:  # OUTCAR-only unit, or a primary-parse fallback
         assert outcar is not None  # _find_calc_units guarantees a primary file
         try:
-            frames, meta = _parse_outcar_ase(outcar, calc_id)
+            frames, meta = _parse_outcar_ase(outcar, calc_id, source)
         except Exception as exc:
             reason = f"{fallback_from}_parse_error" if fallback_from else "outcar_parse_error"
             rej.reject("parse", calc_id, reason, detail=f"{type(exc).__name__}: {exc}")
@@ -712,7 +731,8 @@ def parse_calc_unit(unit: dict, base_meta: dict, availability: dict,
     return frames, meta
 
 
-def _parse_outcar_ase(outcar_path: str, calc_id: str) -> tuple[list[Atoms], dict]:
+def _parse_outcar_ase(outcar_path: str, calc_id: str,
+                      source: str = "zenodo") -> tuple[list[Atoms], dict]:
     """Fallback: read an OUTCAR ionic trajectory via ASE (no vasprun.xml).
 
     ASE's OUTCAR reader reaches into the working directory for a neighbouring
@@ -771,7 +791,7 @@ def _parse_outcar_ase(outcar_path: str, calc_id: str) -> tuple[list[Atoms], dict
         if "stress" in res:  # ASE Voigt stress, eV/Å³ (already ASE convention)
             atoms.info["REF_stress"] = np.asarray(res["stress"], dtype=float)
             n_with_stress += 1
-        atoms.info.update({"source": "zenodo", "calc_id": calc_id,
+        atoms.info.update({"source": source, "calc_id": calc_id,
                            "frame_id": f"{calc_id}#{i}", "ionic_step": i})
         # electronic_converged is intentionally NOT written on the OUTCAR path: it is
         # unknown here (OUTCAR exposes no per-SCF trace). Writing None would serialise as a
