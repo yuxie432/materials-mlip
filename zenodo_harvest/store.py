@@ -248,6 +248,59 @@ def read_shard_frames_lenient(path: Path) -> tuple[list[Atoms], bool]:
     return frames, truncated
 
 
+# frame_id in an extxyz comment line is an ``info`` value; ASE quotes it because it
+# contains ':'/'/'/'#' (e.g. frame_id="zenodo:123:.../vasprun.xml#0"). Fall back to an
+# unquoted token just in case.
+_FRAME_ID_RE = re.compile(r'frame_id=(?:"([^"]*)"|(\S+))')
+
+
+def read_shard_frame_meta_lenient(path: Path) -> tuple[list[tuple[str | None, set[str]]], bool]:
+    """Fast, low-overhead read of a shard's per-frame ``(frame_id, {symbols})`` WITHOUT
+    building ``Atoms`` — the version :func:`~zenodo_harvest.dataset_ops.verify_dataset` needs.
+
+    ``verify`` only wants each frame's ``frame_id`` (for the metadata↔shard bijection) and
+    its element set (for coverage stats), yet :func:`read_shard_frames_lenient` constructs a
+    full ``Atoms`` per frame via ``ase_read`` — ~1-3 ms each, i.e. HOURS for a 10M+-frame
+    dataset (the cause of ``verify`` blowing its wallclock). Parsing the extxyz text directly
+    is ~100x cheaper and allocates almost nothing per frame. Same lenient handling of a
+    crash-truncated gzip / torn tail frame as :func:`read_shard_frames_lenient`.
+
+    Assumes the ASE extxyz convention that the first column is the chemical species (which
+    is how :class:`ShardedExtxyzWriter` writes them). Returns ``(metas, truncated)``.
+    """
+    truncated = False
+    try:
+        with gzip.open(path, "rt") as fh:
+            text = fh.read()
+    except (EOFError, OSError, zlib.error):
+        text = _decompress_gzip_prefix(path)
+        truncated = True
+
+    lines = text.splitlines()
+    n = len(lines)
+    metas: list[tuple[str | None, set[str]]] = []
+    i = 0
+    while i < n:
+        try:
+            natoms = int(lines[i].strip())
+        except (ValueError, IndexError):
+            truncated = True
+            break
+        if i + 2 + natoms > n:  # last frame torn off mid-write
+            truncated = True
+            break
+        m = _FRAME_ID_RE.search(lines[i + 1])
+        frame_id = (m.group(1) if m and m.group(1) is not None else m.group(2)) if m else None
+        symbols: set[str] = set()
+        for j in range(i + 2, i + 2 + natoms):
+            tok = lines[j].split(None, 1)
+            if tok:
+                symbols.add(tok[0])
+        metas.append((frame_id, symbols))
+        i += 2 + natoms
+    return metas, truncated
+
+
 def prune_uncommitted_frames(
     out_dir: str | Path, committed_frame_ids: set[str], prefix: str = "shard",
 ) -> dict:

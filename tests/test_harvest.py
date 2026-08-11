@@ -3053,3 +3053,51 @@ def test_extract_errors_catches_corrupt_xz_and_encrypted_7z():
     except ImportError:
         return
     assert issubclass(py7zr.exceptions.PasswordRequired, _EXTRACT_ERRORS)
+
+
+def test_read_shard_frame_meta_matches_atoms_reader(tmp_path):
+    """The fast text reader used by verify must extract the same frame_ids + element sets
+    as the Atoms-based reader, and stay bijection-consistent with what verify checks."""
+    pytest = __import__("pytest")
+    pytest.importorskip("ase")
+    from ase import Atoms
+    from ase.io import write as ase_write
+    from zenodo_harvest.store import read_shard_frames_lenient, read_shard_frame_meta_lenient
+    import gzip, io as _io
+
+    frames = [
+        Atoms("H2O", positions=[[0, 0, 0], [0, 0, 1], [0, 1, 0]]),
+        Atoms("Si2", positions=[[0, 0, 0], [1, 1, 1]]),
+    ]
+    for k, a in enumerate(frames):
+        a.info["frame_id"] = f"zenodo:42:some/dir/vasprun.xml#{k}"
+    buf = _io.StringIO()
+    ase_write(buf, frames, format="extxyz")
+    shard = tmp_path / "shard-00000.extxyz.gz"
+    with gzip.open(shard, "wt") as fh:
+        fh.write(buf.getvalue())
+
+    atoms_frames, trunc_a = read_shard_frames_lenient(shard)
+    metas, trunc_m = read_shard_frame_meta_lenient(shard)
+    assert trunc_a is False and trunc_m is False
+    assert [f.info.get("frame_id") for f in atoms_frames] == [m[0] for m in metas]
+    assert metas[0] == ("zenodo:42:some/dir/vasprun.xml#0", {"H", "O"})
+    assert metas[1] == ("zenodo:42:some/dir/vasprun.xml#1", {"Si"})
+    # per-frame symbol sets match the Atoms reader
+    for f, (_fid, syms) in zip(atoms_frames, metas):
+        assert set(f.get_chemical_symbols()) == syms
+
+
+def test_read_shard_frame_meta_tolerates_truncated_tail(tmp_path):
+    """A crash-truncated shard (torn final frame) is handled leniently, like the Atoms reader."""
+    __import__("pytest").importorskip("ase")
+    from zenodo_harvest.store import read_shard_frame_meta_lenient
+    import gzip
+    shard = tmp_path / "shard-00000.extxyz.gz"
+    good = "1\nframe_id=zenodo:1:a#0 Properties=species:S:1:pos:R:3\nSi 0.0 0.0 0.0\n"
+    torn = "2\nframe_id=zenodo:1:a#1 Properties=species:S:1:pos:R:3\nSi 0.0 0.0 0.0\n"  # says 2 atoms, only 1
+    with gzip.open(shard, "wt") as fh:
+        fh.write(good + torn)
+    metas, truncated = read_shard_frame_meta_lenient(shard)
+    assert truncated is True
+    assert metas == [("zenodo:1:a#0", {"Si"})]   # the complete frame kept, torn tail dropped

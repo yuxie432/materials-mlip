@@ -39,7 +39,7 @@ from .store import (
     dataset_lock_is_live,
     existing_shard_paths,
     next_shard_index,
-    read_shard_frames_lenient,
+    read_shard_frame_meta_lenient,
 )
 
 logger = logging.getLogger(__name__)
@@ -203,23 +203,24 @@ def _scan_disk(dataset_dir: str | Path) -> tuple[Counter, Counter, list[str]]:
 
     Returns the on-disk ``frame_id`` multiset (Counter), per-element frame counts
     (Counter; a frame counts once per element it contains), and the names of any
-    truncated shards. Memory is bounded to a single shard's frames (~frames_per_shard
-    Atoms), NOT the whole dataset — verify/merge must scale to a TB-scale dataset
-    (tens of millions of frames) without OOM, so we never materialise all frames at
-    once (the old ``_read_all_frames`` did, and would blow up a normal CSD3 node).
+    truncated shards. Uses :func:`store.read_shard_frame_meta_lenient`, which extracts
+    just ``(frame_id, {symbols})`` by parsing the extxyz text — NOT building an ``Atoms``
+    per frame — so verify scales to tens of millions of frames in minutes rather than
+    hours (a full ``Atoms`` build per frame made verify blow its wallclock at ~12M frames).
+    Memory is bounded to one shard's lightweight tuples at a time.
     """
     disk_counts: Counter = Counter()
     elements: Counter = Counter()
     truncated: list[str] = []
     for shard in existing_shard_paths(dataset_dir):
-        frames, was_truncated = read_shard_frames_lenient(shard)
+        metas, was_truncated = read_shard_frame_meta_lenient(shard)
         if was_truncated:
             truncated.append(shard.name)
-        for f in frames:
-            disk_counts[f.info.get("frame_id")] += 1
-            for sym in set(f.get_chemical_symbols()):
+        for frame_id, symbols in metas:
+            disk_counts[frame_id] += 1
+            for sym in symbols:
                 elements[sym] += 1
-        # `frames` (this shard's Atoms) is released before the next shard is read.
+        # `metas` (this shard's tuples) is released before the next shard is read.
     return disk_counts, elements, truncated
 
 
