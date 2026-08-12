@@ -42,7 +42,14 @@ from pathlib import Path
 
 from . import config
 from .client import ZenodoClient
-from .dataset_ops import merge_datasets, purge_raw, split_manifest, verify_dataset
+from .dataset_ops import (
+    enrich_metadata,
+    merge_datasets,
+    purge_raw,
+    split_manifest,
+    verify_dataset,
+)
+from .param_resolver import TARGET_TAGS
 from .discover import DEFAULT_QUERIES, DEFAULT_RESOURCE_TYPES, discover
 from .fetch import DEFAULT_MAX_MEMBER_BYTES, DEFAULT_ZIP_STREAM_MAX_FILES, fetch
 from .parse import parse
@@ -197,6 +204,42 @@ def _add_purge_raw(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--dry-run", action="store_true", help="report only; delete nothing")
 
 
+def _add_enrich(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("enrich-metadata",
+                       help="attach resolved effective VASP parameters (defaults filled, "
+                            "hybrid mixing derived) to metadata.jsonl in place")
+    p.add_argument("--dataset-dir", default=str(config.DATASET_DIR))
+    p.add_argument("--dry-run", action="store_true",
+                   help="report coverage only; write nothing")
+    p.add_argument("--no-backup", action="store_true",
+                   help="skip the one-time metadata.jsonl.bak backup (not recommended)")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+
+
+def _format_enrich(summary: dict) -> str:
+    """Render the per-tag coverage table over the INCAR-complete (vasprun/vaspout) calcs."""
+    n = summary.get("n_incar_complete", 0) or 0
+    lines = [
+        f"enrich-metadata{' (dry-run)' if summary.get('dry_run') else ''}: "
+        f"{summary['n_calcs']:,} calcs, {n:,} INCAR-complete (vasprun/vaspout), "
+        f"{summary['n_calcs'] - n:,} OUTCAR (left unresolved)",
+        f"computes_stress known for {summary.get('computes_stress_known', 0):,} calcs",
+        "",
+        f"{'TAG':10s} {'incar':>8} {'+default':>9} {'+derived':>9}   "
+        f"{'before':>7} {'after':>7}   (coverage among INCAR-complete)",
+    ]
+    for tag in TARGET_TAGS:
+        c = summary["coverage"].get(tag, {})
+        incar = c.get("incar", 0)
+        deflt = c.get("default", 0)
+        deriv = c.get("derived:run_type", 0)
+        before = 100 * incar / n if n else 0
+        after = 100 * (incar + deflt + deriv) / n if n else 0
+        lines.append(f"{tag:10s} {incar:>8,} {deflt:>9,} {deriv:>9,}   "
+                     f"{before:6.1f}% {after:6.1f}%")
+    return "\n".join(lines)
+
+
 def _add_status(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("status", help="read-only snapshot of harvest progress "
                                       "(counts, staging vs quota, rejection reasons)")
@@ -272,6 +315,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_split(sub)
     _add_merge(sub)
     _add_verify(sub)
+    _add_enrich(sub)
     _add_purge_raw(sub)
     _add_status(sub)
     _add_pipeline(sub)
@@ -356,6 +400,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0  # read-only: always succeeds
     elif args.cmd == "verify":
         summary = verify_dataset(args.dataset_dir)
+    elif args.cmd == "enrich-metadata":
+        summary = enrich_metadata(args.dataset_dir, dry_run=args.dry_run,
+                                  backup=not args.no_backup)
+        if not summary.get("ok"):
+            print(f"ERROR: {summary.get('error')}", file=sys.stderr)
+            return 1
+        print(json.dumps(summary, indent=2) if args.json else _format_enrich(summary))
+        return 0
     elif args.cmd == "purge-raw":
         fetched = args.fetched or str(Path(args.raw_dir).parent / "manifests" / "fetched.jsonl")
         try:

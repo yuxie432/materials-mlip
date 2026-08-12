@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from .manifest import read_jsonl
+from .param_resolver import TARGET_TAGS, resolve_parameters
 from .store import (
     DatasetLock,
     MetadataWriter,
@@ -344,6 +345,119 @@ def verify_dataset(dataset_dir: str | Path) -> dict:
     stats["n_frames_on_disk"] = integrity["n_frames_on_disk"]
     return {"dataset_dir": str(dataset_dir), "ok": integrity["ok"],
             "integrity": integrity, "stats": stats}
+
+
+# --------------------------------------------------------------------------- #
+# enrich-metadata — attach resolved effective VASP parameters in place        #
+# --------------------------------------------------------------------------- #
+
+def _resolved_block(rec: dict) -> tuple[dict, Any]:
+    """Compute a lean ``resolved`` block for one metadata record.
+
+    Returns ``(block, raw)`` where ``block`` is what gets stored under
+    ``calc_parameters["resolved"]`` and ``raw`` is the full :func:`resolve_parameters`
+    output (kept for stats). The stored block is deliberately lean: it carries only the
+    KNOWN effective values (``incar``-authoritative + filled defaults + run_type-derived)
+    plus their per-tag provenance and the ``computes_stress`` fact — the ``unknown`` /
+    ``not_applicable`` tags are omitted (their absence already means "no reliable value").
+    """
+    raw = resolve_parameters(rec.get("calc_parameters"), rec.get("quality"))
+    effective: dict[str, Any] = {}
+    sources: dict[str, str] = {}
+    for tag, entry in raw["parameters"].items():
+        if entry["value"] is not None:          # skip unknown / not_applicable
+            effective[tag] = entry["value"]
+            sources[tag] = entry["source"]
+    block = {
+        "incar_complete": raw["incar_complete"],
+        "effective": effective,
+        "sources": sources,
+        "computes_stress": raw["derived"]["computes_stress"]["value"],
+    }
+    return block, raw
+
+
+def enrich_metadata(dataset_dir: str | Path, dry_run: bool = False,
+                    backup: bool = True) -> dict:
+    """Attach resolved effective VASP parameters to every record of ``metadata.jsonl``.
+
+    For each calc, :func:`resolve_parameters` fills VASP's documented defaults for unset
+    INCAR tags (only where the full INCAR is known — the vasprun/vaspout path), derives the
+    hybrid mixing from ``run_type``, and leaves the undeterminable ones out. The result is
+    written under ``calc_parameters["resolved"]`` (see :func:`_resolved_block`).
+
+    This ONLY adds a field: ``calc_id``, ``frame_ids``, ``shards`` and every field
+    :func:`verify_dataset` checks are left byte-identical, so the metadata<->shard bijection
+    is preserved (re-run ``verify`` after to confirm). The write is atomic (temp file ->
+    ``os.replace``) under the dataset ``.parse.lock``; a one-time ``metadata.jsonl.bak``
+    backup is kept unless ``backup=False``. Idempotent: re-running overwrites the block.
+
+    **Compatibility with a later re-fetch / re-parse.** The ``resolved`` block is a *derived
+    cache* of the record's own fields; it never alters the inputs a later stage consumes —
+    ``parse`` resumes off ``calc_id``/``frame_ids`` (untouched), ``merge-datasets`` carries the
+    whole record through, and ``verify`` ignores it. So enriching now does not block re-fetching
+    and re-parsing the OUTCAR calcs later (which will replace those records with real INCARs);
+    just re-run ``enrich-metadata`` afterwards to refresh the cache for the newly-parsed records
+    (a re-parsed OUTCAR calc flips ``incar_complete`` false→true and gains real filled defaults).
+
+    ``dry_run`` computes and returns the coverage stats without writing anything. Returns a
+    dict with ``ok``, ``n_calcs``, ``n_incar_complete``, and ``coverage`` — a per-tag
+    ``{incar, default, derived, not_applicable, unknown}`` breakdown over the INCAR-complete
+    (vasprun/vaspout) calcs — plus ``computes_stress_known``.
+    """
+    dataset_dir = Path(dataset_dir)
+    mp = dataset_dir / "metadata.jsonl"
+    if not mp.is_file():
+        return {"ok": False, "error": f"no metadata.jsonl in {dataset_dir}"}
+
+    n_calcs = 0
+    n_complete = 0
+    computes_stress_known = 0
+    # per-tag source tallies, counted over INCAR-complete calcs only (the answerable set)
+    coverage: dict[str, Counter] = {t: Counter() for t in TARGET_TAGS}
+
+    def _accumulate(rec: dict) -> dict:
+        nonlocal n_calcs, n_complete, computes_stress_known
+        block, raw = _resolved_block(rec)
+        n_calcs += 1
+        if raw["incar_complete"]:
+            n_complete += 1
+            for tag in TARGET_TAGS:
+                coverage[tag][raw["parameters"][tag]["source"]] += 1
+        if block["computes_stress"] is not None:
+            computes_stress_known += 1
+        cp = rec.get("calc_parameters")
+        if not isinstance(cp, dict):
+            cp = {}
+        cp["resolved"] = block
+        rec["calc_parameters"] = cp
+        return rec
+
+    with DatasetLock(dataset_dir):
+        if dry_run:
+            for rec in read_jsonl(mp):
+                _accumulate(rec)
+        else:
+            tmp = mp.parent / (mp.name + ".enrich.tmp")
+            with tmp.open("w", encoding="utf-8") as out:
+                for rec in read_jsonl(mp):
+                    out.write(json.dumps(_accumulate(rec)) + "\n")
+                out.flush()
+                os.fsync(out.fileno())
+            bak = mp.parent / (mp.name + ".bak")
+            if backup and not bak.exists():      # preserve the PRISTINE original only
+                shutil.copy2(mp, bak)
+            os.replace(tmp, mp)                   # atomic swap into place
+
+    return {
+        "ok": True,
+        "dataset_dir": str(dataset_dir),
+        "dry_run": dry_run,
+        "n_calcs": n_calcs,
+        "n_incar_complete": n_complete,
+        "computes_stress_known": computes_stress_known,
+        "coverage": {t: dict(coverage[t]) for t in TARGET_TAGS},
+    }
 
 
 # --------------------------------------------------------------------------- #

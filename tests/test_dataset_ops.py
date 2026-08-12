@@ -22,6 +22,7 @@ pytest.importorskip("ase")
 from ase import Atoms  # noqa: E402
 
 from zenodo_harvest.dataset_ops import (  # noqa: E402
+    enrich_metadata,
     merge_datasets,
     purge_raw,
     split_manifest,
@@ -581,3 +582,68 @@ def test_purge_raw_partial_is_idempotent(tmp_path):
     assert first["bytes_freed"] > 0
     assert second["bytes_freed"] == 0 and second["files_removed"] == 0
     assert (raw / "555" / "extracted" / "calc2" / "OUTCAR").is_file()
+
+
+# --------------------------------------------------------------------------- #
+# enrich-metadata                                                             #
+# --------------------------------------------------------------------------- #
+
+def test_enrich_preserves_bijection_and_resolves(tmp_path):
+    """enrich only ADDS calc_parameters.resolved: bijection fields byte-identical, verify
+    still passes, defaults filled/derived correctly, OUTCAR left unresolved."""
+    ds = tmp_path / "ds"
+    _build_calc(ds, "zenodo:1:vasprun.xml", ["H", "He"], parser="pymatgen.Vasprun",
+                run_type="HSE06")
+    _build_calc(ds, "zenodo:2:OUTCAR", ["Li"], parser="ase.OUTCAR")
+    mp = ds / "metadata.jsonl"
+    # give the vasprun calc a real (partial) INCAR; make the OUTCAR calc parameter-less
+    recs = list(read_jsonl(mp))
+    for rec in recs:
+        cp = rec["calc_parameters"]
+        if rec["calc_id"].endswith("vasprun.xml"):
+            cp["incar"] = {"ENCUT": 400.0}                 # ISIF unset, hybrid only via run_type
+        else:
+            cp.pop("incar", None)
+            cp["run_type"] = None
+            cp["functional"] = None
+    mp.write_text("".join(json.dumps(r) + "\n" for r in recs))
+    before = [(r["calc_id"], tuple(r["frame_ids"]), tuple(r["shards"])) for r in read_jsonl(mp)]
+
+    summary = enrich_metadata(ds)
+    assert summary["ok"] and summary["n_calcs"] == 2 and summary["n_incar_complete"] == 1
+
+    got = {r["calc_id"]: r for r in read_jsonl(mp)}
+    after = [(r["calc_id"], tuple(r["frame_ids"]), tuple(r["shards"])) for r in read_jsonl(mp)]
+    assert before == after                                  # bijection keys untouched
+
+    v = got["zenodo:1:vasprun.xml"]["calc_parameters"]["resolved"]
+    assert v["incar_complete"] is True
+    assert v["effective"]["LHFCALC"] is True and v["sources"]["LHFCALC"] == "derived:run_type"
+    assert v["effective"]["AEXX"] == 0.25 and v["effective"]["ENCUT"] == 400.0
+    assert v["sources"]["ENCUT"] == "incar" and v["sources"]["LREAL"] == "default"
+    assert "ISIF" not in v["effective"]                     # unset -> left unknown, not guessed
+
+    o = got["zenodo:2:OUTCAR"]["calc_parameters"]["resolved"]
+    assert o["incar_complete"] is False and o["effective"] == {}   # nothing fabricated
+
+    assert (ds / "metadata.jsonl.bak").is_file()            # pristine backup kept
+    assert verify_dataset(ds)["ok"] is True                 # bijection still holds
+
+
+def test_enrich_is_idempotent(tmp_path):
+    """Re-running produces byte-identical output and never nests resolved-in-resolved —
+    so it composes with a later re-parse (re-enrich to refresh the derived cache)."""
+    ds = tmp_path / "ds"
+    _build_calc(ds, "zenodo:1:vasprun.xml", ["H"], run_type="PBE")
+    mp = ds / "metadata.jsonl"
+    # add a minimal INCAR so there is something to resolve
+    recs = list(read_jsonl(mp))
+    recs[0]["calc_parameters"]["incar"] = {"ENCUT": 520.0}
+    mp.write_text(json.dumps(recs[0]) + "\n")
+
+    enrich_metadata(ds)
+    once = mp.read_text()
+    enrich_metadata(ds)                                     # second pass
+    assert mp.read_text() == once                           # stable
+    rec = next(iter(read_jsonl(mp)))
+    assert "resolved" not in rec["calc_parameters"]["resolved"]   # not nested
