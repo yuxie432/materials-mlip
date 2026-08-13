@@ -123,12 +123,27 @@ PY
 )
 echo "OUTCAR calcs still missing a functional: $REMAINING"
 
-if [[ "$rc" -eq 0 && "$REMAINING" -eq 0 ]]; then
-    echo "=== all OUTCAR calcs recovered; enrich + verify ==="
+# Finalize when the recovery is DONE (REMAINING==0) OR a CLEAN round made NO progress
+# (REMAINING unchanged from the previous round) — the latter means the leftover calcs are
+# unrecoverable (recid missing from keep.jsonl, an unsupported/oversized archive, or a
+# corrupt/unreadable OUTCAR header) and will never decrease, so the chain must stop cleanly
+# instead of burning all MAX_ATTEMPTS. A round cut short by wallclock/USR1 (rc!=0) NEVER
+# finalizes: its successor keeps going. PREV persists across the resubmit chain in $MAN.
+PREV_FILE="$MAN/.outcar_remaining.prev"
+PREV="$(cat "$PREV_FILE" 2>/dev/null || echo -1)"
+echo "$REMAINING" > "$PREV_FILE"
+if [[ "$rc" -eq 0 && ( "$REMAINING" -eq 0 || "$REMAINING" == "$PREV" ) ]]; then
+    if [[ "$REMAINING" -ne 0 ]]; then
+        echo "WARNING: $REMAINING OUTCAR calc(s) still null after a no-progress round — likely"
+        echo "  unrecoverable (missing from keep / unsupported archive / unreadable header)."
+        echo "  Finalizing anyway. Inspect: parser=='ase.OUTCAR' and calc_parameters.run_type null."
+    fi
+    echo "=== finalizing: enrich-metadata + verify $(date -Is) ==="
     python -m zenodo_harvest.cli enrich-metadata --dataset-dir "$DS"
     python -m zenodo_harvest.cli verify --dataset-dir "$DS"
+    rm -f "$PREV_FILE"
     if [[ -n "$NEXT_JOBID" ]]; then
-        echo "done cleanly; cancelling pre-queued successor $NEXT_JOBID"
+        echo "done; cancelling pre-queued successor $NEXT_JOBID"
         scancel "$NEXT_JOBID" 2>/dev/null || true
     fi
 else
