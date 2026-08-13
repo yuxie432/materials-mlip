@@ -20,14 +20,25 @@
 # already correct), so this is far cheaper than a re-parse — and targeted ZIP fetch pulls just
 # the OUTCAR out of a .zip over HTTP Range instead of downloading the whole archive.
 #
-# One round = fetch(paced) -> refresh-outcar(--only-missing) -> purge-raw. The round is
-# resubmitted (wallclock via the USR1 trap, or when OUTCAR calcs remain) until every OUTCAR
-# calc has a functional; then it runs enrich-metadata + verify once and stops.
+# It runs a BATCHED loop of fetch(BATCH records) -> refresh-outcar(--only-missing) -> purge-raw,
+# so the null-count drops every batch (visible in this .out) and staging stays tiny. The loop
+# ends when no OUTCAR calc is left null (or a small unrecoverable floor is reached), then runs
+# enrich-metadata + verify once. A wallclock kill just resumes in the successor job.
+#
+# Staging is ISOLATED in a DEDICATED raw dir ($RAW below, default raw_outcar) and rejections in
+# a SEPARATE $MAN/outcar_rejections.jsonl — so the main harvest's raw/ and rejections.jsonl are
+# left untouched (keep them for a later skipped/error-record campaign).
+#
+# NOTE: records whose OUTCAR sits inside a .rar/.7z/.tar.zst need the `archives` extra AND an
+# `unrar`/`bsdtar` (rar) binary on PATH — otherwise those extract as a logged rejection and
+# those few calcs won't recover. Install: `pip install -e .[archives]` + `module load` (or a
+# conda) that provides unrar; check with `python -c "import rarfile,py7zr,zstandard"` and
+# `which unrar bsdtar`.
 #
 #   export SBATCH_ACCOUNT=<...>; source <path>/.venv/bin/activate; mkdir -p logs
 #   RESUBMIT=1 sbatch scripts/csd3/44_outcar_recover.sh
 # RESUBMIT is an ON/OFF switch (MAX_ATTEMPTS bounds the rounds). Everything is resumable +
-# idempotent, so a mid-round kill loses no work.
+# idempotent, so a mid-batch kill loses no work.
 set -euo pipefail
 
 # ---- ENV SETUP (edit me) --------------------------------------------------------
@@ -40,6 +51,8 @@ cd "${SLURM_SUBMIT_DIR:-.}"
 
 # ---- PARAMETERS -----------------------------------------------------------------
 WORKERS="${WORKERS:-4}"                                # concurrent downloads (Zenodo 100 req/min)
+BATCH="${BATCH:-25}"                                   # records per fetch->refresh->purge cycle
+                                                       # (smaller = more frequent progress + tinier staging)
 MAX_DISK_BYTES="${MAX_DISK_BYTES:-800000000000}"       # ~0.8 x 1 TB hpc-work quota
 MAX_DISK_FILES="${MAX_DISK_FILES:-800000}"             # inode quota binds first on Lustre
 MAX_MEMBER_BYTES="${MAX_MEMBER_BYTES:-30000000000}"    # bomb guard on the whole-download fallback
@@ -50,10 +63,13 @@ ATTEMPT="${ATTEMPT:-1}"
 mkdir -p logs
 MAN="$ZENODO_HARVEST_DATA/manifests"
 DS="$ZENODO_HARVEST_DATA/dataset"
-RAW="$ZENODO_HARVEST_DATA/raw"
+# DEDICATED raw dir (NOT the main harvest's raw): keeps the recovery's staging fully isolated,
+# so the main `raw/` — which you may keep for a later skipped/error-record campaign — is never
+# fetched into, walked, or purged, and the recovery starts against an empty inode/byte budget.
+RAW="${RAW_DIR:-$ZENODO_HARVEST_DATA/raw_outcar}"
 KEEP="${KEEP:-$MAN/keep.jsonl}"                        # the ORIGINAL keep-list (has file URLs)
 OUTCAR_KEEP="$MAN/outcar_keep.jsonl"
-OUTCAR_FETCHED="$MAN/outcar_fetched.jsonl"
+OUTCAR_FETCHED="$MAN/outcar_fetched.jsonl"             # recovery resume state (recids fetched)
 
 if [[ ! -s "$DS/metadata.jsonl" ]]; then echo "ERROR: $DS/metadata.jsonl missing" >&2; exit 2; fi
 if [[ ! -s "$KEEP" ]]; then echo "ERROR: $KEEP missing (need the original keep-list's file URLs)" >&2; exit 2; fi
@@ -83,71 +99,81 @@ submit_successor() {
 trap 'submit_successor' USR1
 
 # One round of work, in the background so the USR1 trap can fire mid-round (see 20_pipeline.sh).
-run_round() {
-    # Re-fetch (paced): targeted ZIP member fetch is ON by default, so a .zip record transfers
-    # only its OUTCAR files. Archives are deleted right after extraction; the persistent
-    # footprint is the extracted OUTCARs. Resumable: recids already in $OUTCAR_FETCHED skip.
-    python -m zenodo_harvest.cli -v fetch --in "$OUTCAR_KEEP" --out "$OUTCAR_FETCHED" \
-        --raw-dir "$RAW" --max-bytes 0 --max-member-bytes "$MAX_MEMBER_BYTES" \
-        --max-disk-bytes "$MAX_DISK_BYTES" --max-disk-files "$MAX_DISK_FILES" --workers "$WORKERS"
-    # Refresh metadata from whatever is staged. --only-missing skips calcs already refreshed in
-    # a prior round (whose raw purge-raw has since reclaimed), so it never re-reads a purged file.
-    python -m zenodo_harvest.cli refresh-outcar --dataset-dir "$DS" \
-        --fetched "$OUTCAR_FETCHED" --raw-dir "$RAW" --only-missing
-    # Reclaim the staged OUTCARs (their calcs are all in the dataset) so the next round's fetch
-    # has room under the disk valve.
-    python -m zenodo_harvest.cli purge-raw --raw-dir "$RAW" --dataset-dir "$DS" --fetched "$OUTCAR_FETCHED"
+count_remaining() {
+    # OUTCAR calcs still lacking a functional (run_type null) — the live progress metric.
+    python - "$DS/metadata.jsonl" <<'PY'
+import json, sys
+print(sum(1 for l in open(sys.argv[1]) if (r := json.loads(l)).get("parser") == "ase.OUTCAR"
+          and (r.get("calc_parameters") or {}).get("run_type") is None))
+PY
+}
+
+# BATCHED work loop: fetch a SMALL batch of records, refresh their metadata, purge their raw,
+# repeat — so the null count drops every batch (visible in this .out) and staging never grows
+# beyond one batch (the disk/inode valve is barely touched; each batch's raw walk stays cheap).
+# Refresh/purge run ONLY when the batch fetched something new, so idle passes are cheap.
+# Termination: no OUTCAR calc left null (done), or 3 consecutive batches fetched nothing new
+# (everything left is already fetched or terminally rejected -> the unrecoverable floor). A
+# wallclock SIGKILL just ends the loop mid-batch; the successor resumes it (fetch skips done
+# recids, refresh --only-missing skips done calcs).
+work_loop() {
+    local dry=0 before after remaining
+    while :; do
+        before=$(wc -l < "$OUTCAR_FETCHED" 2>/dev/null || echo 0)
+        # Targeted ZIP fetch is ON by default (a .zip transfers only its OUTCARs). --max-records
+        # bounds the batch; fetch is resume-aware (recids already in $OUTCAR_FETCHED skip).
+        python -m zenodo_harvest.cli -v fetch --in "$OUTCAR_KEEP" --out "$OUTCAR_FETCHED" \
+            --raw-dir "$RAW" --rejections "$MAN/outcar_rejections.jsonl" \
+            --max-bytes 0 --max-member-bytes "$MAX_MEMBER_BYTES" \
+            --max-disk-bytes "$MAX_DISK_BYTES" --max-disk-files "$MAX_DISK_FILES" \
+            --workers "$WORKERS" --max-records "$BATCH"
+        after=$(wc -l < "$OUTCAR_FETCHED" 2>/dev/null || echo 0)
+        if [[ "$after" -gt "$before" ]]; then
+            # Overwrite ONLY these OUTCAR calcs' calc_parameters (--only-missing skips ones a
+            # prior batch already did and whose raw is now purged), then reclaim their raw.
+            python -m zenodo_harvest.cli refresh-outcar --dataset-dir "$DS" \
+                --fetched "$OUTCAR_FETCHED" --raw-dir "$RAW" --only-missing
+            python -m zenodo_harvest.cli purge-raw --raw-dir "$RAW" --dataset-dir "$DS" \
+                --fetched "$OUTCAR_FETCHED"
+            dry=0
+        else
+            dry=$((dry + 1))
+        fi
+        remaining=$(count_remaining)
+        echo "[batch] $(date -Is) fetched=${after}/230 remaining_null=${remaining} dry=${dry}"
+        [[ "$remaining" -eq 0 ]] && return 0
+        [[ "$dry" -ge 3 ]] && return 0
+    done
 }
 
 rc=0
-run_round &
-ROUND_PID=$!
+work_loop &
+LOOP_PID=$!
 set +e
 while true; do
-    wait "$ROUND_PID"; rc=$?
-    if [[ "$rc" -le 128 ]] || ! kill -0 "$ROUND_PID" 2>/dev/null; then break; fi
+    wait "$LOOP_PID"; rc=$?
+    if [[ "$rc" -le 128 ]] || ! kill -0 "$LOOP_PID" 2>/dev/null; then break; fi
 done
 set -e
-echo "=== round exit=$rc $(date -Is) ==="
+echo "=== work loop exit=$rc $(date -Is) ==="
 
-# Completion check: how many OUTCAR calcs still lack a functional (run_type null)?
-REMAINING=$(python - "$DS/metadata.jsonl" <<'PY'
-import json, sys
-n = 0
-for line in open(sys.argv[1]):
-    r = json.loads(line)
-    if r.get("parser") == "ase.OUTCAR" and (r.get("calc_parameters") or {}).get("run_type") is None:
-        n += 1
-print(n)
-PY
-)
-echo "OUTCAR calcs still missing a functional: $REMAINING"
-
-# Finalize when the recovery is DONE (REMAINING==0) OR a CLEAN round made NO progress
-# (REMAINING unchanged from the previous round) — the latter means the leftover calcs are
-# unrecoverable (recid missing from keep.jsonl, an unsupported/oversized archive, or a
-# corrupt/unreadable OUTCAR header) and will never decrease, so the chain must stop cleanly
-# instead of burning all MAX_ATTEMPTS. A round cut short by wallclock/USR1 (rc!=0) NEVER
-# finalizes: its successor keeps going. PREV persists across the resubmit chain in $MAN.
-PREV_FILE="$MAN/.outcar_remaining.prev"
-PREV="$(cat "$PREV_FILE" 2>/dev/null || echo -1)"
-echo "$REMAINING" > "$PREV_FILE"
-if [[ "$rc" -eq 0 && ( "$REMAINING" -eq 0 || "$REMAINING" == "$PREV" ) ]]; then
-    if [[ "$REMAINING" -ne 0 ]]; then
-        echo "WARNING: $REMAINING OUTCAR calc(s) still null after a no-progress round — likely"
-        echo "  unrecoverable (missing from keep / unsupported archive / unreadable header)."
+remaining=$(count_remaining)
+if [[ "$rc" -eq 0 ]]; then
+    # Loop returned cleanly => done or the unrecoverable floor reached. Finalize once.
+    if [[ "$remaining" -ne 0 ]]; then
+        echo "WARNING: $remaining OUTCAR calc(s) still null — unrecoverable (recid missing from"
+        echo "  keep.jsonl / unsupported-or-oversized archive / corrupt-unreadable OUTCAR header)."
         echo "  Finalizing anyway. Inspect: parser=='ase.OUTCAR' and calc_parameters.run_type null."
     fi
     echo "=== finalizing: enrich-metadata + verify $(date -Is) ==="
     python -m zenodo_harvest.cli enrich-metadata --dataset-dir "$DS"
     python -m zenodo_harvest.cli verify --dataset-dir "$DS"
-    rm -f "$PREV_FILE"
     if [[ -n "$NEXT_JOBID" ]]; then
         echo "done; cancelling pre-queued successor $NEXT_JOBID"
         scancel "$NEXT_JOBID" 2>/dev/null || true
     fi
 else
-    # More to do (disk valve paused the fetch, or wallclock, or a transient error): chain on.
+    # Wallclock SIGKILL (or a hard error) mid-batch: the successor resumes the loop.
     submit_successor
 fi
 exit "$rc"
