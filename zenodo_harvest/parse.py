@@ -79,6 +79,7 @@ from ase.stress import full_3x3_to_voigt_6_stress
 
 from . import config
 from .manifest import RejectionLogger, read_jsonl
+from .outcar_params import EFFECTIVE_TAGS, parse_outcar_header
 from .store import (
     DatasetLock,
     MetadataWriter,
@@ -326,6 +327,13 @@ def _calc_parameters(vasprun: Any) -> dict:
         return v if v is not None else params.get(key)
 
     run_type = str(vasprun.run_type)                # functional + U/vdW flavour
+    # VASP's RESOLVED/effective parameters (defaults filled), the authoritative analog of the
+    # OUTCAR header's effective block. Storing them (the "better fix" in the metadata-gaps
+    # memory) lets the resolver read authoritative values instead of guessing defaults, and
+    # keeps the vasprun and OUTCAR `parameters` blocks on one schema. Restricted to the shared
+    # allow-list (outcar_params.EFFECTIVE_TAGS) to bound size — vasprun.parameters is ~100 tags.
+    effective = {k: _jsonable(params.get(k)) for k in EFFECTIVE_TAGS
+                 if params.get(k) is not None}
     return {
         "code": "vasp",
         "code_version": getattr(vasprun, "vasp_version", None),
@@ -349,6 +357,7 @@ def _calc_parameters(vasprun: Any) -> dict:
         "potcar_set_hash": _potcar_set_hash(
             [s.get("titel") for s in (vasprun.potcar_spec or [])]),
         "incar": incar,
+        "parameters": effective,
     }
 
 
@@ -741,6 +750,13 @@ def _parse_outcar_ase(outcar_path: str, calc_id: str,
     temp dir sidesteps that and is format-pinned to avoid filename sniffing. A
     compressed OUTCAR (``OUTCAR.gz``/``.bz2``/``.xz``) is decompressed first so the
     lone temp copy is always plain text.
+
+    ASE recovers only the *trajectory* (positions/energy/forces/stress); the calc
+    *parameters* (functional/run_type/INCAR/effective values/k-points/POTCAR) come from a
+    separate read of the OUTCAR **header** via :func:`outcar_params.parse_outcar_header`, so
+    the ``calc_parameters`` block matches the vasprun path rather than being near-empty. This
+    is what closes the historical OUTCAR metadata gap (functional was ``null`` on 25.6% of
+    frames — see the metadata-gaps memory / docs/EVALUATION.md).
     """
     import bz2
     import gzip
@@ -760,7 +776,6 @@ def _parse_outcar_ase(outcar_path: str, calc_id: str,
             with opener(outcar_path, "rb") as src, open(lone, "wb") as dst:
                 shutil.copyfileobj(src, dst)
         traj = read(lone, format="vasp-out", index=":")
-        potcar_titels = _outcar_potcar_titels(lone)  # read TITEL lines before td closes
     if not isinstance(traj, list):
         traj = [traj]
     frames = []
@@ -798,14 +813,19 @@ def _parse_outcar_ase(outcar_path: str, calc_id: str,
         # bare extxyz key that reads back as True (see _frame); omitting it -> read-back
         # None ("unknown"), consistent with this calc's quality.electronic_converged = None.
         frames.append(atoms)
+    # Recover the full calc parameters from the OUTCAR HEADER (functional/run_type/INCAR/
+    # effective parameters/k-points/POTCAR) — parity with the vasprun path, so an OUTCAR-only
+    # calc is no longer a metadata black hole (the 25.6%-unknown-functional gap). Read from the
+    # ORIGINAL path (compression-aware); fall back to a minimal dict only if the header is
+    # unreadable (frames were already recovered by ASE, so we still keep the calc).
+    calc_parameters = parse_outcar_header(outcar_path) or {
+        "code": "vasp", "run_type": None, "functional": None,
+        "potcar_symbols": None, "potcar_set_hash": None,
+        "parsed_from": "outcar_header_unreadable",
+    }
     meta = {
         "calc_id": calc_id,
-        "calc_parameters": {"code": "vasp", "run_type": None, "functional": None,
-                            # POTCAR titels ARE recoverable from the OUTCAR header, so
-                            # the set-hash consistency key works on this path too.
-                            "potcar_titels": potcar_titels or None,
-                            "potcar_set_hash": _potcar_set_hash(potcar_titels),
-                            "note": "parsed from OUTCAR only; parameters limited"},
+        "calc_parameters": calc_parameters,
         # No SCF trace from OUTCAR here, so per-frame convergence stays None (never
         # False) -> n_frames_scf_unconverged is 0. n_ionic_steps counts all steps
         # read; n_frames counts those actually stored (after the no-energy drop).

@@ -96,8 +96,21 @@ parse-rejected 18,494 = outcar_parse_error 17,037
 **The one structural gap:** ~3.04M frames (all `parser=="ase.OUTCAR"`) lack
 `run_type`/`functional`/`electronic_converged`. This is *by construction* (those come from
 pymatgen `Vasprun.run_type`/`converged_electronic`, which don't run on the OUTCAR fallback),
-**not corruption** — and it is back-fillable later by classifying from the OUTCAR's INCAR echo.
-Filter these with `parser == "ase.OUTCAR"`.
+**not corruption**. Filter these with `parser == "ase.OUTCAR"`.
+
+**Addressed (2026-08-13) — `run_type`/`functional`/INCAR:** the OUTCAR parser now reads the
+OUTCAR **header** (`zenodo_harvest/outcar_params.py`), so `_parse_outcar_ase` populates the
+full `calc_parameters` (functional/run_type/INCAR/effective `parameters`/k-points/POTCAR) to
+parity with the vasprun path, with `run_type` classified faithfully to pymatgen's
+`Vasprun.run_type` (live-validated by a same-calc OUTCAR-vs-vasprun cross-check across
+GGA/PBE/PBEsol/R2SCAN/HSE06/GGA+U). For the *already-built* dataset the fix is applied
+**metadata-only, without rebuilding shards**, by the targeted recovery flow
+(`outcar-keeplist` → re-fetch → `refresh-outcar`; `zenodo_harvest/outcar_recover.py` and
+`scripts/csd3/44_outcar_recover.sh`): 230 records / 93,043 calcs / ~955 GiB to re-fetch, of
+which 132 records are `.zip` (targeted member fetch transfers only the OUTCARs). `calc_id`/
+`frame_ids`/`shards` stay byte-identical so this `verify`-clean gate still holds.
+(`electronic_converged` per frame remains OUTCAR-unrecoverable without re-reading the SCF body
+into the shards, which the metadata-only recovery deliberately does not do.)
 
 ---
 

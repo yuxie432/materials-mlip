@@ -52,6 +52,7 @@ from .dataset_ops import (
 from .param_resolver import TARGET_TAGS
 from .discover import DEFAULT_QUERIES, DEFAULT_RESOURCE_TYPES, discover
 from .fetch import DEFAULT_MAX_MEMBER_BYTES, DEFAULT_ZIP_STREAM_MAX_FILES, fetch
+from .outcar_recover import build_outcar_keeplist, refresh_outcar_metadata
 from .parse import parse
 from .store import DatasetLockError
 from .triage import triage
@@ -225,19 +226,53 @@ def _format_enrich(summary: dict) -> str:
         f"{summary['n_calcs'] - n:,} OUTCAR (left unresolved)",
         f"computes_stress known for {summary.get('computes_stress_known', 0):,} calcs",
         "",
-        f"{'TAG':10s} {'incar':>8} {'+default':>9} {'+derived':>9}   "
+        f"{'TAG':10s} {'incar':>8} {'+params':>8} {'+default':>9} {'+derived':>9}   "
         f"{'before':>7} {'after':>7}   (coverage among INCAR-complete)",
     ]
     for tag in TARGET_TAGS:
         c = summary["coverage"].get(tag, {})
         incar = c.get("incar", 0)
+        params = c.get("parameters", 0)          # authoritative resolved value (OUTCAR-refresh)
         deflt = c.get("default", 0)
         deriv = c.get("derived:run_type", 0)
         before = 100 * incar / n if n else 0
-        after = 100 * (incar + deflt + deriv) / n if n else 0
-        lines.append(f"{tag:10s} {incar:>8,} {deflt:>9,} {deriv:>9,}   "
+        after = 100 * (incar + params + deflt + deriv) / n if n else 0
+        lines.append(f"{tag:10s} {incar:>8,} {params:>8,} {deflt:>9,} {deriv:>9,}   "
                      f"{before:6.1f}% {after:6.1f}%")
     return "\n".join(lines)
+
+
+def _add_outcar_keeplist(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("outcar-keeplist",
+                       help="stage 0 of OUTCAR recovery: emit a slim keep-list of just the "
+                            "records that still hold an OUTCAR-parsed calc (to re-fetch)")
+    p.add_argument("--dataset-dir", default=str(config.DATASET_DIR))
+    p.add_argument("--keep", required=True,
+                   help="the original triaged keep-list (has each record's file URLs)")
+    p.add_argument("--out", required=True, help="where to write the OUTCAR-only keep-list JSONL")
+    p.add_argument("--only-missing", action="store_true",
+                   help="target only OUTCAR calcs still lacking a functional (run_type is "
+                        "null) — i.e. not yet refreshed; default targets every OUTCAR calc")
+
+
+def _add_refresh_outcar(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("refresh-outcar",
+                       help="stage 2 of OUTCAR recovery: re-parse re-fetched OUTCAR headers "
+                            "and overwrite ONLY those records' calc_parameters in "
+                            "metadata.jsonl (calc_id/frame_ids/shards untouched)")
+    p.add_argument("--dataset-dir", default=str(config.DATASET_DIR))
+    p.add_argument("--fetched", required=True,
+                   help="fetched manifest from re-fetching the OUTCAR keep-list")
+    p.add_argument("--raw-dir", default=str(config.RAW_DIR),
+                   help="where the re-fetch staged the files; manifest paths resolve against it")
+    p.add_argument("--only-missing", action="store_true",
+                   help="only overwrite OUTCAR calcs still lacking a functional (skip ones "
+                        "already refreshed in a prior run)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="report what would change; write nothing")
+    p.add_argument("--no-backup", action="store_true",
+                   help="skip the one-time metadata.jsonl.bak.pre_outcar_refresh snapshot")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
 
 
 def _add_status(sub: argparse._SubParsersAction) -> None:
@@ -316,6 +351,8 @@ def main(argv: list[str] | None = None) -> int:
     _add_merge(sub)
     _add_verify(sub)
     _add_enrich(sub)
+    _add_outcar_keeplist(sub)
+    _add_refresh_outcar(sub)
     _add_purge_raw(sub)
     _add_status(sub)
     _add_pipeline(sub)
@@ -407,6 +444,26 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: {summary.get('error')}", file=sys.stderr)
             return 1
         print(json.dumps(summary, indent=2) if args.json else _format_enrich(summary))
+        return 0
+    elif args.cmd == "outcar-keeplist":
+        summary = build_outcar_keeplist(args.dataset_dir, args.keep, args.out,
+                                        only_missing=args.only_missing)
+        if not summary.get("ok"):
+            print(f"ERROR: {summary.get('error')}", file=sys.stderr)
+            return 1
+    elif args.cmd == "refresh-outcar":
+        try:
+            summary = refresh_outcar_metadata(
+                args.dataset_dir, args.fetched, args.raw_dir,
+                dry_run=args.dry_run, backup=not args.no_backup,
+                only_missing=args.only_missing)
+        except DatasetLockError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        if not summary.get("ok"):
+            print(f"ERROR: {summary.get('error')}", file=sys.stderr)
+            return 1
+        print(json.dumps(summary, indent=2))
         return 0
     elif args.cmd == "purge-raw":
         fetched = args.fetched or str(Path(args.raw_dir).parent / "manifests" / "fetched.jsonl")

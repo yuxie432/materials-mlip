@@ -10,13 +10,23 @@ unit-tests network-free.
 
 Why this is safe (and where it stops):
 
+* **Authoritative ``parameters`` win over any guess.** When a calc carries a
+  ``calc_parameters["parameters"]`` block — VASP's RESOLVED/effective values, stored by BOTH
+  the vasprun path and the OUTCAR-header parser (:mod:`outcar_params`) — the resolver reads a
+  tag straight from it (``source="parameters"``) instead of filling a documented default or
+  inverting ``run_type``. This is the memory's "better fix": no version-dependent default
+  guessing when VASP already told us the effective value. Records that predate the block (the
+  original Zenodo vasprun harvest) simply have no ``parameters`` key, so the resolver falls
+  back to the default/derived tiers exactly as before — fully backward compatible.
+
 * **CRITICAL gate — default-filling requires the FULL INCAR.** On the vasprun/vaspout path
   ``calc_parameters["incar"]`` is the user's complete INCAR, so a tag's *absence* means the
-  user did not set it and VASP applied its default. On the **OUTCAR path there is no INCAR**
-  — absence means "we never parsed it", NOT "left at default" — so assuming ``LHFCALC=False``
-  there could silently relabel a hybrid/+U/SOC run. The resolver therefore fills nothing on a
-  calc whose INCAR is unknown: every tag comes back ``source="unknown"``. Those calcs need the
-  re-fetch + OUTCAR-header re-parse, not this resolver.
+  user did not set it and VASP applied its default. On an OUTCAR path with **no INCAR and no
+  parameters block** (an old, un-refreshed OUTCAR record) absence means "we never parsed it",
+  NOT "left at default" — so assuming ``LHFCALC=False`` there could silently relabel a
+  hybrid/+U/SOC run. The resolver therefore fills nothing on such a calc: every tag comes back
+  ``source="unknown"``. Those calcs need the re-fetch + OUTCAR-header re-parse (which gives
+  them the authoritative ``parameters`` block above), not a guess.
 
 * **Binary/enum flags with a stable constant default** (``LHFCALC``, ``LDAU``, ``LSORBIT``,
   ``NKRED``, ``ADDGRID``, ``LREAL``, ``LASPH``) are filled from :data:`_CONSTANT_DEFAULTS`.
@@ -53,6 +63,7 @@ from typing import Any
 
 # --- provenance tiers for every resolved value -------------------------------------------
 SRC_INCAR = "incar"                 # user-set, authoritative
+SRC_PARAMETERS = "parameters"       # VASP's RESOLVED/effective value (authoritative, no guess)
 SRC_DEFAULT = "default"             # VASP documented constant default, filled (INCAR known)
 SRC_DERIVED_RUNTYPE = "derived:run_type"   # inferred by inverting run_type
 SRC_DERIVED_STRESS = "derived:stress"      # inferred from frame stress presence
@@ -135,6 +146,7 @@ def resolve_parameters(calc_parameters: dict | None,
     """
     cp = calc_parameters or {}
     incar = cp.get("incar") or {}
+    params_eff = cp.get("parameters") or {}   # VASP's RESOLVED/effective values (authoritative)
     run_type = cp.get("run_type")
     # The full INCAR is known only on the vasprun/vaspout path, which stores an ``incar``
     # dict (the OUTCAR path omits the key entirely). Presence of the key — NOT its
@@ -149,13 +161,23 @@ def resolve_parameters(calc_parameters: dict | None,
             return True, incar[tag]
         return False, None
 
+    def _eff_get(tag: str) -> tuple[bool, Any]:
+        """(present, value) for a tag in VASP's resolved ``parameters`` (authoritative)."""
+        if tag in params_eff and params_eff[tag] is not None:
+            return True, params_eff[tag]
+        return False, None
+
     out: dict[str, dict[str, Any]] = {}
 
     # --- constant-default flags (+ run_type cross-check for the two that have one) --------
+    # Precedence per tag: user INCAR > resolved parameters > (default / run_type-derived).
     for tag, default in _CONSTANT_DEFAULTS.items():
         present, val = _incar_get(tag)
+        eff_present, eff_val = _eff_get(tag)
         if present:
             out[tag] = _v(val, SRC_INCAR)
+        elif eff_present:
+            out[tag] = _v(eff_val, SRC_PARAMETERS)     # VASP told us the effective value
         elif not incar_complete:
             out[tag] = _v(None, SRC_UNKNOWN)
         elif tag == "LHFCALC" and _is_hybrid(run_type):
@@ -165,13 +187,16 @@ def resolve_parameters(calc_parameters: dict | None,
         else:
             out[tag] = _v(default, SRC_DEFAULT)
 
-    # --- hybrid mixing (AEXX, HFSCREEN): invert run_type, else not-applicable/unknown -----
-    hybrid = bool(out["LHFCALC"]["value"])  # resolved LHFCALC (incar or derived)
+    # --- hybrid mixing (AEXX, HFSCREEN): parameters if known, else invert run_type --------
+    hybrid = bool(out["LHFCALC"]["value"])  # resolved LHFCALC (incar / parameters / derived)
     mixing = _HYBRID_MIXING.get(_base_run_type(run_type) or "")
     for tag, idx in (("AEXX", 0), ("HFSCREEN", 1)):
         present, val = _incar_get(tag)
+        eff_present, eff_val = _eff_get(tag)
         if present:
             out[tag] = _v(val, SRC_INCAR)
+        elif eff_present:
+            out[tag] = _v(eff_val, SRC_PARAMETERS)     # authoritative (e.g. AEXX=0.0 non-hybrid)
         elif not incar_complete:
             out[tag] = _v(None, SRC_UNKNOWN)
         elif not hybrid:
@@ -181,13 +206,17 @@ def resolve_parameters(calc_parameters: dict | None,
         else:
             out[tag] = _v(None, SRC_UNKNOWN)           # hybrid but pymatgen couldn't pin it
 
-    # --- ENCUT: default is POTCAR-dependent (max ENMAX), not a constant -> leave if unset -
+    # --- ENCUT: default is POTCAR-dependent (max ENMAX), not a constant -> parameters or unset
     present, val = _incar_get("ENCUT")
-    out["ENCUT"] = _v(val, SRC_INCAR) if present else _v(None, SRC_UNKNOWN)
+    eff_present, eff_val = _eff_get("ENCUT")
+    out["ENCUT"] = (_v(val, SRC_INCAR) if present else
+                    _v(eff_val, SRC_PARAMETERS) if eff_present else _v(None, SRC_UNKNOWN))
 
-    # --- ISIF: integer not recoverable from stored data -> leave; stress fact is separate -
+    # --- ISIF: integer not recoverable by guessing -> take it if parameters/INCAR carry it -
     present, val = _incar_get("ISIF")
-    out["ISIF"] = _v(val, SRC_INCAR) if present else _v(None, SRC_UNKNOWN)
+    eff_present, eff_val = _eff_get("ISIF")
+    out["ISIF"] = (_v(val, SRC_INCAR) if present else
+                   _v(eff_val, SRC_PARAMETERS) if eff_present else _v(None, SRC_UNKNOWN))
 
     # derived physical fact: did the run compute a stress tensor? (from frame counts)
     computes_stress: dict[str, Any]

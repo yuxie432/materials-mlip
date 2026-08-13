@@ -199,6 +199,15 @@ def test_parse_then_verify_end_to_end(tmp_path):
     assert vr["provenance"]["record_id"] == "vr" and vr["provenance"]["file_path"]
     assert vr["calc_parameters"]["run_type"] and "incar" in vr["calc_parameters"]
     assert "potcar_set_hash" in vr["calc_parameters"]
+    assert "parameters" in vr["calc_parameters"]        # resolved effective values now stored
+
+    # The OUTCAR path now recovers the calc parameters from the header too (not null):
+    # run_type/functional classified, INCAR + effective parameters present, parsed_from set.
+    oc = next(r for cid, r in recs.items() if r["parser"] == "ase.OUTCAR")
+    assert oc["calc_parameters"]["run_type"] is not None
+    assert oc["calc_parameters"]["functional"] is not None
+    assert oc["calc_parameters"]["parsed_from"] == "outcar_header"
+    assert "incar" in oc["calc_parameters"] and "parameters" in oc["calc_parameters"]
 
 
 def test_resume_skips_previously_rejected_calc(tmp_path):

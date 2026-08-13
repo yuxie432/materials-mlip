@@ -131,6 +131,34 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
     wastes minutes per resume on a big bad record and duplicated rejection lines;
     `--retry-rejected` re-attempts them (use after a pymatgen/ase upgrade). `parse_timeout`/
     `primary_too_large`/`parse_worker_died` stay retryable (absent from the skip set).
+    **OUTCAR-only calcs now recover the FULL calc parameters from the OUTCAR header** (not
+    just the trajectory): `_parse_outcar_ase` reads the header via `outcar_params` so
+    `run_type`/`functional`/INCAR/effective `parameters`/k-points/POTCAR are populated to
+    parity with the vasprun path (closing the 25.6%-null-functional gap). The vasprun path
+    also stores VASP's resolved `parameters` block now (the metadata-gaps "better fix").
+  - `outcar_params.py` — parse an OUTCAR **header** into a vasprun-schema `calc_parameters`:
+    the user `INCAR:` echo (via pymatgen's canonical `Incar` parser, stdlib fallback) + the
+    resolved-parameter blocks (`parameters`) + POTCAR titels + k-points. `run_type` is
+    classified **faithfully to pymatgen 2026.5.4's `Vasprun.run_type`** (same GGA/METAGGA
+    tables + hybrid/+U/+vdW rules), validated by a live same-calc cross-check (mine(OUTCAR) ==
+    pymatgen(vasprun), incl. HSE06/GGA+U). Reads `IVDW`/`METAGGA` from the user INCAR (never
+    the resolved default `IVDW=0`, which would add a spurious `+vdW-no-correction`). Pure
+    stdlib except the optional pymatgen `Incar`; unit-tested offline.
+  - `param_resolver.py` — pure-logic resolver filling effective VASP params from stored
+    metadata: user INCAR > resolved `parameters` (authoritative, `source="parameters"`) > VASP
+    documented defaults / run_type-derived hybrid mixing; genuinely-unknown values stay None.
+    Exposed as `enrich-metadata` (writes `calc_parameters.resolved`; ADDS a field only, so the
+    frame_id bijection holds). Backward compatible: records with no `parameters` block behave
+    exactly as before.
+  - `outcar_recover.py` — targeted recovery of the OUTCAR metadata gap **without rebuilding
+    shards** (the physical data is already correct; only calc-level `calc_parameters` was
+    impoverished). `build_outcar_keeplist` emits a slim keep-list of just the ~230 records
+    holding an OUTCAR calc; re-fetch them with the ordinary `fetch` (targeted-zip pulls only
+    the OUTCAR out of a `.zip`); `refresh_outcar_metadata` re-parses each OUTCAR header and
+    overwrites ONLY those records' `calc_parameters` in metadata.jsonl —
+    `calc_id`/`frame_ids`/`shards` left byte-identical (verify still passes, no shard opened),
+    atomic rewrite under `.parse.lock` + one-time `metadata.jsonl.bak.pre_outcar_refresh`,
+    idempotent, `--only-missing` for incremental resume.
   - `store.py` — stage 4: `ShardedExtxyzWriter` (rotating `shard-NNNNN.extxyz.gz`) +
     `MetadataWriter` (one JSONL record per calc), joined by `calc_id`/`frame_id`.
   - `status.py` — read-only progress snapshot: line-counts the append-only manifests +
@@ -153,7 +181,7 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
       every array job.
     - `purge-raw` — delete `<raw-dir>/<recid>/` trees whose every calc_id is already in the
       dataset (reclaim scratch); `--dry-run` reports without deleting.
-  - `cli.py` — `python -m zenodo_harvest.cli {discover,triage,fetch,parse,pipeline,split,merge-datasets,verify,purge-raw,status} ...`
+  - `cli.py` — `python -m zenodo_harvest.cli {discover,triage,fetch,parse,pipeline,split,merge-datasets,verify,enrich-metadata,outcar-keeplist,refresh-outcar,purge-raw,status} ...`
     (loads `.env`; `verify`/`merge-datasets`/`pipeline` exit non-zero on an integrity failure;
     `status` is read-only and always exits 0, `--json` for machine output).
     Parse and merge take a `.parse.lock` on the dataset dir so two writers never corrupt one
@@ -201,6 +229,19 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   python -m zenodo_harvest.cli merge-datasets --into data/dataset data/dataset/task-*
   python -m zenodo_harvest.cli verify --dataset-dir data/dataset
   python -m zenodo_harvest.cli purge-raw --raw-dir data/raw --dataset-dir data/dataset
+  ```
+  **OUTCAR metadata recovery** (fill run_type/functional/INCAR for the OUTCAR-parsed calcs,
+  metadata-only — shards untouched; CSD3 template `scripts/csd3/44_outcar_recover.sh` runs
+  this as a self-resubmitting, disk-paced campaign):
+  ```
+  python -m zenodo_harvest.cli outcar-keeplist --dataset-dir data/dataset \
+      --keep data/manifests/keep.jsonl --out data/manifests/outcar_keep.jsonl
+  python -m zenodo_harvest.cli fetch --in data/manifests/outcar_keep.jsonl \
+      --out data/manifests/outcar_fetched.jsonl --max-bytes 0    # targeted-zip pulls just OUTCARs
+  python -m zenodo_harvest.cli refresh-outcar --dataset-dir data/dataset \
+      --fetched data/manifests/outcar_fetched.jsonl              # overwrites calc_parameters only
+  python -m zenodo_harvest.cli enrich-metadata --dataset-dir data/dataset   # refresh resolved cache
+  python -m zenodo_harvest.cli verify --dataset-dir data/dataset            # bijection still holds
   ```
 - `ZENODO_TOKEN` lives in `.env` (gitignored, loaded by `config.load_dotenv`). Stage 0–1 depend
   only on `requests`; stages 2–4 need `pymatgen` + `ase` (`pip install -e .[parse]`).
