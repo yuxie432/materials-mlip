@@ -25,7 +25,11 @@ from pathlib import Path
 
 from ase import Atoms
 
-from zenodo_harvest.outcar_recover import build_outcar_keeplist, refresh_outcar_metadata
+from zenodo_harvest.outcar_recover import (
+    build_outcar_keeplist,
+    reclassify_outcar_run_types,
+    refresh_outcar_metadata,
+)
 from zenodo_harvest.store import ShardedExtxyzWriter
 
 # A minimal but format-faithful OUTCAR header: PBEsol (+U here) with two POTCARs.
@@ -270,3 +274,82 @@ def test_verify_still_passes_after_refresh(tmp_path):
     assert out["ok"] is True
     assert out["integrity"]["n_frames_metadata"] == out["integrity"]["n_frames_on_disk"] == 3
     assert out["stats"]["frames_by_functional"].get("PBEsol") == 2   # the two refreshed OUTCARs
+
+
+# --- reclassify_outcar_run_types (metadata-only classifier bugfix, no re-fetch) --------
+
+def _reclassify_dataset(tmp_path: Path) -> Path:
+    """A dataset with: a header-parsed OUTCAR calc mislabeled "TRUE" (boolean-METAGGA bug), a
+    correctly-labeled header-parsed OUTCAR calc, an OLD-format (pre-recovery) null OUTCAR calc
+    with no ``parsed_from``, and a vasprun calc — each with a real frame + shard."""
+    ds = tmp_path / "ds"
+    ds.mkdir(parents=True)
+    frame_ids = ["zenodo:B:c/OUTCAR#0", "zenodo:G:c/OUTCAR#0",
+                 "zenodo:N:c/OUTCAR#0", "zenodo:V:v/vasprun.xml#0"]
+    _write_shard(ds, frame_ids)
+    buggy = {"code": "vasp", "run_type": "TRUE", "functional": "TRUE",
+             "parsed_from": "outcar_header", "incar": {},
+             "parameters": {"GGA": "--", "METAGGA": True, "LHFCALC": False, "AEXX": 0.0},
+             "potcar_symbols": ["PAW_PBE Fe 06Sep2000"], "hubbard_u": None}
+    good = {"code": "vasp", "run_type": "PBEsol", "functional": "PBEsol",
+            "parsed_from": "outcar_header", "incar": {"GGA": "PS"},
+            "parameters": {"GGA": "PS", "LHFCALC": False, "AEXX": 0.0},
+            "potcar_symbols": ["PAW_PBE O 08Apr2002"], "hubbard_u": None}
+    recs = [
+        {"calc_id": "zenodo:B:c/OUTCAR", "parser": "ase.OUTCAR", "calc_parameters": buggy,
+         "frame_ids": ["zenodo:B:c/OUTCAR#0"], "shards": ["shard-00000.extxyz.gz"],
+         "provenance": {"source": "zenodo", "record_id": "B"}},
+        {"calc_id": "zenodo:G:c/OUTCAR", "parser": "ase.OUTCAR", "calc_parameters": good,
+         "frame_ids": ["zenodo:G:c/OUTCAR#0"], "shards": ["shard-00000.extxyz.gz"],
+         "provenance": {"source": "zenodo", "record_id": "G"}},
+        {"calc_id": "zenodo:N:c/OUTCAR", "parser": "ase.OUTCAR",
+         "calc_parameters": _impoverished_outcar_cp(),      # no parsed_from -> untouched
+         "frame_ids": ["zenodo:N:c/OUTCAR#0"], "shards": ["shard-00000.extxyz.gz"],
+         "provenance": {"source": "zenodo", "record_id": "N"}},
+        {"calc_id": "zenodo:V:v/vasprun.xml", "parser": "pymatgen.Vasprun",
+         "calc_parameters": {"run_type": "PBE", "functional": "PBE", "incar": {"ENCUT": 400}},
+         "frame_ids": ["zenodo:V:v/vasprun.xml#0"], "shards": ["shard-00000.extxyz.gz"],
+         "provenance": {"source": "zenodo", "record_id": "V"}},
+    ]
+    (ds / "metadata.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs))
+    return ds
+
+
+def test_reclassify_fixes_only_the_buggy_true_label(tmp_path):
+    ds = _reclassify_dataset(tmp_path)
+    before_shards = _shard_md5(ds)
+    summ = reclassify_outcar_run_types(ds)
+    assert summ["ok"]
+    assert summ["outcar_header_calcs"] == 2                 # only the two parsed_from calcs
+    assert summ["records_reclassified"] == 1
+    assert summ["changes"] == {"TRUE -> GGA": 1}
+    recs = _load(ds)
+    b = recs["zenodo:B:c/OUTCAR"]["calc_parameters"]
+    assert b["run_type"] == "GGA" and b["functional"] == "GGA"
+    # the correctly-labeled calc, the old-format null calc, and the vasprun calc are UNTOUCHED
+    assert recs["zenodo:G:c/OUTCAR"]["calc_parameters"]["run_type"] == "PBEsol"
+    assert recs["zenodo:N:c/OUTCAR"]["calc_parameters"]["run_type"] is None
+    assert recs["zenodo:V:v/vasprun.xml"]["calc_parameters"]["run_type"] == "PBE"
+    assert _shard_md5(ds) == before_shards                  # shards never opened
+
+
+def test_reclassify_dry_run_writes_nothing(tmp_path):
+    ds = _reclassify_dataset(tmp_path)
+    before = (ds / "metadata.jsonl").read_text()
+    summ = reclassify_outcar_run_types(ds, dry_run=True)
+    assert summ["records_reclassified"] == 1
+    assert (ds / "metadata.jsonl").read_text() == before
+    assert not (ds / "metadata.jsonl.bak.pre_reclassify").exists()
+
+
+def test_reclassify_idempotent_and_backup(tmp_path):
+    ds = _reclassify_dataset(tmp_path)
+    pristine = (ds / "metadata.jsonl").read_text()
+    reclassify_outcar_run_types(ds)
+    bak = ds / "metadata.jsonl.bak.pre_reclassify"
+    assert bak.exists() and bak.read_text() == pristine
+    once = (ds / "metadata.jsonl").read_text()
+    summ2 = reclassify_outcar_run_types(ds)
+    assert summ2["records_reclassified"] == 0              # already fixed -> no-op
+    assert (ds / "metadata.jsonl").read_text() == once
+    assert bak.read_text() == pristine                     # backup not overwritten

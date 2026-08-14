@@ -158,7 +158,12 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
     overwrites ONLY those records' `calc_parameters` in metadata.jsonl —
     `calc_id`/`frame_ids`/`shards` left byte-identical (verify still passes, no shard opened),
     atomic rewrite under `.parse.lock` + one-time `metadata.jsonl.bak.pre_outcar_refresh`,
-    idempotent, `--only-missing` for incremental resume.
+    idempotent, `--only-missing` for incremental resume. `reclassify_outcar_run_types`
+    (CLI `reclassify-outcar`) re-derives `run_type`/`functional` for every header-parsed OUTCAR
+    calc **from its already-stored `incar`/`parameters`** — metadata-only, NO re-fetch and NO
+    shard access — so a `classify_run_type` bugfix that lands *after* the 955-GiB recovery ran
+    can be applied cheaply (atomic under `.parse.lock` + `metadata.jsonl.bak.pre_reclassify`;
+    e.g. it fixed the 57 calcs a boolean-`METAGGA` had mislabeled run_type `"TRUE"` → `GGA`).
   - `store.py` — stage 4: `ShardedExtxyzWriter` (rotating `shard-NNNNN.extxyz.gz`) +
     `MetadataWriter` (one JSONL record per calc), joined by `calc_id`/`frame_id`.
   - `status.py` — read-only progress snapshot: line-counts the append-only manifests +
@@ -181,7 +186,7 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
       every array job.
     - `purge-raw` — delete `<raw-dir>/<recid>/` trees whose every calc_id is already in the
       dataset (reclaim scratch); `--dry-run` reports without deleting.
-  - `cli.py` — `python -m zenodo_harvest.cli {discover,triage,fetch,parse,pipeline,split,merge-datasets,verify,enrich-metadata,outcar-keeplist,refresh-outcar,purge-raw,status} ...`
+  - `cli.py` — `python -m zenodo_harvest.cli {discover,triage,fetch,parse,pipeline,split,merge-datasets,verify,enrich-metadata,outcar-keeplist,refresh-outcar,reclassify-outcar,purge-raw,status} ...`
     (loads `.env`; `verify`/`merge-datasets`/`pipeline` exit non-zero on an integrity failure;
     `status` is read-only and always exits 0, `--json` for machine output).
     Parse and merge take a `.parse.lock` on the dataset dir so two writers never corrupt one

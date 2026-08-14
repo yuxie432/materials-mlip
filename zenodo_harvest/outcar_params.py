@@ -107,6 +107,18 @@ _IVDW_TYPES = {
     2: "TS", 20: "TS", 21: "TS-H", 202: "MBD", 4: "dDsC",
 }
 
+# METAGGA values that mean "no metaGGA selected". pymatgen reads METAGGA from ``self.incar``
+# (always a *string* tag from its Incar parser, screened only against ``{"--", "None"}``), so it
+# never sees a boolean. We additionally fall back to the OUTCAR's RESOLVED-parameter block when
+# the user INCAR echo is absent (older/edited OUTCARs), and VASP prints METAGGA there as a
+# boolean-style ``T``/``F`` flag — coerced by :func:`_coerce_scalar` to a Python ``bool`` (or a
+# boolean *token* string). A bool is NOT a functional name: classifying it as a metaGGA request
+# mislabels a plain GGA run ``"TRUE"``/``"FALSE"``. So :func:`classify_run_type` treats a bool
+# (and these boolean tokens) as "off" — recovering a real string metaGGA (``SCAN``/``R2SCAN``)
+# from the resolved block while never inventing one. (Superset of pymatgen's ``{"--", "None"}``.)
+_METAGGA_OFF = frozenset({"--", "NONE", "F", ".FALSE.", ".F.", "FALSE",
+                          "T", ".TRUE.", ".T.", "TRUE"})
+
 
 # --- low-level value coercion ----------------------------------------------------------
 
@@ -375,9 +387,11 @@ def _classify_inputs(incar: dict, eff: dict, ldau_on: bool) -> dict[str, Any]:
     ``0`` is a member of pymatgen's ``IVDW_TYPES`` ("no-correction"), so reading it from the
     effective block would append a spurious ``+vdW-no-correction`` to essentially every run
     (caught by the real-OUTCAR cross-check against pymatgen's vasprun ``run_type``). ``METAGGA``
-    prefers the echo and falls back to the effective value — its non-metaGGA effective form is
-    ``--``/``F`` (handled as "off"), so the fallback only ever *recovers* a real metaGGA on an
-    OUTCAR whose INCAR echo was empty, never invents one.
+    prefers the echo and falls back to the effective value, which only ever *recovers* a real
+    string metaGGA (``SCAN``/``R2SCAN``) on an OUTCAR whose INCAR echo was empty, never invents
+    one: the effective block's non-metaGGA form is a boolean-style ``T``/``F`` flag (a Python
+    ``bool`` after coercion), which :func:`classify_run_type` screens out via :data:`_METAGGA_OFF`
+    (without which a plain GGA run was mislabeled ``"TRUE"`` — see that set's note).
     """
     def pick(key: str, default: Any) -> Any:
         if key in eff and eff[key] is not None:
@@ -425,7 +439,8 @@ def classify_run_type(p: dict, potcar_symbols: list[str]) -> str:
         run_type = "B3LYP"
     elif _as_bool(p.get("LHFCALC")):
         run_type = "PBEO or other Hybrid Functional"
-    elif metagga and str(metagga).upper() not in {"--", "NONE", "F", ".FALSE."}:
+    elif (metagga and not isinstance(metagga, bool)
+          and str(metagga).upper() not in _METAGGA_OFF):
         tag = str(metagga).upper()
         run_type = _METAGGA_TYPES.get(tag, tag)
     elif gga:

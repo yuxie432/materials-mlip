@@ -119,7 +119,7 @@ PY
 work_loop() {
     local dry=0 before after remaining
     while :; do
-        before=$(wc -l < "$OUTCAR_FETCHED" 2>/dev/null || echo 0)
+        before=$([[ -f "$OUTCAR_FETCHED" ]] && wc -l < "$OUTCAR_FETCHED" || echo 0)
         # Targeted ZIP fetch is ON by default (a .zip transfers only its OUTCARs). --max-records
         # bounds the batch; fetch is resume-aware (recids already in $OUTCAR_FETCHED skip).
         python -m zenodo_harvest.cli -v fetch --in "$OUTCAR_KEEP" --out "$OUTCAR_FETCHED" \
@@ -127,7 +127,7 @@ work_loop() {
             --max-bytes 0 --max-member-bytes "$MAX_MEMBER_BYTES" \
             --max-disk-bytes "$MAX_DISK_BYTES" --max-disk-files "$MAX_DISK_FILES" \
             --workers "$WORKERS" --max-records "$BATCH"
-        after=$(wc -l < "$OUTCAR_FETCHED" 2>/dev/null || echo 0)
+        after=$([[ -f "$OUTCAR_FETCHED" ]] && wc -l < "$OUTCAR_FETCHED" || echo 0)
         if [[ "$after" -gt "$before" ]]; then
             # Overwrite ONLY these OUTCAR calcs' calc_parameters (--only-missing skips ones a
             # prior batch already did and whose raw is now purged), then reclaim their raw.

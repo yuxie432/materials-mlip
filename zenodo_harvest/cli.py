@@ -52,7 +52,11 @@ from .dataset_ops import (
 from .param_resolver import TARGET_TAGS
 from .discover import DEFAULT_QUERIES, DEFAULT_RESOURCE_TYPES, discover
 from .fetch import DEFAULT_MAX_MEMBER_BYTES, DEFAULT_ZIP_STREAM_MAX_FILES, fetch
-from .outcar_recover import build_outcar_keeplist, refresh_outcar_metadata
+from .outcar_recover import (
+    build_outcar_keeplist,
+    reclassify_outcar_run_types,
+    refresh_outcar_metadata,
+)
 from .parse import parse
 from .store import DatasetLockError
 from .triage import triage
@@ -275,6 +279,18 @@ def _add_refresh_outcar(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--json", action="store_true", help="machine-readable output")
 
 
+def _add_reclassify_outcar(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("reclassify-outcar",
+                       help="re-derive run_type/functional for OUTCAR-header calcs from their "
+                            "STORED calc_parameters (metadata-only, no re-fetch) — applies a "
+                            "classifier bugfix to an already-recovered dataset")
+    p.add_argument("--dataset-dir", default=str(config.DATASET_DIR))
+    p.add_argument("--dry-run", action="store_true",
+                   help="report the label transitions that would change; write nothing")
+    p.add_argument("--no-backup", action="store_true",
+                   help="skip the one-time metadata.jsonl.bak.pre_reclassify snapshot")
+
+
 def _add_status(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("status", help="read-only snapshot of harvest progress "
                                       "(counts, staging vs quota, rejection reasons)")
@@ -353,6 +369,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_enrich(sub)
     _add_outcar_keeplist(sub)
     _add_refresh_outcar(sub)
+    _add_reclassify_outcar(sub)
     _add_purge_raw(sub)
     _add_status(sub)
     _add_pipeline(sub)
@@ -457,6 +474,18 @@ def main(argv: list[str] | None = None) -> int:
                 args.dataset_dir, args.fetched, args.raw_dir,
                 dry_run=args.dry_run, backup=not args.no_backup,
                 only_missing=args.only_missing)
+        except DatasetLockError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        if not summary.get("ok"):
+            print(f"ERROR: {summary.get('error')}", file=sys.stderr)
+            return 1
+        print(json.dumps(summary, indent=2))
+        return 0
+    elif args.cmd == "reclassify-outcar":
+        try:
+            summary = reclassify_outcar_run_types(
+                args.dataset_dir, dry_run=args.dry_run, backup=not args.no_backup)
         except DatasetLockError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1

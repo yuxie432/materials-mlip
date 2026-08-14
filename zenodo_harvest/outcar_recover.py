@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from .manifest import JsonlWriter, read_jsonl
-from .outcar_params import parse_outcar_header
+from .outcar_params import _classify_inputs, classify_run_type, parse_outcar_header
 from .store import DatasetLock
 
 logger = logging.getLogger(__name__)
@@ -49,8 +49,14 @@ logger = logging.getLogger(__name__)
 # Distinct from enrich's ``metadata.jsonl.bak`` (the pristine pre-enrich original) so BOTH
 # snapshots survive: this captures the state just before the FIRST OUTCAR refresh.
 _REFRESH_BACKUP = "metadata.jsonl.bak.pre_outcar_refresh"
+# One-time snapshot taken by :func:`reclassify_outcar_run_types` before it rewrites labels.
+_RECLASSIFY_BACKUP = "metadata.jsonl.bak.pre_reclassify"
 
 OUTCAR_PARSER = "ase.OUTCAR"
+# Marks a calc_parameters block produced by the OUTCAR-header parser (:mod:`outcar_params`),
+# i.e. one that carries the ``incar``/``parameters``/``potcar_symbols`` needed to re-classify
+# run_type offline. Pre-recovery OUTCAR calcs (the old ASE path) lack it and are left alone.
+_HEADER_PROVENANCE = "outcar_header"
 
 
 def _outcar_records(metadata_path: Path, only_missing: bool) -> tuple[set[str], set[str], int]:
@@ -253,4 +259,102 @@ def refresh_outcar_metadata(dataset_dir: str | Path, fetched: str | Path,
         "records_refreshed": n_refreshed,
         # OUTCAR calcs not yet re-fetched (still to do) — campaign progress.
         "not_yet_refetched": max(0, n_target - len(update)),
+    }
+
+
+def _reclassify_one(cp: dict) -> tuple[str, str] | None:
+    """Re-derive ``(run_type, functional)`` for a header-parsed ``calc_parameters`` — offline.
+
+    Uses only the stored ``incar`` / ``parameters`` / ``potcar_symbols`` / ``hubbard_u`` (no
+    OUTCAR file), running the CURRENT :func:`outcar_params.classify_run_type`, so a classifier
+    bugfix (e.g. the boolean-``METAGGA`` → ``"TRUE"`` mislabel) can be applied to an
+    already-built dataset without a re-fetch. ``ldau_on`` is reconstructed faithfully from the
+    stored ``hubbard_u`` or a ``+U`` already present in the old ``run_type`` (the ``+U`` logic is
+    untouched by the fix, so this reproduces the original ``+U`` decision exactly). Returns the
+    new pair, or ``None`` if this block was not produced by the OUTCAR-header parser (nothing to
+    reclassify — the old ASE path stored no such inputs).
+    """
+    if not isinstance(cp, dict) or cp.get("parsed_from") != _HEADER_PROVENANCE:
+        return None
+    incar = cp.get("incar") or {}
+    eff = cp.get("parameters") or {}
+    titels = cp.get("potcar_symbols") or []
+    ldau_on = (cp.get("hubbard_u") is not None) or ("+U" in (cp.get("run_type") or ""))
+    view = _classify_inputs(incar, eff, ldau_on)
+    run_type = classify_run_type(view, list(titels))
+    return run_type, run_type.split("+")[0]
+
+
+def reclassify_outcar_run_types(dataset_dir: str | Path, dry_run: bool = False,
+                                backup: bool = True) -> dict:
+    """Re-derive ``run_type``/``functional`` for every OUTCAR-header calc from its STORED
+    ``calc_parameters`` (metadata-only), applying the current classifier.
+
+    This is the cheap corrective for a :func:`outcar_params.classify_run_type` bugfix landing
+    *after* the 955-GiB OUTCAR recovery already ran: the OUTCAR raw files are purged, but the
+    header's ``incar``/``parameters`` were persisted into ``calc_parameters``, so run_type can be
+    recomputed with zero network and zero shard access. ONLY ``run_type``/``functional`` change;
+    ``calc_id``/``frame_ids``/``shards`` are byte-identical, so ``verify`` still passes. Records
+    whose recomputed label equals the stored one are written back unchanged (idempotent).
+
+    Atomic (temp → ``os.replace``) under the dataset ``.parse.lock``, with a one-time
+    ``metadata.jsonl.bak.pre_reclassify`` snapshot. Re-run ``enrich-metadata`` afterwards so any
+    ``resolved`` cache keyed off the old ``run_type`` is refreshed. Returns a summary including a
+    ``changes`` histogram of ``"old -> new"`` label transitions.
+    """
+    dataset_dir = Path(dataset_dir)
+    metadata_path = dataset_dir / "metadata.jsonl"
+    if not metadata_path.is_file():
+        return {"ok": False, "error": f"no metadata.jsonl in {dataset_dir}"}
+
+    n_meta = n_header = n_changed = 0
+    changes: dict[str, int] = {}
+
+    def _apply(record: dict) -> dict:
+        nonlocal n_header, n_changed
+        if record.get("parser") != OUTCAR_PARSER:
+            return record
+        cp = record.get("calc_parameters")
+        if not isinstance(cp, dict):
+            return record
+        new = _reclassify_one(cp)            # None unless this is a header-parsed block
+        if new is None:
+            return record
+        n_header += 1
+        new_rt, new_func = new
+        old_rt = cp.get("run_type")
+        if new_rt != old_rt or new_func != cp.get("functional"):
+            key = f"{old_rt} -> {new_rt}"
+            changes[key] = changes.get(key, 0) + 1
+            cp["run_type"] = new_rt
+            cp["functional"] = new_func
+            n_changed += 1
+        return record
+
+    if dry_run:
+        for record in read_jsonl(metadata_path):
+            n_meta += 1
+            _apply(dict(record))
+    else:
+        with DatasetLock(dataset_dir):
+            tmp = metadata_path.parent / (metadata_path.name + ".reclassify.tmp")
+            with tmp.open("w", encoding="utf-8") as fh:
+                for record in read_jsonl(metadata_path):
+                    n_meta += 1
+                    fh.write(json.dumps(_apply(record)) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            bak = metadata_path.parent / _RECLASSIFY_BACKUP
+            if backup and not bak.exists():
+                shutil.copy2(metadata_path, bak)
+            os.replace(tmp, metadata_path)
+
+    return {
+        "ok": True,
+        "dataset_dir": str(dataset_dir),
+        "dry_run": dry_run,
+        "metadata_records": n_meta,
+        "outcar_header_calcs": n_header,
+        "records_reclassified": n_changed,
+        "changes": dict(sorted(changes.items(), key=lambda kv: -kv[1])),
     }

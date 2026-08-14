@@ -432,6 +432,41 @@ def test_mixed_case_metagga_tag():
     assert build_calc_parameters(header.splitlines())["run_type"] == "R2SCAN"
 
 
+def test_boolean_metagga_from_effective_block_is_off_not_TRUE():
+    """Regression: the resolved-parameter block prints METAGGA as a boolean flag (``T``/``F``).
+    That is not a functional name — a plain GGA run whose INCAR echo is empty was mislabeled
+    run_type ``"TRUE"``. It must fall through to the GGA branch, both as a bool and as a token."""
+    # METAGGA coerced to a Python bool True (as _coerce_scalar turns "T"/".TRUE." into)
+    assert _run_type({"GGA": "--", "METAGGA": True}, {}, False) == "GGA"
+    assert _run_type({"GGA": "PS", "METAGGA": True}, {}, False) == "PBEsol"
+    # ...and as a raw boolean-token string, from either block
+    assert _run_type({"GGA": "--", "METAGGA": ".TRUE."}, {}, False) == "GGA"
+    assert _run_type({"GGA": "PE"}, {"METAGGA": "T"}, False) == "PBE"
+    # a REAL string metaGGA in the effective block is still recovered (never over-corrected)
+    assert _run_type({"GGA": "--", "METAGGA": "R2SCAN"}, {}, False) == "R2SCAN"
+
+
+def test_boolean_metagga_via_full_header_not_TRUE():
+    """End-to-end: an OUTCAR with empty INCAR echo whose effective block prints ``METAGGA = T``
+    classifies GGA, not ``"TRUE"`` (the exact shape of the 57 mislabeled dataset calcs)."""
+    header = (
+        " vasp.6.4.2\n INCAR:\n POTCAR:    PAW_PBE Fe 06Sep2000\n"
+        "   TITEL  = PAW_PBE Fe 06Sep2000\n"
+        " Startparameter for this run:\n   ISPIN = 1\n"
+        " Exchange correlation treatment:\n   GGA     =    --\n   METAGGA =      T\n"
+        "   LHFCALC =     F\n   AEXX    =    0.0000\n"
+        "--------------------------------------- Iteration    1(   1)  -----\n"
+    )
+    cp = build_calc_parameters(header.splitlines())
+    assert cp["run_type"] == "GGA" and cp["functional"] == "GGA"
+
+
+def test_gga_91_pw91_kept_raw_faithful_to_pymatgen():
+    """GGA=91 (PW91) is absent from pymatgen 2026.5.4's GGA_TYPES, so pymatgen returns the raw
+    ``"91"`` — we MUST match it (the mine==pymatgen invariant), not remap it to ``"PW91"``."""
+    assert _run_type({"GGA": "91"}, {}, False) == "91"
+
+
 def test_flexible_incar_syntax_via_pymatgen_incar():
     """VASP INCAR is flexible: '#'/'!' comments, ';'-separated tags, sci-notation, string
     values with spaces, and 'N*x' repeat arrays. pymatgen's Incar parser handles them all."""
