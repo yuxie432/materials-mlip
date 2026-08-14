@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(PYTHONPATH=/home/yuxie432/summer2026/materials-mlip timeout 400 python /tmp/claude-1000/-home-yuxie432-summer2026-materials-mlip/a6f95fe5-21c9-4acb-bb02-1fb0174ba231/scratchpad/bench.py)",
-      "Bash(PYTHONPATH=. timeout 400 python /tmp/claude-1000/-home-yuxie432-summer2026-materials-mlip/a6f95fe5-21c9-4acb-bb02-1fb0174ba231/scratchpad/rerun.py)"
+      "Bash(PYTHONPATH=. timeout 400 python /tmp/claude-1000/-home-yuxie432-summer2026-materials-mlip/a6f95fe5-21c9-4acb-bb02-1fb0174ba231/scratchpad/rerun.py)",
+      "WebFetch(domain:nomad-lab.eu)",
+      "WebFetch(domain:docs.nomad-lab.eu)",
+      "Bash(PYTHONPATH=. python -m nomad_harvest.cli -v smoke -n 8)"
     ]
   }
 }

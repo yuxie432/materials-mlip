@@ -743,7 +743,20 @@ def _bulk_stage_batch(
                             zf, f"{uid}/{oc}",
                             dest / "extracted" / "calc" / canonical_staged_name(oc, "outcar"),
                             budget, own)
-                    fe = build_fetched_entry(e, raw_dir, dest, listings.get(eid) or {"files": []})
+                    # Availability (charge density / DOS / eigenvalues / …) comes from the
+                    # rawdir file listing and is a MANDATORY provenance field. bulk_rawdir is
+                    # best-effort (it can 5xx for a whole batch — the bulk endpoints are flaky);
+                    # when it didn't cover this entry, recover the listing with a per-entry
+                    # rawdir rather than writing an all-False availability block. This costs one
+                    # extra request ONLY on the (rare) failure path — the common path stays ~2
+                    # requests/batch — and guarantees availability is never silently dropped.
+                    listing = listings.get(eid)
+                    if not (listing and listing.get("files")):
+                        try:
+                            listing = client.rawdir(eid)
+                        except Exception:  # noqa: BLE001 - keep the calc; availability stays empty
+                            listing = {"files": []}
+                    fe = build_fetched_entry(e, raw_dir, dest, listing)
                     if fe is None:                     # staged a primary but no calc unit
                         _refund_and_delete(dest, budget, own)
                         rejects.append((eid, "no_calc_units_after_stage", ""))

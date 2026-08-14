@@ -460,14 +460,22 @@ class FakeBulkClient(FakeNomadClient):
     as content). ``omit`` forces given entries to be MISSING from the zip, exercising the
     per-entry fallback. Inherits ``rawdir``/``download_raw_file`` so that fallback works."""
 
-    def __init__(self, entries: dict, uploads: dict, omit=()):
+    def __init__(self, entries: dict, uploads: dict, omit=(), fail_bulk_rawdir=False):
         super().__init__(entries)
         self.uploads = uploads
         self.mains = {eid: e["mainfile"] for eid, e in entries.items()}
         self.omit = set(omit)
+        self.fail_bulk_rawdir = fail_bulk_rawdir
         self.zips = 0
+        self.rawdirs = 0
+
+    def rawdir(self, entry_id: str) -> dict:
+        self.rawdirs += 1
+        return super().rawdir(entry_id)
 
     def bulk_rawdir(self, ids):
+        if self.fail_bulk_rawdir:
+            raise RuntimeError("simulated bulk_rawdir 5xx for the whole batch")
         return {eid: {"entry_id": eid, "upload_id": self.uploads[eid],
                       "mainfile": self.mains[eid], "files": self.entries[eid]["files"]}
                 for eid in ids if eid in self.entries}
@@ -553,6 +561,20 @@ def test_bulk_fetch_resume_skips_manifest(tmp_path):
     assert summary["skipped_existing"] == 2 and summary["staged"] == 0
     assert client.zips == z                        # nothing re-fetched
     assert len(list(read_jsonl(out))) == 2         # no duplicate manifest lines
+
+
+def test_bulk_fetch_recovers_availability_when_bulk_rawdir_fails(tmp_path):
+    # bulk_rawdir 5xx's for the batch -> availability (a mandatory field) must be recovered
+    # per-entry, NOT written as all-False. The upload holds a CHGCAR, so charge_density=True.
+    keep, entries, uploads = _bulk_setup(tmp_path, [("A", "U", "d/vasprun.xml", 30)])
+    entries["A"]["files"].append({"path": "d/CHGCAR", "size": 999})   # heavy output present
+    client = FakeBulkClient(entries, uploads, fail_bulk_rawdir=True)
+    out = tmp_path / "fetched.jsonl"
+    summary = fetch_candidates_bulk(client, keep, raw_dir=tmp_path / "raw", out_path=out)
+    assert summary["staged"] == 1
+    assert client.rawdirs == 1                        # per-entry rawdir recovered the listing
+    rec = next(iter(read_jsonl(out)))
+    assert rec["availability"]["charge_density"] is True   # NOT silently lost
 
 
 def test_bulk_fetch_valve_defers(tmp_path):

@@ -95,7 +95,10 @@ curl -sS -X POST 'https://nomad-lab.eu/prod/v1/api/v1/entries/query' \
 ### Auth & rate limits
 
 - **Anonymous read works** (every query in this doc ran token-free). Pass `owner="public"` for published + non-embargoed scope. Tokens are only for private/own data or writes; **no documented read-rate benefit** from a token. ⚠
-- Documented limits are installation-dependent, floor **"~30 req/s or 10 concurrent"**. **HTTP 503 = rate-limited** → back off. There are **no `RateLimit-*`/`Retry-After` headers**, so self-throttle. For a multi-million-entry pull, email **support@nomad-lab.eu** first (documented etiquette).
+- Documented limits are installation-dependent, floor **"as low as 30 requests per second or 10 concurrent"**, enforced **per IP** (shared across a NAT), per the API how-to
+  (https://docs.nomad-lab.eu/1.4.3/howto/manage/program/api.html). **HTTP 503 = rate-limited** → back off. There are **no `RateLimit-*`/`Retry-After` headers**, so self-throttle.
+- **Contacting NOMAD is NOT a documented prerequisite for a large harvest** (checked 2026-08-14 across the API how-to, download how-to, FAQ, Terms, and Support pages — none require or request it). The *only* contact text is **reactive**: the 503 FAQ
+  (https://nomad-lab.eu/nomad-lab/faqs.html) says to lower your request rate and, if the limit is genuinely too low for a legitimate use, to "contact us … if you want to get exempted from the rate-limit." So emailing **support@nomad-lab.eu** is an **optional courtesy** — worth doing only to *request a rate-limit exemption* that could shorten a multi-TB pull, not a gate to clear before starting. NOMAD's own **endorsed bulk mechanism is the streaming-zip query endpoint** `POST /entries/raw/query` (docs: https://docs.nomad-lab.eu/1.4.3/howto/manage/program/download.html) — exactly what our bulk fetch uses. There is **no public data dump**; NOMAD Oasis is a local-install of the software, not a mirror of the public archive.
 
 ---
 
@@ -313,14 +316,28 @@ constraint is **NOMAD's request rate**, not CSD3, disk, bandwidth, or parse (par
 - Net: ~**2 requests per ~300 entries** (~47k total) vs **14.2M**. Fetch becomes **bandwidth-bound**
   (~1–6.5 TB), and a few concurrent long-lived batch streams (`--workers`) multiply bandwidth
   *without* tripping the req/s limiter (safe, unlike per-entry concurrency) → **~days, not months**;
-  feasible inside two weeks (coordinate with `support@nomad-lab.eu` — NOMAD's server-side throttle
-  is the remaining governor, and it was heavy during testing).
-- **Coverage/quality unchanged:** exact mainfiles keep the **5% OUTCAR-only** entries; the FULL
-  vasprun is fetched, so the enhanced parser recovers full `calc_parameters` (run_type, INCAR,
-  resolved `parameters`, k-points, POTCAR — confirmed on live NOMAD vaspruns); any entry a zip
-  can't deliver **falls back to the per-entry path**. The per-entry `fetch_candidates` remains as
-  `--per-entry`. Parse is the well-hidden second stage (overlapped fetch∥parse in `pipeline`);
-  peak *staging* disk stays bounded by the valve.
+  feasible inside two weeks. NOMAD's server-side throughput is now the remaining governor (heavy and
+  variable during testing, ~1.5 MB/s/stream), NOT the request rate. This is the one place emailing
+  `support@nomad-lab.eu` helps — not as a required step, but to *request a rate-limit exemption* (the
+  documented purpose of contacting them; §2) if the throttle makes two weeks tight.
+- **Coverage/quality unchanged — ALL ~7.1M direct uploads are covered.** Every VASP entry's
+  mainfile is either a `vasprun.xml` or an `OUTCAR` (measured live 2026-08-14 on a 1000-entry
+  keyspace-spread sample: **92.5% vasprun-mainfile, 7.5% OUTCAR-mainfile, 0% neither**), and we
+  fetch **exactly that mainfile** — so the ~7.5% OUTCAR-only entries (no vasprun in the upload)
+  are kept via their OUTCAR, and the ~92.5% vasprun entries pull only the vasprun (not the OUTCAR
+  beside it, if any — that is the transfer-size saving). The FULL vasprun/OUTCAR is fetched, so the
+  enhanced parser recovers full `calc_parameters` (run_type, INCAR, resolved `parameters`, k-points,
+  POTCAR — confirmed on live NOMAD vaspruns; the OUTCAR path recovers the same from the header). Any
+  entry a zip can't deliver **falls back to the per-entry path**, and availability is recovered
+  per-entry if a batch `rawdir/query` fails — so no coverage or metadata is lost. The per-entry
+  `fetch_candidates` remains as `--per-entry`. Parse is overlapped with fetch in `pipeline`; peak
+  *staging* disk stays bounded by the valve.
+  **One consequence of vasprun-only (mentor-agreed):** per-atom DFT **charges/spins**
+  (`dft_charge`/`dft_magmom`) come only from an OUTCAR, so they are recorded only for the ~7.5%
+  OUTCAR-mainfile entries (or any run with `--want-outcar`). For the ~92.5% vasprun entries they are
+  absent — but this is the "if available" clause of the storage spec, and the **availability** of
+  magnetization/charge-density/spin-density is still recorded for every entry (from the file listing
+  + ISPIN). Wholesale OUTCAR is ~170 TB (§5), which is why it is excluded by default.
 
 **Complementary path — OPTIMADE.** NOMAD implements OPTIMADE at
 `https://nomad-lab.eu/prod/v1/optimade/v1` (18.8M structures). Standardized
@@ -338,7 +355,7 @@ forces/energies, so it's a discovery/dedup aid only, never a label source.
 4. **`raw/{path}` is relative to the mainfile's DIRECTORY**, not the upload root — the full path 404s, the mainfile-dir-relative path 200s (`raw_path_rel`). *(caught by the smoke test — every fetch failed until fixed)*
 5. **No multi-step / forces search flag** — the `trajectory` property tags only ~0.1% of direct uploads (median 1, mean ~4.6 steps); **don't pre-filter on it** — recover steps + confirm forces at parse time.
 6. **Compression + naming** — NOMAD stores files `.bz2`/`.gz` under varied names (`GEO3_vasprun.xml.bz2`, `vasprun.xml.relax1`); stage under a **canonical name** (`vasprun.xml[.bz2]`) so `_find_calc_units` + pymatgen `zopen` read them unchanged. Do **not** rely on the server-side `decompress` param — it doesn't handle `.bz2`. *(smoke verifies compressed-kept == locally-decompressed)*
-7. **Self-throttle + 5xx backoff** — ~30 req/s, ≤10 concurrent, no `Retry-After`; **502/503/504 all appear under load** (seen repeatedly in the smoke). The client backs off exponentially. Email support before a multi-million pull.
+7. **Self-throttle + 5xx backoff** — ~30 req/s, ≤10 concurrent (per IP), no `Retry-After`; **502/503/504 all appear under load** (seen repeatedly in the smoke). The client backs off exponentially. Contacting support is **not** a documented prerequisite (§2) — do it only to request a rate-limit *exemption* if throughput is the bottleneck.
 8. **Archive label caveats (only if you ever use the normalized archive)** — `energy.free`=F, `energy.total`=E, `energy.total_t0` anomalous (no drop-in σ→0), stress sign undocumented, `calculation.step`=None. This is *why* we re-parse raw vasprun instead.
 9. **Raw files can be missing/partial** — `rawdir` first; skip+log an entry with no vasprun/OUTCAR primary.
 10. **Read the per-entry `license`** — keep only CC-BY, log the rest.
@@ -364,8 +381,9 @@ forces/energies, so it's a discovery/dedup aid only, never a label source.
   the fetch is disk/inode-valve-paced with `--workers`; `nomad_harvest.cli pipeline` runs the
   overlapped fetch∥parse+purge disk-paced, and `scripts/csd3/nomad/{10_discover,20_pipeline}.sh`
   wrap it as self-resubmitting SLURM jobs (mirroring the Zenodo templates). `merge-datasets`
-  folds the NOMAD dataset (`data/dataset/nomad`) into the combined one. Notify
-  `support@nomad-lab.eu` before a multi-million-entry pull.
+  folds the NOMAD dataset (`data/dataset/nomad`) into the combined one. Optionally email
+  `support@nomad-lab.eu` to request a rate-limit exemption for a multi-million-entry pull
+  (not required — see §2).
 
 **Run it (bounded sample):**
 ```bash
