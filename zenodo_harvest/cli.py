@@ -57,6 +57,7 @@ from .outcar_recover import (
     reclassify_outcar_run_types,
     refresh_outcar_metadata,
 )
+from .vasprun_recover import build_vasprun_keeplist, refresh_vasprun_metadata
 from .parse import parse
 from .store import DatasetLockError
 from .triage import triage
@@ -279,6 +280,39 @@ def _add_refresh_outcar(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--json", action="store_true", help="machine-readable output")
 
 
+def _add_vasprun_keeplist(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("vasprun-keeplist",
+                       help="stage 0 of vasprun recovery: emit a slim keep-list of just the "
+                            "records that hold a pymatgen.Vasprun calc (to re-fetch)")
+    p.add_argument("--dataset-dir", default=str(config.DATASET_DIR))
+    p.add_argument("--keep", required=True,
+                   help="the original triaged keep-list (has each record's file URLs)")
+    p.add_argument("--out", required=True, help="where to write the vasprun-only keep-list JSONL")
+    p.add_argument("--only-missing", action="store_true",
+                   help="target only vasprun calcs still lacking a resolved `parameters` block "
+                        "(i.e. not yet refreshed); default targets every vasprun calc")
+
+
+def _add_refresh_vasprun(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("refresh-vasprun",
+                       help="stage 2 of vasprun recovery: re-read re-fetched vasprun HEADERS and "
+                            "write VASP's resolved `parameters` block into those records' "
+                            "calc_parameters (calc_id/frame_ids/shards + run_type untouched)")
+    p.add_argument("--dataset-dir", default=str(config.DATASET_DIR))
+    p.add_argument("--fetched", required=True,
+                   help="fetched manifest from re-fetching the vasprun keep-list")
+    p.add_argument("--raw-dir", default=str(config.RAW_DIR),
+                   help="where the re-fetch staged the files; manifest paths resolve against it")
+    p.add_argument("--only-missing", action="store_true",
+                   help="only add the block to vasprun calcs still lacking one (skip ones a "
+                        "prior run already did)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="report what would change; write nothing")
+    p.add_argument("--no-backup", action="store_true",
+                   help="skip the one-time metadata.jsonl.bak.pre_vasprun_refresh snapshot")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+
+
 def _add_reclassify_outcar(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("reclassify-outcar",
                        help="re-derive run_type/functional for OUTCAR-header calcs from their "
@@ -370,6 +404,8 @@ def main(argv: list[str] | None = None) -> int:
     _add_outcar_keeplist(sub)
     _add_refresh_outcar(sub)
     _add_reclassify_outcar(sub)
+    _add_vasprun_keeplist(sub)
+    _add_refresh_vasprun(sub)
     _add_purge_raw(sub)
     _add_status(sub)
     _add_pipeline(sub)
@@ -486,6 +522,28 @@ def main(argv: list[str] | None = None) -> int:
         try:
             summary = reclassify_outcar_run_types(
                 args.dataset_dir, dry_run=args.dry_run, backup=not args.no_backup)
+        except DatasetLockError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        if not summary.get("ok"):
+            print(f"ERROR: {summary.get('error')}", file=sys.stderr)
+            return 1
+        print(json.dumps(summary, indent=2))
+        return 0
+    elif args.cmd == "vasprun-keeplist":
+        summary = build_vasprun_keeplist(args.dataset_dir, args.keep, args.out,
+                                         only_missing=args.only_missing)
+        if not summary.get("ok"):
+            print(f"ERROR: {summary.get('error')}", file=sys.stderr)
+            return 1
+        print(json.dumps(summary, indent=2))
+        return 0
+    elif args.cmd == "refresh-vasprun":
+        try:
+            summary = refresh_vasprun_metadata(
+                args.dataset_dir, args.fetched, args.raw_dir,
+                dry_run=args.dry_run, backup=not args.no_backup,
+                only_missing=args.only_missing)
         except DatasetLockError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1

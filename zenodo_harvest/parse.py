@@ -79,7 +79,8 @@ from ase.stress import full_3x3_to_voigt_6_stress
 
 from . import config
 from .manifest import RejectionLogger, read_jsonl
-from .outcar_params import EFFECTIVE_TAGS, parse_outcar_header
+from .outcar_params import parse_outcar_header
+from .vasprun_params import resolved_parameters
 from .store import (
     DatasetLock,
     MetadataWriter,
@@ -330,10 +331,12 @@ def _calc_parameters(vasprun: Any) -> dict:
     # VASP's RESOLVED/effective parameters (defaults filled), the authoritative analog of the
     # OUTCAR header's effective block. Storing them (the "better fix" in the metadata-gaps
     # memory) lets the resolver read authoritative values instead of guessing defaults, and
-    # keeps the vasprun and OUTCAR `parameters` blocks on one schema. Restricted to the shared
-    # allow-list (outcar_params.EFFECTIVE_TAGS) to bound size — vasprun.parameters is ~100 tags.
-    effective = {k: _jsonable(params.get(k)) for k in EFFECTIVE_TAGS
-                 if params.get(k) is not None}
+    # keeps the vasprun and OUTCAR `parameters` blocks on one schema. `resolved_parameters`
+    # renames vasprun's ENMAX->ENCUT and restricts to the shared allow-list
+    # (outcar_params.EFFECTIVE_TAGS) — the SAME function the vasprun recovery uses, so a live
+    # parse and a recovered record emit a byte-identical block. (Without the ENMAX->ENCUT
+    # rename the cutoff was silently dropped here: vasprun.parameters has no "ENCUT" key.)
+    effective = resolved_parameters(params)
     return {
         "code": "vasp",
         "code_version": getattr(vasprun, "vasp_version", None),

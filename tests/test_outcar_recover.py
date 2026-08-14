@@ -18,7 +18,6 @@ Uses ASE only via the shard writer (same tier as ``test_store.py``). Run:
 
 from __future__ import annotations
 
-import gzip
 import hashlib
 import json
 from pathlib import Path

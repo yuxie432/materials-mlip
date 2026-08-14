@@ -164,6 +164,22 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
     shard access — so a `classify_run_type` bugfix that lands *after* the 955-GiB recovery ran
     can be applied cheaply (atomic under `.parse.lock` + `metadata.jsonl.bak.pre_reclassify`;
     e.g. it fixed the 57 calcs a boolean-`METAGGA` had mislabeled run_type `"TRUE"` → `GGA`).
+  - `vasprun_params.py` + `vasprun_recover.py` — the vasprun analog of the OUTCAR recovery,
+    for the missing resolved **`parameters`** block on the ~83k `pymatgen.Vasprun` calcs (they
+    were parsed before `_calc_parameters` stored it, so only the user `incar` is present →
+    `ISIF`/`ADDGRID`/etc. rely on the resolver's guess). `vasprun_params.parse_vasprun_parameters`
+    reads **only the `<parameters>` element** of a vasprun.xml (iterparse, stops before the
+    `<calculation>` trajectory → cheap regardless of file size) via pymatgen's own
+    `_parse_params`, then `resolved_parameters` renames vasprun's **`ENMAX`→`ENCUT`** (the
+    `<parameters>` block has no `ENCUT`) and restricts to `EFFECTIVE_TAGS` — the SAME function
+    `parse._calc_parameters` now uses, so a live parse and a recovered record emit a
+    byte-identical block. `build_vasprun_keeplist` + `refresh_vasprun_metadata` (CLI
+    `vasprun-keeplist`/`refresh-vasprun`) re-fetch the vasprun records and write ONLY the
+    `parameters` block into their `calc_parameters` (dropping the stale `resolved`;
+    `run_type`/`functional`/`incar`/`calc_id`/`frame_ids`/`shards` untouched → verify passes),
+    atomic under `.parse.lock` + `metadata.jsonl.bak.pre_vasprun_refresh`, `--only-missing` for
+    resume. CSD3 campaign: `scripts/csd3/45_vasprun_recover.sh` (mirrors 44). Run
+    `enrich-metadata` after to regenerate `resolved` from the authoritative parameters.
   - `store.py` — stage 4: `ShardedExtxyzWriter` (rotating `shard-NNNNN.extxyz.gz`) +
     `MetadataWriter` (one JSONL record per calc), joined by `calc_id`/`frame_id`.
   - `status.py` — read-only progress snapshot: line-counts the append-only manifests +
@@ -186,7 +202,7 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
       every array job.
     - `purge-raw` — delete `<raw-dir>/<recid>/` trees whose every calc_id is already in the
       dataset (reclaim scratch); `--dry-run` reports without deleting.
-  - `cli.py` — `python -m zenodo_harvest.cli {discover,triage,fetch,parse,pipeline,split,merge-datasets,verify,enrich-metadata,outcar-keeplist,refresh-outcar,reclassify-outcar,purge-raw,status} ...`
+  - `cli.py` — `python -m zenodo_harvest.cli {discover,triage,fetch,parse,pipeline,split,merge-datasets,verify,enrich-metadata,outcar-keeplist,refresh-outcar,reclassify-outcar,vasprun-keeplist,refresh-vasprun,purge-raw,status} ...`
     (loads `.env`; `verify`/`merge-datasets`/`pipeline` exit non-zero on an integrity failure;
     `status` is read-only and always exits 0, `--json` for machine output).
     Parse and merge take a `.parse.lock` on the dataset dir so two writers never corrupt one
