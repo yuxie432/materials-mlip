@@ -36,7 +36,7 @@ from zenodo_harvest.parse import parse
 from zenodo_harvest.store import DatasetLockError
 
 from .client import NomadClient, direct_upload_vasp_query
-from .harvest import discover_candidates, fetch_candidates
+from .harvest import discover_candidates, fetch_candidates, fetch_candidates_bulk
 
 
 def _add_disk_valve(p: argparse.ArgumentParser) -> None:
@@ -53,6 +53,29 @@ def _add_disk_valve(p: argparse.ArgumentParser) -> None:
     p.add_argument("--want-outcar", action="store_true",
                    help="also fetch OUTCAR when present (per-atom charges/spins on the final "
                         "frame; larger transfer — vasprun-only is the default)")
+    p.add_argument("--per-entry", action="store_true",
+                   help="use the per-entry fetch (2 requests/entry) instead of the DEFAULT "
+                        "bulk fetch (~2 requests per --batch-size entries). Bulk is ~100x "
+                        "fewer requests — the difference between a ~months and a ~days run; "
+                        "use per-entry only to debug or if bulk raw/query is unavailable.")
+    p.add_argument("--batch-size", type=int, default=300,
+                   help="entries per bulk raw/query zip (bulk mode; bounds zip size + the "
+                        "server's zip-assembly time)")
+    p.add_argument("--tmp-dir", default=None,
+                   help="node-local dir for transient batch zips (bulk mode; default a temp "
+                        "dir under $TMPDIR). Keep it OFF the rds quota — e.g. CSD3 /local.")
+
+
+def _fetch(client: NomadClient, in_path: str, out_path: str | None, raw_dir: str,
+           args: argparse.Namespace, max_records: int | None) -> dict:
+    """Run the selected fetch (bulk by default, per-entry with ``--per-entry``)."""
+    kw = dict(raw_dir=raw_dir, out_path=out_path, want_outcar=args.want_outcar,
+              max_records=max_records, max_disk_bytes=(args.max_disk_bytes or None),
+              max_disk_files=(args.max_disk_files or None), workers=args.workers)
+    if args.per_entry:
+        return fetch_candidates(client, in_path, **kw)
+    return fetch_candidates_bulk(client, in_path, batch_size=args.batch_size,
+                                 tmp_dir=args.tmp_dir, **kw)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -129,11 +152,7 @@ def main(argv: list[str] | None = None) -> int:
             max_entries=args.max_entries, page_size=args.page_size,
             license_gate=args.license_gate, zenodo_metadata=zmeta)
     elif args.cmd == "fetch":
-        summary = fetch_candidates(
-            client, args.in_path, raw_dir=args.raw_dir, out_path=args.out,
-            want_outcar=args.want_outcar, max_records=args.max_records,
-            max_disk_bytes=(args.max_disk_bytes or None),
-            max_disk_files=(args.max_disk_files or None), workers=args.workers)
+        summary = _fetch(client, args.in_path, args.out, args.raw_dir, args, args.max_records)
     elif args.cmd == "pipeline":
         return _run_pipeline(client, args)
     else:  # pragma: no cover
@@ -166,12 +185,9 @@ def _run_pipeline(client: NomadClient, args: argparse.Namespace) -> int:
         return part.with_name(part.stem + ".fetched.jsonl")
 
     def fetch_fn(part: Path) -> bool:
-        """Fetch one batch. Returns False if the disk-budget valve stopped it part-way, so
-        run_pipeline drains the background parse+purge and resumes THIS part."""
-        summary = fetch_candidates(
-            client, str(part), raw_dir=str(raw_dir), out_path=str(_fetched_path(part)),
-            want_outcar=args.want_outcar, max_disk_bytes=max_disk_bytes,
-            max_disk_files=max_disk_files, workers=args.workers)
+        """Fetch one batch (bulk by default). Returns False if the disk-budget valve stopped
+        it part-way, so run_pipeline drains the background parse+purge and resumes THIS part."""
+        summary = _fetch(client, str(part), str(_fetched_path(part)), str(raw_dir), args, None)
         return not summary.get("stopped_disk_budget", False)
 
     def process_fn(part: Path) -> None:

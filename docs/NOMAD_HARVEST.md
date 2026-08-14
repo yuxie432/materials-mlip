@@ -296,18 +296,31 @@ manifests), so NOMAD frames are tagged `source="nomad"` and calc_ids namespace a
 needs **no CLI flag** (the authoritative provenance field drives it). `purge-raw`, which
 re-derives calc_ids via the same `_calc_id`, follows automatically.
 
-### Rate-limiting process during the run
+### Rate-limiting process — and the fetch redesign (built 2026-08-11)
 
-- **Not discovery** (~700 keyset requests for all 7.1M) and **not request count** — the 7.1M
-  entries come from only **~3,792 uploads**, so fetch can batch per upload.
-- The bottleneck is a race between **fetch throughput** (~6.5 TB pulled under NOMAD's
-  ~10-concurrent / ~30-req/s ceiling *and* its 5xx flakiness — 502/503/504 all appear under
-  load, no `Retry-After` headers, so conservative self-throttle + exponential backoff) and
-  **parse CPU** (~7.1M pymatgen parses ≈ tens of CPU-days). Parse parallelises across array-job
-  cores; fetch is capped by NOMAD's limits and can't. **So fetch is the rate-limiting stage**,
-  with parse the close second that parallelism keeps hidden behind it (same fetch∥parse overlap
-  as the Zenodo `pipeline`). Final storage (~25-40 GB) is a non-issue; peak *staging* disk is
-  bounded by the valve.
+Measured live: the naive **per-entry** fetch is **latency-bound** — ~**1 s/entry** (2 requests
+each: `rawdir` + download; a 0.15 MB file takes ~0.8 s, almost all overhead), and per-entry
+**concurrency makes it *worse*** (a 503 storm). That extrapolates to **~89 days** for 7.1M — the
+constraint is **NOMAD's request rate**, not CSD3, disk, bandwidth, or parse (parse is ~**86 ms/calc**
+→ ~**2 h on one 76-core node**; storage is ~25–40 GB, a non-issue).
+
+**So the fix is to collapse the request count** — implemented as the default
+`fetch_candidates_bulk` (fixes #1 + #2, all API behaviour verified live):
+- **#1** `POST /entries/raw/query` with `{"entry_id:any": [batch]}` + `files.include_files=[<exact
+  mainfiles>]` streams **ONE zip of exactly the wanted files** (verified: no over-fetch); members
+  are `<upload_id>/<mainfile>`, mapped back exactly. ~1 download request per **300-entry batch**.
+- **#2** `POST /entries/rawdir/query` gets availability for a whole batch in one request (not one `rawdir` each).
+- Net: ~**2 requests per ~300 entries** (~47k total) vs **14.2M**. Fetch becomes **bandwidth-bound**
+  (~1–6.5 TB), and a few concurrent long-lived batch streams (`--workers`) multiply bandwidth
+  *without* tripping the req/s limiter (safe, unlike per-entry concurrency) → **~days, not months**;
+  feasible inside two weeks (coordinate with `support@nomad-lab.eu` — NOMAD's server-side throttle
+  is the remaining governor, and it was heavy during testing).
+- **Coverage/quality unchanged:** exact mainfiles keep the **5% OUTCAR-only** entries; the FULL
+  vasprun is fetched, so the enhanced parser recovers full `calc_parameters` (run_type, INCAR,
+  resolved `parameters`, k-points, POTCAR — confirmed on live NOMAD vaspruns); any entry a zip
+  can't deliver **falls back to the per-entry path**. The per-entry `fetch_candidates` remains as
+  `--per-entry`. Parse is the well-hidden second stage (overlapped fetch∥parse in `pipeline`);
+  peak *staging* disk stays bounded by the valve.
 
 **Complementary path — OPTIMADE.** NOMAD implements OPTIMADE at
 `https://nomad-lab.eu/prod/v1/optimade/v1` (18.8M structures). Standardized

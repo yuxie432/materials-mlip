@@ -238,3 +238,66 @@ class NomadClient:
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise
+
+    # -- bulk raw access (fixes #1 + #2: collapse per-entry requests) -------
+
+    def bulk_rawdir(self, entry_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Raw-file listings for many entries in ONE request (``POST /entries/rawdir/query``).
+
+        Returns ``{entry_id: {"mainfile", "upload_id", "files": [{"path","size"}, …]}}``.
+        This replaces the per-entry ``rawdir`` round-trip (**fix #2**): one request covers a
+        whole batch, so availability + file listings cost ~1 request per few-hundred entries
+        instead of one each.
+        """
+        if not entry_ids:
+            return {}
+        body = {"owner": "public", "query": {"entry_id:any": list(entry_ids)},
+                "pagination": {"page_size": len(entry_ids)}}
+        d = self._post("/entries/rawdir/query", body)
+        return {row["entry_id"]: row for row in d.get("data", []) if row.get("entry_id")}
+
+    def bulk_raw_zip(self, entry_ids: list[str], files: dict[str, Any], dest: Path,
+                     on_chunk: "Callable[[int], None] | None" = None) -> int:
+        """Download ONE zip of many entries' raw files selected by ``files`` (**fix #1**).
+
+        ``POST /entries/raw/query`` with ``{"entry_id:any": ids}`` + a ``files`` directive
+        (``{"include_files": [<full mainfile paths>]}`` for an EXACT, waste-free pull —
+        verified live to return exactly those files — or ``{"glob_pattern": "*vasprun*.xml*"}``)
+        streams a single ``application/zip`` of the matching files across those entries
+        (members named ``<upload_id>/<path-in-upload>``, verified live). This collapses the
+        per-entry download into ~1 request per batch — the change that turns a latency-bound,
+        ~months-long fetch into a bandwidth-bound, ~days one. Streams to ``dest`` via a
+        ``.part`` then renames; ``on_chunk`` may meter/limit the bytes. Returns bytes written.
+        """
+        body: dict[str, Any] = {"owner": "public", "query": {"entry_id:any": list(entry_ids)},
+                                "files": files}
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        for attempt in range(self.max_retries):
+            self._throttle()
+            try:
+                with self.session.post(f"{self.base}/entries/raw/query", json=body,
+                                       stream=True, timeout=self.timeout) as r:
+                    if r.status_code in _RETRY_STATUS and attempt < self.max_retries - 1:
+                        r.close()
+                        time.sleep(_backoff_seconds(attempt, r.headers.get("Retry-After")))
+                        continue
+                    r.raise_for_status()
+                    n = 0
+                    with tmp.open("wb") as fh:
+                        for chunk in r.iter_content(1 << 20):
+                            if on_chunk is not None:
+                                on_chunk(len(chunk))
+                            fh.write(chunk)
+                            n += len(chunk)
+                tmp.replace(dest)
+                self._last = time.monotonic()
+                return n
+            except requests.RequestException:
+                self._last = time.monotonic()
+                if attempt >= self.max_retries - 1:
+                    tmp.unlink(missing_ok=True)
+                    raise
+                time.sleep(_backoff_seconds(attempt, None))
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError("bulk_raw_zip: exhausted retries")

@@ -31,10 +31,12 @@ from nomad_harvest.client import (
 )
 from nomad_harvest.harvest import (
     RecordTooBig,
+    _member_role,
     build_fetched_entry,
     canonical_staged_name,
     choose_primary,
     fetch_candidates,
+    fetch_candidates_bulk,
     normalize_doi,
     raw_path_rel,
     references_of,
@@ -448,3 +450,118 @@ def test_fetch_candidates_resume_skips_manifest(tmp_path):
     assert summary["staged"] == 0
     assert client.downloads == before                                   # no re-downloads
     assert len(list(read_jsonl(out))) == 2                              # no duplicate manifest lines
+
+
+# --- bulk fetch (fixes #1/#2): batching + exact member mapping + fallback + valve --
+
+class FakeBulkClient(FakeNomadClient):
+    """Adds the two bulk endpoints: ``bulk_rawdir`` (batch listings) and ``bulk_raw_zip``
+    (writes a REAL zip whose members are ``<upload_id>/<mainfile>`` with each entry's blob
+    as content). ``omit`` forces given entries to be MISSING from the zip, exercising the
+    per-entry fallback. Inherits ``rawdir``/``download_raw_file`` so that fallback works."""
+
+    def __init__(self, entries: dict, uploads: dict, omit=()):
+        super().__init__(entries)
+        self.uploads = uploads
+        self.mains = {eid: e["mainfile"] for eid, e in entries.items()}
+        self.omit = set(omit)
+        self.zips = 0
+
+    def bulk_rawdir(self, ids):
+        return {eid: {"entry_id": eid, "upload_id": self.uploads[eid],
+                      "mainfile": self.mains[eid], "files": self.entries[eid]["files"]}
+                for eid in ids if eid in self.entries}
+
+    def bulk_raw_zip(self, ids, files, dest, on_chunk=None):
+        import zipfile
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(dest, "w") as zf:
+            for eid in ids:
+                if eid in self.omit or eid not in self.entries:
+                    continue
+                base = self.mains[eid].rsplit("/", 1)[-1]
+                zf.writestr(f"{self.uploads[eid]}/{self.mains[eid]}",
+                            self.entries[eid]["blobs"][base])
+        if on_chunk is not None:
+            on_chunk(dest.stat().st_size)
+        self.zips += 1
+        return dest.stat().st_size
+
+
+def _bulk_setup(tmp_path: Path, specs):
+    """specs: [(entry_id, upload_id, mainfile, size)]. Returns (keeplist, entries, uploads)."""
+    entries, uploads, rows = {}, {}, []
+    for eid, uid, mf, size in specs:
+        base = mf.rsplit("/", 1)[-1]
+        entries[eid] = {"mainfile": mf, "files": [{"path": mf, "size": size}],
+                        "blobs": {base: b"x" * size}}
+        uploads[eid] = uid
+        rows.append({"entry_id": eid, "upload_id": uid, "mainfile": mf,
+                     "license": "CC BY 4.0", "references": [],
+                     "results": {"material": {"elements": ["Si"]}}})
+    keep = tmp_path / "bulk_keep.jsonl"
+    write_jsonl(keep, rows)
+    return keep, entries, uploads
+
+
+@pytest.mark.parametrize("mainfile,role", [
+    ("d/vasprun.xml.bz2", "vasprun"), ("GEO3_vasprun.xml", "vasprun"),
+    ("run/OUTCAR", "outcar"), ("d/OUTCAR.gz", "outcar"), ("d/INCAR", None),
+])
+def test_member_role(mainfile, role):
+    assert _member_role(mainfile) == role
+
+
+def test_bulk_fetch_stages_vasprun_and_outcar(tmp_path):
+    # one vasprun-primary + one OUTCAR-only entry -> both covered by include_files
+    keep, entries, uploads = _bulk_setup(tmp_path, [
+        ("V", "U1", "a/vasprun.xml", 40),
+        ("O", "U2", "b/OUTCAR", 40)])
+    client = FakeBulkClient(entries, uploads)
+    out = tmp_path / "fetched.jsonl"
+    summary = fetch_candidates_bulk(client, keep, raw_dir=tmp_path / "raw",
+                                    out_path=out, batch_size=5)
+    assert summary["staged"] == 2 and summary["batches"] == 1 and client.zips == 1
+    recs = {r["recid"]: r for r in read_jsonl(out)}
+    assert set(recs) == {"V", "O"}
+    assert recs["V"]["provenance"]["source"] == "nomad"
+    assert recs["V"]["calc_units"][0]["vasprun"].endswith("vasprun.xml")
+    assert recs["O"]["calc_units"][0]["outcar"].endswith("OUTCAR")
+
+
+def test_bulk_fetch_falls_back_for_missing_member(tmp_path):
+    # B is omitted from the zip -> must be recovered by the per-entry fallback (no data lost)
+    keep, entries, uploads = _bulk_setup(tmp_path, [
+        ("A", "U", "d/A_vasprun.xml", 30), ("B", "U", "d/B_vasprun.xml", 30)])
+    client = FakeBulkClient(entries, uploads, omit=["B"])
+    out = tmp_path / "fetched.jsonl"
+    summary = fetch_candidates_bulk(client, keep, raw_dir=tmp_path / "raw", out_path=out)
+    assert summary["staged"] == 2                 # both staged (B via fallback)
+    assert summary["bulk_fallback"] >= 1
+    assert client.downloads >= 1                  # the per-entry download ran for B
+    assert {r["recid"] for r in read_jsonl(out)} == {"A", "B"}
+
+
+def test_bulk_fetch_resume_skips_manifest(tmp_path):
+    keep, entries, uploads = _bulk_setup(tmp_path, [
+        ("A", "U", "d/A_vasprun.xml", 20), ("B", "U", "d/B_vasprun.xml", 20)])
+    client = FakeBulkClient(entries, uploads)
+    out = tmp_path / "fetched.jsonl"
+    fetch_candidates_bulk(client, keep, raw_dir=tmp_path / "raw", out_path=out)
+    z = client.zips
+    summary = fetch_candidates_bulk(client, keep, raw_dir=tmp_path / "raw", out_path=out)
+    assert summary["skipped_existing"] == 2 and summary["staged"] == 0
+    assert client.zips == z                        # nothing re-fetched
+    assert len(list(read_jsonl(out))) == 2         # no duplicate manifest lines
+
+
+def test_bulk_fetch_valve_defers(tmp_path):
+    # two 600 B members, one batch, 1000 B budget: first stages, second defers (reclaimable)
+    keep, entries, uploads = _bulk_setup(tmp_path, [
+        ("A", "U", "d/A_vasprun.xml", 600), ("B", "U", "d/B_vasprun.xml", 600)])
+    client = FakeBulkClient(entries, uploads)
+    out = tmp_path / "fetched.jsonl"
+    summary = fetch_candidates_bulk(client, keep, raw_dir=tmp_path / "raw", out_path=out,
+                                    max_disk_bytes=1000, batch_size=5)
+    assert summary["staged"] == 1                  # only the first fit
+    assert summary["stopped_disk_budget"] is True  # signals pipeline to reclaim + resume

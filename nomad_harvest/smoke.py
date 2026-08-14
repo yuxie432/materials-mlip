@@ -246,6 +246,31 @@ def run(n: int, elements: list[str] | None, work: Path, keep: bool) -> int:
         except Exception as exc:  # noqa: BLE001
             rep.failed("parse_compat", f"{type(exc).__name__}: {exc}")
 
+    # 8b. BULK fetch path (fixes #1/#2 — the DEFAULT for the real run) -------------
+    if not entries:
+        rep.skip("bulk_fetch", "no entries")
+    else:
+        try:
+            from zenodo_harvest.parse import parse as _parse
+
+            from .harvest import fetch_candidates_bulk
+            bkeep = manifests / "bulk_keep.jsonl"
+            write_jsonl(bkeep, entries)
+            braw, bout, bds = work / "bulk_raw", manifests / "bulk_fetched.jsonl", work / "bulk_ds"
+            bsum = fetch_candidates_bulk(client, str(bkeep), raw_dir=str(braw),
+                                         out_path=str(bout),
+                                         batch_size=max(2, len(entries) // 2), workers=2)
+            bstats = _parse(str(bout), dataset_dir=str(bds), raw_dir=str(braw),
+                            rejections_path=str(bds / "rej.jsonl"), parse_timeout_s=0)
+            ok = bsum["staged"] > 0 and bstats["calcs_parsed"] > 0
+            rep.add("bulk_fetch", "PASS" if ok else "FAIL",
+                    f"{bsum['staged']}/{len(entries)} staged in {bsum['batches']} batch(es) "
+                    f"(~{2 * bsum['batches']} reqs vs {2 * len(entries)} per-entry), "
+                    f"fallback={bsum['bulk_fallback']}; parsed {bstats['calcs_parsed']} "
+                    f"-> {bstats['frames']} frames")
+        except Exception as exc:  # noqa: BLE001
+            rep.failed("bulk_fetch", f"{type(exc).__name__}: {exc}")
+
     # 9. verify bijection ---------------------------------------------------------
     meta_path = ds_dir / "metadata.jsonl"
     if not meta_path.is_file():
