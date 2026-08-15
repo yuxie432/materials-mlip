@@ -44,7 +44,12 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   - `fetch.py` — stage 2: download (checksum-verified, resumable, `--max-bytes` capped;
     `--max-bytes 0` = no cap) and **selectively extract only VASP files** from archives; the
     archive is deleted right after extraction (persistent disk = extracted files, not archives);
-    records availability of heavy files (CHGCAR/WAVECAR/DOSCAR/EIGENVAL/…) without extracting them.
+    records availability of heavy files (CHGCAR/WAVECAR/DOSCAR/EIGENVAL/…) without extracting
+    them. **Availability is scoped PER CALC**: each heavy file is attributed to the calc whose
+    primary sits in the SAME directory (VASP writes CHGCAR/DOSCAR beside the run's vasprun/OUTCAR),
+    not OR'd across every calc in the record (the old over-count). `fetched.jsonl` carries a
+    `calc_availability` list aligned index-for-index with `calc_units` (parse reads it; a
+    record-level `availability` union is kept for older manifests/report tooling).
     **`.zip` uses targeted member fetch by default** (`zipstream.py`; `--no-zip-stream` to
     disable): a ZIP's tail central directory gives every member's byte offset, so the VASP
     files are pulled straight out over HTTP Range (~1 request/file, CRC-verified) **without
@@ -107,7 +112,12 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   - `parse.py` — stage 3: pymatgen `Vasprun` (primary) → per-ionic-step ASE frames; tags each
     frame with *its own* step's electronic convergence bool + magnitude (`scf_dE`), drops steps
     with no recoverable energy, records `run_type`, full INCAR/k-points/POTCAR, availability
-    flags. OUTCAR-only calcs fall back to ASE's `vasp-out` reader (read from an isolated temp
+    flags. Availability is taken PER CALC from fetch's `calc_availability` (falling back to the
+    record-level union for pre-fix manifests) and **refined by a cheap embedded probe of the
+    primary**: DOS/eigenvalues/projected written straight into a vasprun.xml (a streaming
+    `<dos`/`<eigenvalues`/`<projected` tag scan, never parsing the arrays) or vaspout.h5 (its
+    `/results` group names) are OR'd on, so a calc with no standalone DOSCAR/EIGENVAL/PROCAR file
+    is no longer under-counted. OUTCAR-only calcs fall back to ASE's `vasp-out` reader (read from an isolated temp
     copy — ASE otherwise crashes on uploads with hash-annotated POTCAR species). Manifest paths
     resolve against `--raw-dir`. `--max-primary-bytes` (0 = off) refuses to *attempt* a
     primary output above a size and logs a `primary_too_large` rejection instead — pymatgen
@@ -313,6 +323,13 @@ tail is ~170 TB).
     returns `stopped_disk_budget` so the pipeline reclaims + resumes. NOMAD stages files
     verbatim (no archive expansion), so the rawdir-declared `size` is the exact on-disk size —
     the valve reserves it up front. Heavy outputs → availability only, never fetched.
+    **Availability uses NOMAD's parsed metadata as the PRIMARY source** (`build_fetched_entry`
+    maps `results.properties.available_properties`: `dos_electronic[_new]`→`dos` (~91% of the
+    corpus), `band_structure_electronic`→`eigenvalues`), OR'd over the filename scan of the
+    rawdir listing (the fallback for charge-density/wavefunction/local-potential/ELF/projections,
+    which NOMAD does not index) and the shared parser's embedded-vasprun probe. A NOMAD entry is
+    one calc (one mainfile→one entry), so this is already per-calc. `available_properties` is
+    preserved by `slim_candidate`; the unreliable `trajectory` property is deliberately not mapped.
   - `cli.py` — `python -m nomad_harvest.cli {discover,fetch,pipeline,smoke}`. `pipeline` splits
     the keep-list and drives the **shared** `run_pipeline` (fetch batch *i+1* ∥ parse+purge
     batch *i*), disk-paced, into its own `data/dataset/nomad` dir; `merge-datasets` folds it in.

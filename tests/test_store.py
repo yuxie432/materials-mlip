@@ -589,3 +589,65 @@ def test_rejected_calc_ids_selects_only_deterministic_parse_failures(tmp_path):
 
 def test_rejected_calc_ids_empty_when_file_absent(tmp_path):
     assert parse_mod._rejected_calc_ids(tmp_path / "nope.jsonl") == set()
+
+
+# --------------------------------------------------------------------------- #
+# parse() feeds each calc its OWN per-calc availability (fix #1 wiring).        #
+# --------------------------------------------------------------------------- #
+
+def _write_manifest(path, rec):
+    path.write_text(json.dumps(rec) + "\n")
+
+
+def test_parse_uses_per_calc_availability(tmp_path, monkeypatch):
+    # A record with two calc units in different dirs and a calc_availability list: parse must
+    # hand EACH calc its own entry (indexed alignment), not the record-level union.
+    seen = {}
+
+    def fake_parse_one(unit, base_meta, availability, rej, mpb, timeout, calc_id):
+        seen[calc_id] = availability
+        return None  # return nothing -> no frames/metadata written (no VASP files needed)
+
+    monkeypatch.setattr(parse_mod, "_parse_one", fake_parse_one)
+    rec = {
+        "recid": "R", "provenance": {"source": "zenodo", "record_id": "R"},
+        "local_dir": "R",
+        "calc_units": [
+            {"dir": "R/extracted/c1", "vasprun": "R/extracted/c1/vasprun.xml"},
+            {"dir": "R/extracted/c2", "vasprun": "R/extracted/c2/vasprun.xml"},
+        ],
+        "availability": {"charge_density": True, "dos": True},          # record union
+        "calc_availability": [
+            {"charge_density": True, "dos": False},                      # c1
+            {"charge_density": False, "dos": True},                       # c2
+        ],
+    }
+    man = tmp_path / "fetched.jsonl"
+    _write_manifest(man, rec)
+    parse_mod.parse(man, dataset_dir=tmp_path / "ds", rejections_path=tmp_path / "rej.jsonl",
+                    raw_dir=tmp_path / "raw", parse_timeout_s=0)
+    assert seen["zenodo:R:c1/vasprun.xml"] == {"charge_density": True, "dos": False}
+    assert seen["zenodo:R:c2/vasprun.xml"] == {"charge_density": False, "dos": True}
+
+
+def test_parse_falls_back_to_record_availability_without_calc_availability(tmp_path, monkeypatch):
+    # Old manifests have no calc_availability -> every calc gets the record-level union (the
+    # prior behaviour), so resuming a pre-fix harvest is byte-compatible.
+    seen = {}
+
+    def fake_parse_one(unit, bm, avail, rej, mpb, to, cid):
+        seen[cid] = avail
+        return None
+
+    monkeypatch.setattr(parse_mod, "_parse_one", fake_parse_one)
+    rec = {
+        "recid": "R", "provenance": {"source": "zenodo", "record_id": "R"},
+        "local_dir": "R",
+        "calc_units": [{"dir": "R/extracted/c1", "vasprun": "R/extracted/c1/vasprun.xml"}],
+        "availability": {"charge_density": True, "dos": False},
+    }
+    man = tmp_path / "fetched.jsonl"
+    _write_manifest(man, rec)
+    parse_mod.parse(man, dataset_dir=tmp_path / "ds", rejections_path=tmp_path / "rej.jsonl",
+                    raw_dir=tmp_path / "raw", parse_timeout_s=0)
+    assert seen["zenodo:R:c1/vasprun.xml"] == {"charge_density": True, "dos": False}

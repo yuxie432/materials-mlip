@@ -29,6 +29,7 @@ import errno
 import logging
 import lzma
 import os
+import posixpath
 import re
 import shutil
 import tarfile
@@ -175,6 +176,46 @@ _AVAILABILITY = {
     "local_potential": re.compile(r"^locpot", re.IGNORECASE),
     "elf": re.compile(r"^elfcar", re.IGNORECASE),
 }
+
+
+def _heavy_kind(base: str) -> str | None:
+    """Which availability kind a filename's basename denotes (CHGCAR->charge_density, …),
+    or None if it is not a recognised heavy output. Anchored at the start of the basename,
+    exactly like :func:`_safe_members`."""
+    for kind, rx in _AVAILABILITY.items():
+        if rx.match(base):
+            return kind
+    return None
+
+
+def _concept_rel(base_rel: str, member_name: str) -> str | None:
+    """Conceptual path (posix, relative to ``<dest>/extracted``) a member *would* occupy
+    once extracted — even for a heavy file we never write to disk.
+
+    ``base_rel`` is the extraction subdir the member's siblings land in (relative to the
+    extracted root): the per-archive subdir for a top-level archive, the nested archive's
+    ``…__extracted`` dir for a sub-archive member, or ``""`` for a directly-exposed file.
+    This lets availability be scoped to the calc-unit *directory* (VASP writes CHGCAR /
+    DOSCAR beside the vasprun/OUTCAR of the SAME run), instead of OR'd across the whole
+    record. Returns None if the member escapes the extracted root (zip-slip-style)."""
+    joined = posixpath.normpath(posixpath.join(base_rel, member_name))
+    if joined in (".", "..") or joined.startswith("../") or joined.startswith("/"):
+        return None
+    return joined
+
+
+def _collect_heavy(heavy: list[tuple[str, str]], base_rel: str, member_name: str) -> None:
+    """Append ``(conceptual_rel_path, kind)`` for ``member_name`` if it is a heavy output.
+
+    ``heavy`` accumulates every heavy file seen while staging a record (across all archives
+    and nesting levels); :func:`_fetched_entry` later matches each against the calc-unit
+    directories to attach availability *per calc* rather than per record."""
+    kind = _heavy_kind(member_name.rsplit("/", 1)[-1])
+    if kind is None:
+        return
+    rel = _concept_rel(base_rel, member_name)
+    if rel is not None:
+        heavy.append((rel, kind))
 
 _TAR_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")
 # zstd-compressed tarballs: common for large ML/DFT datasets (measured on Zenodo:
@@ -1078,6 +1119,8 @@ def _recurse_nested_archives(
     root: Path, member_cap: int, budget: "StagingBudget | None",
     rej: RejectionLogger, id_prefix: str, depth: int = 1,
     err_budget: list[int] | None = None,
+    extracted_root: "Path | None" = None,
+    heavy_out: "list[tuple[str, str]] | None" = None,
 ) -> tuple[list[str], list[str], bool]:
     """Extract any archive files staged under ``root``, recursively.
 
@@ -1091,6 +1134,12 @@ def _recurse_nested_archives(
     ``err_budget`` (a shared 1-element list) caps how many nested *extract failures* one
     record may log before it is abandoned with a single ``nested_extract_errors_capped``
     rejection — a hard backstop against a per-record flood.
+
+    ``heavy_out``/``extracted_root`` (both given together) collect heavy-output members
+    found inside the sub-archives as ``(conceptual_rel_path, kind)`` — the conceptual path
+    each heavy file would occupy under ``extracted_root``, so availability can be scoped to
+    the calc-unit directory (see :func:`_concept_rel`). Omitted (the default) → no
+    per-calc heavy tracking, e.g. when called directly by a unit test.
     """
     extra_names: list[str] = []
     extra_vasp: list[str] = []
@@ -1146,8 +1195,20 @@ def _recurse_nested_archives(
         extra_names.extend(names)
         extra_vasp.extend(n for n in extracted
                           if _nested_archive_kind(n.rsplit("/", 1)[-1]) is None)
+        # Record this sub-archive's heavy members at their conceptual location (the
+        # ``…__extracted`` dir, relative to the extracted root), so per-calc availability
+        # can match them to the calc unit that lives in the same directory.
+        if heavy_out is not None and extracted_root is not None:
+            try:
+                base_rel = out_dir.relative_to(extracted_root).as_posix()
+            except ValueError:
+                base_rel = None
+            if base_rel is not None:
+                for nm in names:
+                    _collect_heavy(heavy_out, base_rel, nm)
         sub_names, sub_vasp, sub_tr = _recurse_nested_archives(
-            out_dir, member_cap, budget, rej, nid, depth + 1, err_budget)
+            out_dir, member_cap, budget, rej, nid, depth + 1, err_budget,
+            extracted_root, heavy_out)
         extra_names.extend(sub_names)
         extra_vasp.extend(sub_vasp)
         transient = transient or sub_tr
@@ -1346,8 +1407,10 @@ def fetch_record(rec: dict, session: requests.Session, raw_dir: Path,
     """
     recid = rec["recid"]
     dest = raw_dir / recid
-    availability = {k: False for k in _AVAILABILITY}
-    availability_files: dict[str, str] = {}
+    # Heavy outputs seen while staging, each as (conceptual_rel_path, kind). Collected
+    # instead of an OR'd record-level flag so availability can be attached PER CALC (by
+    # matching the heavy file's directory to the calc unit's) in _fetched_entry.
+    heavy: list[tuple[str, str]] = []
     got_any = False
     transient = False   # any "couldn't get it THIS time" failure (see _is_transient_reason)
 
@@ -1356,7 +1419,7 @@ def fetch_record(rec: dict, session: requests.Session, raw_dir: Path,
     try:
         got_any, transient = _stage_record_files(
             rec, recid, dest, session, max_bytes, rej, max_member_bytes, budget,
-            availability, availability_files, zip_stream, zip_stream_max_files)
+            heavy, zip_stream, zip_stream_max_files)
     except BudgetExceeded as exc:
         # A limit was reached part way through this record. Roll it back entirely — a
         # record is staged whole or not at all — refund what it had taken, and leave it
@@ -1427,17 +1490,21 @@ def fetch_record(rec: dict, session: requests.Session, raw_dir: Path,
     # Drop extracted files no calc unit references (KPOINTS/OSZICAR, primary-less-dir inputs,
     # unpicked duplicates): never parsed, and purge-raw can't reclaim them later.
     _prune_unreferenced_files(dest / "extracted", units, budget)
-    return _fetched_entry(rec, recid, dest, raw_dir, units, availability, availability_files)
+    return _fetched_entry(rec, recid, dest, raw_dir, units, heavy)
 
 
 def _stage_record_files(
     rec: dict, recid: str, dest: Path, session: requests.Session,
     max_bytes: int | None, rej: RejectionLogger, max_member_bytes: int,
-    budget: "StagingBudget | None", availability: dict, availability_files: dict,
+    budget: "StagingBudget | None", heavy: list[tuple[str, str]],
     zip_stream: bool = True,
     zip_stream_max_files: int = DEFAULT_ZIP_STREAM_MAX_FILES,
 ) -> tuple[bool, bool]:
     """Download + extract one record's files. Returns ``(got_any, transient)``.
+
+    ``heavy`` is filled with ``(conceptual_rel_path, kind)`` for every heavy output seen
+    (across archives + nesting + directly-exposed files), so :func:`_fetched_entry` can
+    scope availability to each calc-unit directory.
 
     Raises :class:`BudgetExceeded` if a disk/inode limit is reached part way, which
     :func:`fetch_record` turns into a full rollback of this record.
@@ -1494,10 +1561,9 @@ def _stage_record_files(
                     continue
                 if result is not None:
                     names, extracted = result
-                    info = _safe_members(names)
-                    for akey, aval in info["availability"].items():
-                        availability[akey] = availability[akey] or aval
-                    availability_files.update(info["availability_files"])
+                    base_rel = _archive_subdir(base)
+                    for name in names:
+                        _collect_heavy(heavy, base_rel, name)
                     got_any = got_any or bool(extracted)
                     continue
                 # not addressable by targeted fetch -> fall through to whole download
@@ -1544,17 +1610,21 @@ def _stage_record_files(
                 budget.refund(arc_bytes, 1)  # transient bytes, not staged footprint
             # Recurse into any nested archives the extraction produced (all archive types),
             # extracting their VASP files too. BudgetExceeded propagates for a rollback.
+            # ``heavy``/``extract_dir``-relative-to-extracted-root let the recursion record
+            # heavy members inside sub-archives at their conceptual per-calc location.
             sub_names, sub_vasp, sub_tr = _recurse_nested_archives(
-                extract_dir, max_member_bytes, budget, rej, f"{recid}:{key}")
+                extract_dir, max_member_bytes, budget, rej, f"{recid}:{key}",
+                extracted_root=dest / "extracted", heavy_out=heavy)
             transient = transient or sub_tr
             # A nested-archive member is a container, not a VASP file — exclude it from the
             # "did we get VASP?" verdict; its extracted contents (sub_vasp) are what count.
             vasp_extracted = [n for n in extracted
                               if _nested_archive_kind(n.rsplit("/", 1)[-1]) is None] + sub_vasp
-            info = _safe_members(names + sub_names)   # availability across all nesting levels
-            for k, v in info["availability"].items():
-                availability[k] = availability[k] or v
-            availability_files.update(info["availability_files"])
+            # Heavy outputs from THIS (top-level) archive's own members, at their conceptual
+            # per-archive-subdir location (the sub-archive ones were added by the recursion).
+            base_rel = _archive_subdir(base)
+            for name in names:
+                _collect_heavy(heavy, base_rel, name)
             got_any = got_any or bool(vasp_extracted)
 
         elif _PARSE_RE.search(base):  # directly-exposed VASP file
@@ -1578,22 +1648,67 @@ def _stage_record_files(
                 transient = transient or _is_transient_reason(why)
 
         else:  # heavy / irrelevant direct file -> availability only
-            for akind, rx in _AVAILABILITY.items():
-                if rx.match(base):
-                    availability[akind] = True
-                    availability_files.setdefault(akind, key)
+            # A directly-exposed file extracts to <dest>/extracted/<key>, so its conceptual
+            # dir is that of ``key`` (base_rel="") — matched per-calc like archive members.
+            _collect_heavy(heavy, "", key)
 
     return got_any, transient
 
 
+def _calc_availability(units: list[dict], dest: Path,
+                       heavy: list[tuple[str, str]]) -> list[dict]:
+    """Per-calc availability: one dict per unit, each matched to the heavy files that live
+    in that unit's OWN directory.
+
+    VASP writes CHGCAR / DOSCAR / WAVECAR / … into the same working directory as the run's
+    vasprun.xml / OUTCAR, so a heavy file belongs to the calc whose primary sits beside it —
+    not to every calc in the record (the historical OR'd over-count: one DOSCAR anywhere
+    flagged all the record's calcs). Matching is on the extracted-root-relative directory;
+    if several calcs share one flat directory (a tag-split multi-primary dir) the heavy file
+    is attributed to each of them, which is the best a filename-only signal allows.
+    """
+    extracted_root = dest / "extracted"
+
+    def _dir_rel(abs_dir: str) -> str | None:
+        try:
+            r = Path(abs_dir).relative_to(extracted_root).as_posix()
+        except ValueError:
+            return None
+        return "" if r == "." else r
+
+    out: list[dict] = []
+    for u in units:
+        udir = _dir_rel(u["dir"])
+        avail = {k: False for k in _AVAILABILITY}
+        files: dict[str, str] = {}
+        if udir is not None:
+            for hp, kind in heavy:
+                if posixpath.dirname(hp) == udir:
+                    avail[kind] = True
+                    files.setdefault(kind, hp)
+        out.append({"availability": avail, "availability_files": files})
+    return out
+
+
 def _fetched_entry(rec: dict, recid: str, dest: Path, raw_dir: Path, units: list[dict],
-                   availability: dict, availability_files: dict) -> dict:
+                   heavy: list[tuple[str, str]]) -> dict:
     """Build the fetched-manifest entry for a staged record."""
     # Store paths RELATIVE to raw_dir. Absolute paths break the manifest as soon as
     # staged data is moved between cluster scratch areas; parse resolves these back
     # against its --raw-dir. calc_id keys off the primary path relative to
     # <local_dir>/extracted, so the recid prefix cancels and the id is unchanged.
     rel_units = [{k: str(Path(v).relative_to(raw_dir)) for k, v in u.items()} for u in units]
+
+    # Availability is scoped PER CALC (see _calc_availability). ``calc_availability`` aligns
+    # index-for-index with ``calc_units`` and is what parse now reads; the record-level
+    # ``availability`` union is retained for backward compatibility (status/report tooling,
+    # and older parse builds that key off it).
+    per_calc = _calc_availability(units, dest, heavy)
+    union = {k: False for k in _AVAILABILITY}
+    union_files: dict[str, str] = {}
+    for hp, kind in heavy:
+        union[kind] = True
+        union_files.setdefault(kind, hp)
 
     return {
         "recid": recid,
@@ -1614,8 +1729,10 @@ def _fetched_entry(rec: dict, recid: str, dest: Path, raw_dir: Path, units: list
         "local_dir": str(dest.relative_to(raw_dir)),
         "n_calc_units": len(units),
         "calc_units": rel_units,
-        "availability": availability,
-        "availability_files": availability_files,
+        "availability": union,
+        "availability_files": union_files,
+        "calc_availability": [c["availability"] for c in per_calc],
+        "calc_availability_files": [c["availability_files"] for c in per_calc],
     }
 
 

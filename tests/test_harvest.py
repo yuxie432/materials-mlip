@@ -36,11 +36,13 @@ from zenodo_harvest.fetch import (
     _MULTIPART_RE,
     _PARSE_RE,
     _archive_subdir,
+    _concept_rel,
     _extract_tar,
     _extract_tar_zst,
     _extract_zip,
     _fetch_zip_targeted,
     _find_calc_units,
+    _heavy_kind,
     _is_archive,
     _unit_role,
     _unit_tag,
@@ -3101,3 +3103,100 @@ def test_read_shard_frame_meta_tolerates_truncated_tail(tmp_path):
     metas, truncated = read_shard_frame_meta_lenient(shard)
     assert truncated is True
     assert metas == [("zenodo:1:a#0", {"Si"})]   # the complete frame kept, torn tail dropped
+
+
+# --------------------------------------------------------------------------- #
+# Per-calc availability scoping (fix #1). Heavy outputs (CHGCAR/DOSCAR/…) are   #
+# attributed to the calc whose primary sits in the SAME directory, not OR'd    #
+# across every calc in the record (the historical over-count).                 #
+# --------------------------------------------------------------------------- #
+
+def test_heavy_kind_and_concept_rel():
+    assert _heavy_kind("CHGCAR") == "charge_density"
+    assert _heavy_kind("DOSCAR") == "dos"
+    assert _heavy_kind("EIGENVAL") == "eigenvalues"
+    assert _heavy_kind("vasprun.xml") is None       # a VASP primary is not a heavy output
+    # conceptual path = base_rel joined with the member name, normalised to posix
+    assert _concept_rel("data", "run1/CHGCAR") == "data/run1/CHGCAR"
+    assert _concept_rel("", "CHGCAR") == "CHGCAR"    # directly-exposed file, no archive subdir
+    assert _concept_rel("a", "./b/CHGCAR") == "a/b/CHGCAR"
+    # a member escaping the extracted root (zip-slip-style) is rejected
+    assert _concept_rel("a", "../../etc/passwd") is None
+    assert _concept_rel("", "/abs/CHGCAR") is None
+
+
+def test_fetch_record_availability_scoped_per_calc(tmp_path):
+    # TWO calcs in separate dirs of one archive: CHGCAR sits only beside run1, DOSCAR only
+    # beside run2. Each heavy file must attach to ITS OWN calc, not to both.
+    members = [
+        ("run1/vasprun.xml", b"<modeling></modeling>"), ("run1/OUTCAR", b"o1"),
+        ("run1/CHGCAR", b"charge" * 100),
+        ("run2/vasprun.xml", b"<modeling></modeling>"), ("run2/OUTCAR", b"o2"),
+        ("run2/DOSCAR", b"dos" * 100),
+    ]
+    blob = _zip_with(members)
+    entry = _fetch_whole(_zip_rec("9001", "data.zip", blob),
+                         _MultiFileStreamSession({"http://x/data.zip": blob}), tmp_path / "raw")
+    assert entry is not None and entry["n_calc_units"] == 2
+    # record-level union still sees both (backward-compatible field)
+    assert entry["availability"]["charge_density"] is True
+    assert entry["availability"]["dos"] is True
+    # per-calc, aligned index-for-index with calc_units
+    ca = entry["calc_availability"]
+    assert len(ca) == len(entry["calc_units"]) == 2
+    by_dir = {Path(u["dir"]).name: ca[i] for i, u in enumerate(entry["calc_units"])}
+    assert by_dir["run1"]["charge_density"] is True and by_dir["run1"]["dos"] is False
+    assert by_dir["run2"]["dos"] is True and by_dir["run2"]["charge_density"] is False
+    # heavy outputs are recorded, never staged
+    raw = [p.name for p in (tmp_path / "raw").rglob("*") if p.is_file()]
+    assert "CHGCAR" not in raw and "DOSCAR" not in raw
+    # calc_availability_files points at the conceptual per-calc location
+    caf = entry["calc_availability_files"]
+    assert caf[[Path(u["dir"]).name for u in entry["calc_units"]].index("run1")]["charge_density"] \
+        == "data/run1/CHGCAR"
+
+
+def test_targeted_zip_availability_scoped_per_calc(tmp_path, monkeypatch):
+    # Same per-calc scoping via the targeted (HTTP-Range) zip path: the central-directory
+    # enumeration lists every member, so heavy files are scoped by directory there too.
+    monkeypatch.setattr(fetch_mod, "ZIP_STREAM_MIN_SKIP_BYTES", 100_000)
+    members = [
+        ("run1/vasprun.xml", b"<modeling>" + b"V" * 2000 + b"</modeling>"),
+        ("run1/OUTCAR", b"outcar " * 300), ("run1/CHGCAR", os.urandom(1 << 20)),
+        ("run2/vasprun.xml", b"<modeling>" + b"W" * 2000 + b"</modeling>"),
+        ("run2/OUTCAR", b"outcar " * 300),
+    ]
+    blob = _zip_with(members)
+    rec = {"recid": "9002", "files": [{"key": "data.zip", "download": "http://x/data.zip",
+                                       "size": len(blob),
+                                       "checksum": "md5:" + md5(blob).hexdigest()}]}
+    sess = _ZipRangeSession({"http://x/data.zip": blob})
+    rej = RejectionLogger(tmp_path / "rej.jsonl")
+    entry = fetch_record(rec, sess, tmp_path / "raw", max_bytes=None, rej=rej)
+    rej.close()
+    assert entry is not None and entry["n_calc_units"] == 2
+    by_dir = {Path(u["dir"]).name: entry["calc_availability"][i]
+              for i, u in enumerate(entry["calc_units"])}
+    assert by_dir["run1"]["charge_density"] is True
+    assert by_dir["run2"]["charge_density"] is False          # NOT over-counted onto run2
+    raw = [p.name for p in (tmp_path / "raw").rglob("*") if p.is_file()]
+    assert "CHGCAR" not in raw
+
+
+def test_fetch_record_nested_archive_availability_scoped_per_calc(tmp_path):
+    # A zip of two per-run tarballs; CHGCAR lives inside run1's tarball only. The recursion
+    # must record the nested heavy file at its conceptual location and scope it to run1.
+    t1 = _tar_gz_bytes([("vasprun.xml", b"<modeling>V</modeling>"), ("OUTCAR", b"o1"),
+                        ("CHGCAR", b"heavy" * 100)])
+    t2 = _tar_gz_bytes([("vasprun.xml", b"<modeling>W</modeling>"), ("OUTCAR", b"o2")])
+    outer = _zip_with([("run1.tar.gz", t1), ("run2.tar.gz", t2)])
+    entry = _fetch_whole(_zip_rec("9003", "outer.zip", outer),
+                         _MultiFileStreamSession({"http://x/outer.zip": outer}), tmp_path / "raw")
+    assert entry is not None and entry["n_calc_units"] == 2
+    charge = [entry["calc_availability"][i]["charge_density"]
+              for i, u in enumerate(entry["calc_units"])
+              if "run1.tar.gz" in u["dir"]]
+    other = [entry["calc_availability"][i]["charge_density"]
+             for i, u in enumerate(entry["calc_units"])
+             if "run2.tar.gz" in u["dir"]]
+    assert charge == [True] and other == [False]              # scoped to run1's sub-archive

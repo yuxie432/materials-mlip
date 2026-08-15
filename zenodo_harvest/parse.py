@@ -364,6 +364,100 @@ def _calc_parameters(vasprun: Any) -> dict:
     }
 
 
+# --- embedded electronic-structure availability probe ---------------------------------
+# DOS and eigenvalues (and PROCAR-style projections) are frequently written straight INTO
+# vasprun.xml / vaspout.h5, with no standalone DOSCAR/EIGENVAL/PROCAR file for the fetch
+# stage's filename scan to catch — so those calcs were flagged False despite the data being
+# present (the availability under-count in the metadata-gaps memo). These probes look for
+# the data IN the primary output. They deliberately do NOT parse it (pymatgen is called with
+# parse_dos/parse_eigen off precisely because the arrays are large): the vasprun probe is a
+# streaming byte scan for the opening tags (holds ~one chunk, never the arrays), and the
+# vaspout probe only lists the top-level ``/results`` group names. Both are best-effort — any
+# read error yields all-False, leaving the fetch-stage flags untouched. Results are OR'd into
+# availability (they only ever turn a flag ON), so they refine, never contradict, the scan.
+_VASPRUN_ES_TAGS = {b"<dos": "dos", b"<eigenvalues": "eigenvalues", b"<projected": "projected"}
+
+
+def _scan_vasprun_electronic(path: str) -> dict:
+    """Stream a vasprun.xml (optionally gz/bz2/xz) and report which of dos / eigenvalues /
+    projected it embeds, by finding their opening tags without building the XML tree.
+
+    ``<dos>``/``<eigenvalues>``/``<projected>`` appear only as element tags in vasprun.xml
+    (attribute *values* are quoted and closing tags read ``</dos`` etc.), so a substring
+    search for ``<dos`` / ``<eigenvalues`` / ``<projected`` is unambiguous. Reads in 1 MiB
+    chunks, carrying a small tail so a tag split across a chunk boundary is still found, and
+    stops as soon as all three are seen. Peak memory is one chunk regardless of file size.
+    """
+    import bz2
+    import gzip
+    import lzma
+
+    found = {"dos": False, "eigenvalues": False, "projected": False}
+    openers: dict[str, Any] = {".gz": gzip.open, ".bz2": bz2.open,
+                               ".xz": lzma.open, ".lzma": lzma.open}
+    opener = next((fn for suf, fn in openers.items() if path.lower().endswith(suf)), open)
+    try:
+        with opener(path, "rb") as fh:
+            tail = b""
+            while True:
+                chunk = fh.read(1 << 20)
+                if not chunk:
+                    break
+                buf = tail + chunk
+                for pat, kind in _VASPRUN_ES_TAGS.items():
+                    if not found[kind] and pat in buf:
+                        found[kind] = True
+                if all(found.values()):
+                    break
+                tail = buf[-16:]  # > len(longest tag) - 1, to catch a boundary-split tag
+    except OSError as exc:
+        logger.debug("vasprun electronic-structure probe failed for %s: %s", path, exc)
+    return found
+
+
+def _probe_vaspout_electronic(path: str) -> dict:
+    """Report which of dos / eigenvalues / projected a vaspout.h5 embeds, from the names of
+    the ``/results`` group's immediate children (cheap — no dataset is read).
+
+    VASP's HDF5 output nests electronic-structure results under ``/results`` (e.g.
+    ``electron_dos``, ``electron_eigenvalues``, projector groups). A fuzzy substring match on
+    the child names is used because the exact spelling varies by VASP version, and vaspout is
+    a tiny fraction of the corpus (~345 calcs) so a defensive probe is enough. Needs h5py; if
+    it is absent or the file cannot be opened, returns all-False (fetch-stage flags stand).
+    """
+    found = {"dos": False, "eigenvalues": False, "projected": False}
+    try:
+        import h5py  # type: ignore
+    except ImportError:  # pragma: no cover - h5py is optional
+        return found
+    try:
+        with h5py.File(path, "r") as f:
+            grp = f["results"] if "results" in f else f
+            names = [str(k).lower() for k in grp.keys()]
+            found["dos"] = any("dos" in n for n in names)
+            found["eigenvalues"] = any("eigen" in n for n in names)
+            found["projected"] = any("proj" in n for n in names)
+    except Exception as exc:  # noqa: BLE001 - h5 layouts drift; probe is best-effort
+        logger.debug("vaspout electronic-structure probe failed for %s: %s", path, exc)
+    return found
+
+
+def _embedded_electronic_structure(vasprun: str | None, vaspout: str | None) -> dict:
+    """Which of dos / eigenvalues / projected are embedded in a unit's primary output.
+
+    Probes the vasprun.xml when present, else the vaspout.h5 (an OUTCAR embeds none of these
+    the way a vasprun does — DOS/EIGENVAL there are separate files, caught by the scan). Uses
+    the ORIGINAL primary path even when ``--max-primary-bytes`` trimmed it from the parse
+    unit: the probe is a streaming scan and never holds the trajectory in memory, so it is
+    safe on a file too large for pymatgen. Returns all-False when there is no vasprun/vaspout.
+    """
+    if vasprun:
+        return _scan_vasprun_electronic(vasprun)
+    if vaspout:
+        return _probe_vaspout_electronic(vaspout)
+    return {"dos": False, "eigenvalues": False, "projected": False}
+
+
 def _site_props_from_outcar(outcar_path: str, natoms: int) -> dict:
     """Per-atom total charge / magnetic moment from an OUTCAR (end-of-run only)."""
     out: dict = {"magmoms": None, "charges": None}
@@ -660,6 +754,10 @@ def parse_calc_unit(unit: dict, base_meta: dict, availability: dict,
     # OUTCAR), so calc_id must NOT depend on which primary survives trimming.
     calc_id = _calc_id(unit, base_meta)
     source = _source_of(base_meta)  # frame `source` tag; matches calc_id's prefix
+    # Primary paths for the embedded electronic-structure probe, captured BEFORE any
+    # oversized-primary trim: the probe streams the file (no trajectory in RAM), so it is
+    # safe even on a primary too large for pymatgen, and it must not lose the vasprun to a trim.
+    probe_vasprun, probe_vaspout = unit.get("vasprun"), unit.get("vaspout")
     if max_primary_bytes:
         over = _oversized_primaries(unit, max_primary_bytes)
         if over:
@@ -729,8 +827,16 @@ def parse_calc_unit(unit: dict, base_meta: dict, availability: dict,
     if n_dropped:
         rej.reject("parse", calc_id, "frames_no_energy", dropped=n_dropped, kept=len(frames))
 
-    # merge availability (from fetch listing) with what the parser could confirm
+    # merge availability (from the fetch listing — now per-calc, scoped to this calc's
+    # directory) with what the parser can confirm from the primary output itself.
     avail = dict(availability)
+    # DOS / eigenvalues / projected data embedded IN the vasprun.xml / vaspout.h5 (no
+    # standalone DOSCAR/EIGENVAL/PROCAR file for the fetch scan to see) — OR it in so those
+    # calcs are no longer under-counted. Only ever turns a flag ON.
+    embedded = _embedded_electronic_structure(probe_vasprun, probe_vaspout)
+    for kind, present in embedded.items():
+        if present:
+            avail[kind] = True
     avail["spin_density"] = avail.get("charge_density", False) and meta["calc_parameters"].get("spin_polarized", False)
     avail["magnetization"] = meta.get("site_magmoms_present", False) or meta["calc_parameters"].get("spin_polarized", False)
     meta["availability"] = avail
@@ -1103,7 +1209,11 @@ def parse(
                 stats["records"] += 1
                 base_meta = {"provenance": rec["provenance"],
                              "_extracted_root": str(_resolve(raw_dir, rec["local_dir"]) / "extracted")}
-                for unit in rec["calc_units"]:
+                # Per-calc availability (fetch now scopes heavy-output flags to each calc's
+                # own directory). Aligned index-for-index with calc_units; fall back to the
+                # record-level union for older manifests that predate calc_availability.
+                calc_avails = rec.get("calc_availability")
+                for idx, unit in enumerate(rec["calc_units"]):
                     stats["calc_units"] += 1
                     # Resolve stored (relative, or legacy absolute) paths against raw_dir.
                     unit = {k: str(_resolve(raw_dir, v)) for k, v in unit.items()}
@@ -1114,10 +1224,13 @@ def parse(
                     if calc_id in rejected_calc_ids:  # known-bad; don't re-run the parser
                         stats["skipped_rejected"] += 1
                         continue
+                    availability = (calc_avails[idx]
+                                    if isinstance(calc_avails, list) and idx < len(calc_avails)
+                                    else rec.get("availability", {}))
                     # Name the calc BEFORE parsing so a slow/hung parse is identifiable live
                     # (`tail -f` the log) and by the last line if the job is killed mid-parse.
                     logger.info("parsing %s", calc_id)
-                    result = _parse_one(unit, base_meta, rec.get("availability", {}),
+                    result = _parse_one(unit, base_meta, availability,
                                         rej, max_primary_bytes, parse_timeout_s, calc_id)
                     if not result:
                         continue

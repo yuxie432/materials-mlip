@@ -97,6 +97,42 @@ def test_vasprun_frames_labels_and_scf_dE(tmp_path):
     assert f.info["scf_dE"] == pytest.approx(expected_dE)
 
 
+def test_embedded_dos_eigenvalues_availability(tmp_path):
+    # vasprun_dfpt.xml embeds <dos> and <eigenvalues> but ships NO DOSCAR/EIGENVAL file, so
+    # the fetch-stage filename scan would flag them False. The parser's content probe (fix #2)
+    # must recover them, turning the flags ON even though the incoming availability is empty.
+    unit, base_meta = _stage(tmp_path, "es1", "calc", "vasprun_dfpt.xml", "vasprun")
+    rej = RejectionLogger(tmp_path / "rej.jsonl")
+    _frames, meta = parse_calc_unit(unit, base_meta, {}, rej)
+    rej.close()
+    assert meta["availability"]["dos"] is True            # embedded in vasprun.xml
+    assert meta["availability"]["eigenvalues"] is True     # embedded in vasprun.xml
+    # charge_density has neither a CHGCAR file nor an embedded signal -> stays False
+    assert meta["availability"].get("charge_density", False) is False
+
+
+def test_embedded_probe_only_ors_never_removes_incoming_flags(tmp_path):
+    # The probe must only turn flags ON: an incoming True (e.g. a CHGCAR the fetch scan saw)
+    # survives, and dos/eigenvalues get added on top from the embedded content.
+    unit, base_meta = _stage(tmp_path, "es2", "calc", "vasprun_dfpt.xml", "vasprun")
+    rej = RejectionLogger(tmp_path / "rej.jsonl")
+    _frames, meta = parse_calc_unit(unit, base_meta, {"charge_density": True}, rej)
+    rej.close()
+    assert meta["availability"]["charge_density"] is True   # incoming flag preserved
+    assert meta["availability"]["dos"] is True              # embedded flag added
+
+
+def test_outcar_only_calc_gets_no_false_embedded_flags(tmp_path):
+    # An OUTCAR-only calc has no vasprun/vaspout to probe, so dos/eigenvalues stay whatever
+    # the (filename-based) incoming availability said — the probe must not fabricate them.
+    unit, base_meta = _stage(tmp_path, "es3", "run", "OUTCAR_example_1", "outcar")
+    rej = RejectionLogger(tmp_path / "rej.jsonl")
+    _frames, meta = parse_calc_unit(unit, base_meta, {}, rej)
+    rej.close()
+    assert meta["availability"].get("dos", False) is False
+    assert meta["availability"].get("eigenvalues", False) is False
+
+
 # --------------------------------------------------------------------------- #
 # OUTCAR path: the electronic_converged round-trip regression (#1)            #
 # --------------------------------------------------------------------------- #
