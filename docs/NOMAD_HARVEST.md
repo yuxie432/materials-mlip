@@ -279,7 +279,7 @@ so both sources produce one schema-identical dataset. Nothing in `zenodo_harvest
 |---|---|---|
 | 0 discover | `discover.py` (keyword search) | `client.iter_entries` keyset-paginates `entries/query` (the direct-upload VASP-DFT query); `harvest.discover_candidates` license-gates + Zenodo-dedups inline and writes a **slimmed** keep-list. ~700 requests total — trivial. |
 | 1 triage | `triage.py` (peek-into-zip) | **folded into discover** — no zip-peek. `is_reusable_license` (reused) + `references`→Zenodo dedup, both audited to a rejection log. |
-| 2 fetch | `fetch.py` (download+extract archives) | `harvest.fetch_candidates` → per entry, `rawdir` then `download_raw_file` the vasprun under a **canonical name** (handles `.bz2`/`.gz` + odd naming); groups via the shared `_find_calc_units`; writes `nomad_fetched.jsonl`. Heavy outputs → availability only, never fetched. **Now production-paced:** reuses the shared `StagingBudget` (bytes **and** inodes) as the disk/inode valve, `--workers` concurrent downloads, resume by manifest; returns `stopped_disk_budget` so the pipeline can reclaim + resume. |
+| 2 fetch | `fetch.py` (download+extract archives) | `harvest.fetch_candidates` → per entry, `rawdir` then `download_raw_file` the vasprun under a **canonical name** (handles `.bz2`/`.gz` + odd naming); groups via the shared `_find_calc_units`; writes `nomad_fetched.jsonl`. Heavy outputs → availability only, never fetched — with **availability taken PRIMARILY from NOMAD's parsed metadata** (`results.properties.available_properties`: `dos_electronic[_new]`→`dos`, `band_structure_electronic`→`eigenvalues`; `nomad_metadata_availability`), OR'd over the filename scan (fallback for charge-density/wavefunction/…) and, at parse, the shared embedded-vasprun DOS/eigen/projected probe. `available_properties` is kept by `slim_candidate`; the unreliable `trajectory` flag is not mapped. **Now production-paced:** reuses the shared `StagingBudget` (bytes **and** inodes) as the disk/inode valve, `--workers` concurrent downloads, resume by manifest; returns `stopped_disk_budget` so the pipeline can reclaim + resume. |
 | pipeline 2-4 | `pipeline.py` | **reused** — `nomad_harvest.cli pipeline` splits the keep-list into parts and drives the shared `run_pipeline` (fetch batch *i+1* ∥ parse+purge batch *i*), disk-paced. One command for a long CSD3 job (`scripts/csd3/nomad/20_pipeline.sh`). |
 | 3 parse | `parse.py` | **reused unmodified**: `python -m zenodo_harvest.cli parse --in nomad_fetched.jsonl --dataset-dir data/dataset/nomad`. |
 | 4 store | `store.py` | **reused** — `REF_energy/forces/stress` + `metadata.jsonl`. |
@@ -336,8 +336,10 @@ constraint is **NOMAD's request rate**, not CSD3, disk, bandwidth, or parse (par
   (`dft_charge`/`dft_magmom`) come only from an OUTCAR, so they are recorded only for the ~7.5%
   OUTCAR-mainfile entries (or any run with `--want-outcar`). For the ~92.5% vasprun entries they are
   absent — but this is the "if available" clause of the storage spec, and the **availability** of
-  magnetization/charge-density/spin-density is still recorded for every entry (from the file listing
-  + ISPIN). Wholesale OUTCAR is ~170 TB (§5), which is why it is excluded by default.
+  DOS/eigenvalues (from NOMAD's parsed `available_properties`, the authoritative primary source)
+  and of magnetization/charge-density/spin-density (from the rawdir file listing + ISPIN, plus the
+  shared parser's embedded-vasprun probe for DOS/eigen/projected) is still recorded for every entry.
+  Wholesale OUTCAR is ~170 TB (§5), which is why it is excluded by default.
 
 **Complementary path — OPTIMADE.** NOMAD implements OPTIMADE at
 `https://nomad-lab.eu/prod/v1/optimade/v1` (18.8M structures). Standardized

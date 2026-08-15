@@ -73,6 +73,7 @@ def slim_candidate(entry: dict[str, Any]) -> dict[str, Any]:
     method = results.get("method") or {}
     sim = method.get("simulation") or {}
     dft = sim.get("dft") or {}
+    props = results.get("properties") or {}
     return {
         "entry_id": entry.get("entry_id"),
         "upload_id": entry.get("upload_id"),
@@ -93,6 +94,10 @@ def slim_candidate(entry: dict[str, Any]) -> dict[str, Any]:
                        "simulation": {"program_name": sim.get("program_name"),
                                       "program_version": sim.get("program_version"),
                                       "dft": {"xc_functional_names": dft.get("xc_functional_names")}}},
+            # available_properties is NOMAD's authoritative list of derived properties the
+            # normalizer found for this entry — the primary source of DOS/eigenvalue
+            # availability (see nomad_metadata_availability). Kept slim (just this list).
+            "properties": {"available_properties": props.get("available_properties") or []},
         },
     }
 
@@ -103,6 +108,38 @@ def normalize_doi(text: str) -> str | None:
         return None
     m = re.search(r"10\.\d{4,9}/[^\s\"'<>]+", str(text).strip(), re.IGNORECASE)
     return m.group(0).rstrip(".").lower() if m else None
+
+
+# NOMAD normalizer available-property -> our availability flag. NOMAD's parsed metadata is
+# the AUTHORITATIVE source of electronic-structure availability (mentor/memo): for VASP-DFT
+# direct uploads it carries DOS (`dos_electronic_new` ~84%, legacy `dos_electronic` ~7%) and,
+# rarely, an electronic band structure (`band_structure_electronic` ~0.4% — the eigenvalue
+# signal). Charge density / wavefunction / local potential / ELF / PROCAR-projections and
+# magnetization are NOT in NOMAD's metadata, so those fall back to the filename scan of the
+# rawdir listing (+ the shared parser's embedded-vasprun probe for dos/eigenvalues/projected).
+# The unreliable `trajectory` available-property is deliberately NOT mapped (docs/NOMAD_HARVEST.md).
+_NOMAD_AVAIL_FROM_PROP = {
+    "dos_electronic_new": "dos",
+    "dos_electronic": "dos",
+    "band_structure_electronic": "eigenvalues",
+    "eigenvalues_electronic": "eigenvalues",
+}
+
+
+def nomad_metadata_availability(entry: dict[str, Any]) -> dict[str, bool]:
+    """Availability flags derivable from an entry's NOMAD metadata (authoritative).
+
+    Reads ``results.properties.available_properties`` (preserved by :func:`slim_candidate`)
+    and maps the electronic-structure entries to our flags. Returns only the flags NOMAD's
+    metadata actually asserts True; everything else is left to the filename fallback in
+    :func:`build_fetched_entry`. Empty dict when the field is absent (older keep-lists)."""
+    props = (entry.get("results") or {}).get("properties") or {}
+    out: dict[str, bool] = {}
+    for ap in props.get("available_properties") or []:
+        kind = _NOMAD_AVAIL_FROM_PROP.get(str(ap))
+        if kind:
+            out[kind] = True
+    return out
 
 
 def references_of(entry: dict[str, Any]) -> list[str]:
@@ -354,7 +391,17 @@ def build_fetched_entry(entry: dict[str, Any], raw_dir: Path, dest: Path,
         return None
     rel_units = [{k: str(Path(v).relative_to(raw_dir)) for k, v in u.items()} for u in units]
     names = [f.get("path") or "" for f in (rawdir_listing.get("files") or [])]
+    # Availability: NOMAD's parsed metadata is the PRIMARY source (authoritative for DOS /
+    # eigenvalues — see nomad_metadata_availability); the filename scan of the rawdir listing
+    # is the FALLBACK for everything NOMAD does not index (charge density / wavefunction /
+    # local potential / ELF / projections). OR the two so neither undercounts the other, and
+    # the shared parser adds any dos/eigenvalues/projected embedded in the vasprun on top. A
+    # NOMAD entry is exactly one calc (one mainfile -> one entry), so this is already per-calc.
     avail = _safe_members(names)
+    for kind, present in nomad_metadata_availability(entry).items():
+        if present:
+            avail["availability"][kind] = True
+            avail["availability_files"].setdefault(kind, "nomad:available_properties")
     refs = references_of(entry)
     doi = next((normalize_doi(r) for r in refs if normalize_doi(r)), None)
     results = entry.get("results") or {}

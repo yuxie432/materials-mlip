@@ -37,6 +37,7 @@ from nomad_harvest.harvest import (
     choose_primary,
     fetch_candidates,
     fetch_candidates_bulk,
+    nomad_metadata_availability,
     normalize_doi,
     raw_path_rel,
     references_of,
@@ -249,6 +250,67 @@ def test_build_fetched_entry_shape(tmp_path):
     assert not (calc / "CHGCAR").exists()
 
 
+# --------------------------------------------------------------------------- #
+# NOMAD availability from parsed metadata (fix #3). available_properties is the #
+# PRIMARY source for DOS/eigenvalues; the filename scan is the fallback for the #
+# rest; the shared parser's embedded probe adds any dos/eigen in the vasprun.   #
+# --------------------------------------------------------------------------- #
+
+def test_nomad_metadata_availability_mapping():
+    def av(props):
+        return nomad_metadata_availability(
+            {"results": {"properties": {"available_properties": props}}})
+    assert av(["dos_electronic_new"]) == {"dos": True}
+    assert av(["dos_electronic"]) == {"dos": True}          # legacy spelling
+    assert av(["band_structure_electronic"]) == {"eigenvalues": True}
+    assert av(["dos_electronic_new", "band_structure_electronic"]) == {
+        "dos": True, "eigenvalues": True}
+    # the unreliable trajectory flag and unrelated properties are NOT mapped
+    assert av(["geometry_optimization", "trajectory", "band_gap"]) == {}
+    assert av([]) == {}
+    # absent field (older keep-lists) -> nothing asserted, fall back to the filename scan
+    assert nomad_metadata_availability({"entry_id": "x"}) == {}
+
+
+def test_build_fetched_entry_dos_from_metadata_without_doscar_file(tmp_path):
+    # A NOMAD entry whose metadata says DOS but whose upload has NO DOSCAR file: the
+    # filename scan alone would flag dos False (the under-count). NOMAD's metadata is the
+    # authoritative primary source, so dos must be True; eigenvalues stays False (no band
+    # structure), and charge_density stays False (no CHGCAR file).
+    raw = tmp_path / "raw"
+    calc = raw / "E" / "extracted" / "calc"
+    calc.mkdir(parents=True)
+    (calc / "vasprun.xml").write_text("<modeling/>")
+    entry = {
+        "entry_id": "E", "upload_id": "U",
+        "results": {"material": {"elements": ["Si"]},
+                    "properties": {"available_properties": ["dos_electronic_new"]}},
+    }
+    rd = {"mainfile": "x/vasprun.xml", "files": [{"path": "x/vasprun.xml", "size": 10}]}
+    fe = build_fetched_entry(entry, raw, raw / "E", rd)
+    assert fe is not None
+    assert fe["availability"]["dos"] is True                       # from NOMAD metadata
+    assert fe["availability"]["eigenvalues"] is False              # no band structure
+    assert fe["availability"]["charge_density"] is False           # no CHGCAR file
+    assert fe["availability_files"]["dos"] == "nomad:available_properties"
+
+
+def test_build_fetched_entry_metadata_and_filename_availability_union(tmp_path):
+    # Metadata (band structure -> eigenvalues) OR filename scan (CHGCAR -> charge_density):
+    # both sources contribute, neither is dropped.
+    raw = tmp_path / "raw"
+    calc = raw / "E" / "extracted" / "calc"
+    calc.mkdir(parents=True)
+    (calc / "vasprun.xml").write_text("<modeling/>")
+    entry = {"entry_id": "E", "upload_id": "U",
+             "results": {"properties": {"available_properties": ["band_structure_electronic"]}}}
+    rd = {"mainfile": "x/vasprun.xml",
+          "files": [{"path": "x/vasprun.xml", "size": 10}, {"path": "x/CHGCAR", "size": 99}]}
+    fe = build_fetched_entry(entry, raw, raw / "E", rd)
+    assert fe["availability"]["eigenvalues"] is True               # from metadata
+    assert fe["availability"]["charge_density"] is True            # from the filename scan
+
+
 def test_slim_candidate_keeps_used_fields_and_drops_bulk():
     entry = {
         "entry_id": "E", "upload_id": "U", "mainfile": "a/vasprun.xml",
@@ -260,11 +322,16 @@ def test_slim_candidate_keeps_used_fields_and_drops_bulk():
                     "method": {"method_name": "DFT",
                                "simulation": {"program_name": "VASP", "program_version": "5.4",
                                               "dft": {"xc_functional_names": ["GGA_X_PBE"]}}},
-                    "properties": {"available_properties": ["x"] * 50}},
+                    "properties": {"available_properties": ["dos_electronic_new"],
+                                   "electronic": {"band_gap": [1.0] * 50},  # bulky -> dropped
+                                   "structures": {"x": [1] * 50}}},         # bulky -> dropped
     }
     slim = slim_candidate(entry)
     assert "quantities" not in slim
-    assert "properties" not in slim["results"]         # bulky sub-tree dropped
+    # `properties` is kept but SLIMMED to just available_properties (the availability source);
+    # its bulky electronic/structures sub-trees are dropped.
+    assert set(slim["results"]["properties"]) == {"available_properties"}
+    assert slim["results"]["properties"]["available_properties"] == ["dos_electronic_new"]
     assert slim["results"]["material"]["elements"] == ["Si"]
     assert slim["results"]["method"]["simulation"]["program_name"] == "VASP"
     assert slim["datasets"] == [{"doi": "10.5281/zenodo.1"}]
