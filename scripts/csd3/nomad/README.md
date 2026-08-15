@@ -29,7 +29,8 @@ export SBATCH_ACCOUNT=<MYGROUP>-SL3-CPU
 export ZENODO_HARVEST_DATA=/rds/user/$USER/hpc-work/zenodo   # same scratch root as Zenodo
 mkdir -p logs
 
-# Scope the bounded sample (see docs/NOMAD_HARVEST.md — the full 7.1M is a multi-week campaign):
+# MAX_ENTRIES scopes an OPTIONAL bounded slice (an early checkpoint); the full 7.1M is Zenodo-
+# scale and can run as one self-resubmitting campaign — see docs/NOMAD_HARVEST.md:
 MAX_ENTRIES=200000 sbatch --parsable scripts/csd3/nomad/10_discover.sh      # ELEMENTS="Ti O" to focus
 # ...then the overlapped, disk-paced pipeline (queue it to wait on discover):
 DISC=<jobid-from-above>

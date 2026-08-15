@@ -30,7 +30,9 @@ produce a byte-identical ``parameters`` block.
 
 from __future__ import annotations
 
+import bz2
 import gzip
+import lzma
 import logging
 from pathlib import Path
 from typing import Any
@@ -38,6 +40,13 @@ from typing import Any
 from .outcar_params import EFFECTIVE_TAGS
 
 logger = logging.getLogger(__name__)
+
+# Compressed-primary openers (binary, for lxml). VASP outputs are staged verbatim, so a
+# ``vasprun.xml`` may arrive gzip/bzip2/xz/lzma-compressed — the same set the OUTCAR header
+# reader handles. Feeding a still-compressed file to the XML parser fails with a bogus
+# "Start tag expected" at line 1, so every suffix here MUST be decompressed on the way in.
+_OPENERS: dict[str, Any] = {".gz": gzip.open, ".bz2": bz2.open,
+                            ".xz": lzma.open, ".lzma": lzma.open}
 
 # vasprun.xml's <parameters> block internal name -> the canonical INCAR name we store under
 # (EFFECTIVE_TAGS is keyed by INCAR names). Only the cutoff differs between the two.
@@ -89,14 +98,15 @@ def parse_vasprun_parameters(path: str | Path) -> dict[str, Any] | None:
     Streams the file with ``iterparse`` and stops at the first ``<calculation>`` start event
     (the ionic trajectory), so a multi-GB AIMD vasprun costs the same as a single-point one.
     Parses the block with pymatgen's own ``_parse_params`` for exact parity with
-    ``vasprun.parameters``. Handles plain or gzip files. Returns ``None`` if the file is
-    unreadable or carries no ``<parameters>`` block (caller leaves the record as-is).
+    ``vasprun.parameters``. Handles plain or gzip/bzip2/xz/lzma files. Returns ``None`` if the
+    file is unreadable or carries no ``<parameters>`` block (caller leaves the record as-is).
     """
     from lxml import etree                                   # pymatgen's own XML backend
     from pymatgen.io.vasp.outputs import Vasprun
 
     p = str(path)
-    opener = gzip.open if p.lower().endswith(".gz") else open
+    low = p.lower()
+    opener = next((fn for suf, fn in _OPENERS.items() if low.endswith(suf)), open)
     try:
         with opener(p, "rb") as fh:
             for event, elem in etree.iterparse(fh, events=("start", "end"), huge_tree=True):

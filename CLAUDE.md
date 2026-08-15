@@ -324,8 +324,12 @@ tail is ~170 TB).
   drives it.
 - CSD3 batch templates: `scripts/csd3/nomad/{10_discover,20_pipeline}.sh` (mirror the Zenodo
   templates: single-stream discover, then the overlapped disk-paced pipeline, self-resubmitting).
-  Full harvest of 7.1M is a multi-week, many-job campaign gated by NOMAD's fetch rate (not
-  CSD3) — scope with `--max-entries`; email `support@nomad-lab.eu` before a large pull.
+  Full harvest of 7.1M direct uploads is **Zenodo-scale**: the bulk fetch collapses the request
+  count (~47k, not 14.2M) so it is **bandwidth-bound, not fetch-rate-bound** — a single
+  self-resubmitting campaign of ~1–2 weeks wall-clock IF NOMAD sustains Zenodo-like throughput
+  (~50 MB/s). Slicing with `--max-entries` is OPTIONAL (an early quality/dedup checkpoint), not
+  required. Contacting `support@nomad-lab.eu` is NOT required — only to request a rate-limit
+  exemption if NOMAD's throughput is the bottleneck (measure it on a ~10k-entry batch first).
 - Offline tests: `tests/test_nomad.py` (network-free — query builder, keyset paging, backoff,
   dedup, staging-name/primary logic, and the fetch valve/workers/resume against an in-memory
   client). Live path: `python -m nomad_harvest.cli smoke -n 12`.

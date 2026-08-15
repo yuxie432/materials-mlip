@@ -19,8 +19,10 @@
 # (nomad_harvest) is source-specific. Writes to its OWN dataset dir (dataset/nomad); fold
 # it into the combined dataset later with `zenodo_harvest.cli merge-datasets`.
 #
-# The full 7.1M direct-upload set is a multi-week, many-job campaign (fetch is rate-limited
-# by NOMAD, not by CSD3 — see docs/NOMAD_HARVEST.md). Scope with 10_discover.sh's MAX_ENTRIES.
+# The full 7.1M direct-upload set is Zenodo-scale: the bulk fetch is bandwidth-bound, not
+# fetch-rate-bound (~47k requests total — see docs/NOMAD_HARVEST.md), so at Zenodo-like
+# throughput this is a ~1-2 week single self-resubmitting campaign, NOT a multi-job one.
+# Scoping with 10_discover.sh's MAX_ENTRIES is optional (an early checkpoint), not required.
 # Everything is resumable, so re-submit by hand OR set RESUBMIT=1 to self-chain across
 # wallclock kills:  RESUBMIT=1 sbatch scripts/csd3/nomad/20_pipeline.sh
 # RESUBMIT is ON/OFF, not a count — MAX_ATTEMPTS (default 8) bounds the rounds.

@@ -100,6 +100,21 @@ def test_parse_vasprun_parameters_gzip(tmp_path):
     assert cp is not None and cp["ENCUT"] == 400.0 and cp["ISIF"] == 3
 
 
+def test_parse_vasprun_parameters_bz2_and_xz(tmp_path):
+    # regression: real uploads stage vasprun.xml.bz2 / .xz — the opener MUST decompress them,
+    # else lxml gets compressed bytes and fails "Start tag expected" (the 112-calc recovery gap)
+    _pmg_or_skip()
+    import bz2 as _bz2
+    import lzma as _lzma
+    for suffix, opener in ((".bz2", _bz2.open), (".xz", _lzma.open)):
+        f = tmp_path / f"vasprun.xml{suffix}"
+        with opener(f, "wt", encoding="utf-8") as fh:
+            fh.write(MINIMAL_VASPRUN)
+        cp = parse_vasprun_parameters(f)
+        assert cp is not None, suffix
+        assert cp["ENCUT"] == 400.0 and cp["ISIF"] == 3, suffix
+
+
 def test_parse_vasprun_parameters_missing_or_bad_returns_none(tmp_path):
     _pmg_or_skip()
     assert parse_vasprun_parameters(tmp_path / "nope.xml") is None
