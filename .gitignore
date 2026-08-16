@@ -94,3 +94,14 @@ Thumbs.db
 dataset_csd3/
 manifests_csd3/
 logs_csd3/
+
+# NOMAD harvest: SLURM logs (logs_nomad/, kept separate from the Zenodo logs/) + any NOMAD
+# artifacts pulled down for offline evaluation. On the cluster the NOMAD tree lives on scratch
+# ($NOMAD_HARVEST_DATA, e.g. /rds/.../hpc-work/nomad); locally it defaults under data/ (already
+# ignored above). These cover the case where you also keep a NOMAD tree/logs inside the repo.
+logs_nomad/
+dataset_nomad/
+manifests_nomad/
+# Anchored to the repo root (leading slash) so it ignores ONLY a top-level nomad/ data dir —
+# NOT the scripts/csd3/nomad/ code dir or the nomad_harvest/ package.
+/nomad/

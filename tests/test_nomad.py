@@ -654,3 +654,99 @@ def test_bulk_fetch_valve_defers(tmp_path):
                                     max_disk_bytes=1000, batch_size=5)
     assert summary["staged"] == 1                  # only the first fit
     assert summary["stopped_disk_budget"] is True  # signals pipeline to reclaim + resume
+
+
+# --- NOMAD data-root separation + status (the standalone-tree design) -----------
+
+from nomad_harvest.cli import nomad_paths  # noqa: E402
+from zenodo_harvest import config  # noqa: E402
+
+
+def test_nomad_paths_sibling_of_absolute_zenodo_root(monkeypatch):
+    # On CSD3 the Zenodo root is absolute (.../hpc-work/zenodo): NOMAD is a SIBLING (.../nomad),
+    # never nested inside the Zenodo tree, so the two harvests never share a staging dir.
+    monkeypatch.delenv("NOMAD_HARVEST_DATA", raising=False)
+    monkeypatch.setattr(config, "DATA_ROOT", Path("/rds/user/me/hpc-work/zenodo"))
+    root, man, raw, ds = nomad_paths()
+    assert root == Path("/rds/user/me/hpc-work/nomad")
+    assert (man, raw, ds) == (root / "manifests", root / "raw", root / "dataset")
+
+
+def test_nomad_paths_nested_under_relative_local_default(monkeypatch):
+    # Local default root is the relative "data" (gitignored): nest NOMAD under it (data/nomad)
+    # rather than a repo-root sibling, so it stays inside the ignored tree.
+    monkeypatch.delenv("NOMAD_HARVEST_DATA", raising=False)
+    monkeypatch.setattr(config, "DATA_ROOT", Path("data"))
+    assert nomad_paths()[0] == Path("data/nomad")
+
+
+def test_nomad_paths_env_override_wins(monkeypatch):
+    monkeypatch.setenv("NOMAD_HARVEST_DATA", "/scratch/nomad")
+    monkeypatch.setattr(config, "DATA_ROOT", Path("/rds/user/me/hpc-work/zenodo"))
+    assert nomad_paths()[0] == Path("/scratch/nomad")
+
+
+def _write(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_jsonl(path, rows)
+
+
+def test_nomad_status_uses_nomad_manifest_names(tmp_path):
+    # Build a minimal NOMAD tree and assert the shared status walker, told NOMAD's names,
+    # counts the keep-list as BOTH discover + triage, the standalone nomad_fetched.jsonl for
+    # FETCH, and both NOMAD rejection logs — using NOMAD filenames, not the Zenodo ones.
+    from zenodo_harvest.status import status_report
+
+    man, raw, ds = tmp_path / "manifests", tmp_path / "raw", tmp_path / "dataset"
+    _write(man / "nomad_keep.jsonl",
+           [{"entry_id": f"E{i}", "mainfile": "d/vasprun.xml.bz2"} for i in range(5)])
+    _write(man / "nomad_fetched.jsonl",
+           [{"recid": f"E{i}", "n_calc_units": 1,
+             "provenance": {"source": "nomad", "record_id": f"E{i}"}} for i in range(3)])
+    _write(man / "nomad_rejections.jsonl",
+           [{"stage": "nomad_discover", "id": "E7", "reason": "non_redistributable_license"}])
+    _write(man / "nomad_fetch_rejections.jsonl",
+           [{"stage": "nomad_fetch", "id": "E4", "reason": "no_vasp_primary"}])
+    _write(ds / "metadata.jsonl",
+           [{"calc_id": f"nomad:E{i}:d/vasprun.xml",
+             "provenance": {"source": "nomad", "record_id": f"E{i}"},
+             "quality": {"n_frames": 2, "n_frames_with_forces": 2}} for i in range(2)])
+
+    r = status_report(
+        manifests_dir=man, raw_dir=raw, dataset_dir=ds,
+        candidate_globs=["nomad_keep.jsonl"], keep_name="nomad_keep.jsonl",
+        extra_rejection_names=("nomad_rejections.jsonl", "nomad_fetch_rejections.jsonl"),
+        fetched_globs=["*.fetched.jsonl", "nomad_fetched.jsonl"], staging_walk=False)
+
+    assert r["discover"]["candidates"] == 5          # nomad_keep.jsonl (not candidates*.jsonl)
+    assert r["triage"]["keep"] == 5
+    assert r["fetch"]["fetched_records"] == 3         # standalone nomad_fetched.jsonl counted
+    assert r["fetch"]["calc_units"] == 3
+    assert r["parse"]["calcs_parsed"] == 2
+    assert r["parse"]["frames"] == 4
+    assert r["errors"]["rejections"] == 2             # BOTH nomad rejection logs folded in
+    assert r["errors"]["by_reason"]["no_vasp_primary"] == 1
+    # RECORDS breakdown bounded by keep membership (keep-list keyed by entry_id): E0-E2 fetched,
+    # E4 fetch-rejected -> 4 attempted, 1 untouched (E3), 1 fetch-rejected.
+    assert r["records"]["attempted"] == 4
+    assert r["records"]["fetched"] == 3
+    assert r["records"]["fetch_rejected"] == 1
+    assert r["records"]["untouched"] == 1
+
+
+def test_status_zenodo_defaults_unchanged(tmp_path):
+    # Regression: without the NOMAD params, the walker keeps its Zenodo behaviour (candidates*
+    # glob, keep.jsonl, fetch stage exactly "fetch").
+    from zenodo_harvest.status import status_report
+
+    man, raw, ds = tmp_path / "manifests", tmp_path / "raw", tmp_path / "dataset"
+    _write(man / "candidates.jsonl", [{"recid": f"z{i}"} for i in range(4)])
+    _write(man / "keep.jsonl", [{"recid": f"z{i}"} for i in range(4)])
+    _write(man / "fetched.jsonl", [{"recid": "z0", "n_calc_units": 2}])  # standalone name
+    _write(man / "rejections.jsonl",
+           [{"stage": "fetch", "id": "z3", "reason": "no_vasp_files"}])
+    r = status_report(manifests_dir=man, raw_dir=raw, dataset_dir=ds, staging_walk=False)
+    assert r["discover"]["candidates"] == 4
+    assert r["triage"]["keep"] == 4
+    assert r["fetch"]["fetched_records"] == 1          # fetched.jsonl now counted too
+    assert r["records"]["fetch_rejected"] == 1

@@ -8,16 +8,22 @@
 #SBATCH --cpus-per-task=4              # bought for RAM (~26 GiB), not compute — see MAX_PRIMARY_BYTES
 #SBATCH --time=12:00:00                # SL3 max; SL1/SL2 may use up to 36:00:00
 #SBATCH --signal=B:USR1@600            # SIGUSR1 to the batch shell 10 min before wallclock
-#SBATCH -o logs/nomad-pipeline-%j.out  #   -> lets RESUBMIT=1 queue a resume job before the
-#SBATCH -e logs/nomad-pipeline-%j.err  #      hard SIGKILL (see the run/resubmit block below)
+#SBATCH -o logs_nomad/nomad-pipeline-%j.out  #   -> lets RESUBMIT=1 queue a resume job before the
+#SBATCH -e logs_nomad/nomad-pipeline-%j.err  #      hard SIGKILL (see the run/resubmit block below)
 #SBATCH --mail-type=END,FAIL           # email on job END/FAIL; SBATCH_MAIL_USER overrides the address.
 #
 # NOMAD stages 2-4 in ONE overlapped, disk-paced command: fetch(batch i+1) runs while
 # parse+purge(batch i) runs, so the network is never idle during parsing. Ends with
 # `verify` (metadata<->shard bijection + coverage stats). Reuses the SHARED
 # zenodo_harvest parse/store/verify + the disk/inode valve unchanged — only the fetch
-# (nomad_harvest) is source-specific. Writes to its OWN dataset dir (dataset/nomad); fold
-# it into the combined dataset later with `zenodo_harvest.cli merge-datasets`.
+# (nomad_harvest) is source-specific.
+#
+# STANDALONE NOMAD TREE (kept OUT of the Zenodo dir). Everything NOMAD writes — raw staging,
+# manifests, the dataset — lands under $NOMAD_HARVEST_DATA (a sibling of the Zenodo scratch
+# root), so a concurrent Zenodo (re)harvest never shares a staging tree with this job and the
+# two disk valves never count each other's files. Fold the finished NOMAD dataset into the
+# combined one later with `zenodo_harvest.cli merge-datasets`. The ONLY Zenodo path this job
+# reads is the dataset/metadata.jsonl used for cross-source dedup at discover time (read-only).
 #
 # The full 7.1M direct-upload set is Zenodo-scale: the bulk fetch is bandwidth-bound, not
 # fetch-rate-bound (~47k requests total — see docs/NOMAD_HARVEST.md), so at Zenodo-like
@@ -27,18 +33,23 @@
 # wallclock kills:  RESUBMIT=1 sbatch scripts/csd3/nomad/20_pipeline.sh
 # RESUBMIT is ON/OFF, not a count — MAX_ATTEMPTS (default 8) bounds the rounds.
 #
-# NB: create logs/ BEFORE you submit (SLURM opens -o/-e before the body runs): `mkdir -p logs`.
+# NB: create logs_nomad/ BEFORE you submit (SLURM opens -o/-e before the body runs): `mkdir -p logs_nomad`.
 set -euo pipefail
 
 # ---- ENV SETUP (edit me) --------------------------------------------------------
+# ZENODO_HARVEST_DATA = the Zenodo scratch root (read-only here, for dedup metadata).
+# NOMAD_HARVEST_DATA  = NOMAD's OWN sibling root — all NOMAD raw/manifests/dataset live here,
+#                       fully separate from Zenodo. Both are read at IMPORT time (set first).
 export ZENODO_HARVEST_DATA="${ZENODO_HARVEST_DATA:-/rds/user/$USER/hpc-work/zenodo}"
+export NOMAD_HARVEST_DATA="${NOMAD_HARVEST_DATA:-/rds/user/$USER/hpc-work/nomad}"
 # Activate the harvest env BEFORE `sbatch` (captured via --export=ALL, carried through the
 # RESUBMIT chain). Keep it OUT of this script (a failed `module load` would abort under set -e):
 #   module load python/3.11.0-icl && source ~/materials-mlip/.venv/bin/activate
-# Parse copies each OUTCAR into $TMPDIR before ASE reads it. Point TMPDIR at fast node-local
-# scratch (/local, auto-removed at job end) so a temp copy neither eats the RAM budget nor the
-# /rds quota (the disk valve does not track $TMPDIR). Fall back to /rds scratch.
-if [[ -d /local && -w /local ]]; then export TMPDIR="/local"; else export TMPDIR="$ZENODO_HARVEST_DATA/tmp"; fi
+# Parse copies each OUTCAR into $TMPDIR before ASE reads it, and the bulk fetch writes transient
+# batch zips there. Point TMPDIR at fast node-local scratch (/local, auto-removed at job end) so
+# neither eats the RAM budget nor the /rds quota (the disk valve does not track $TMPDIR). Fall
+# back to NOMAD-root scratch (NOT the Zenodo tree) so a fallback still stays out of Zenodo.
+if [[ -d /local && -w /local ]]; then export TMPDIR="/local"; else export TMPDIR="$NOMAD_HARVEST_DATA/tmp"; fi
 mkdir -p "$TMPDIR"
 cd "${SLURM_SUBMIT_DIR:-.}"
 # --------------------------------------------------------------------------------
@@ -46,15 +57,22 @@ cd "${SLURM_SUBMIT_DIR:-.}"
 # ---- HARVEST PARAMETERS ---------------------------------------------------------
 PARTS="${PARTS:-40}"                   # batches; more parts = smaller peak staging
 WORKERS="${WORKERS:-4}"                # concurrent downloads (NOMAD allows ~10 concurrent)
-# Bounds the WHOLE raw staging dir (both concurrently-staged batches). ~0.8x the 1 TB
-# hpc-work quota; the valve charges every byte as written + every inode as created and
-# refunds on delete, so `staged <= this` holds exactly. NOMAD stages only small vasprun
-# files (no archives, no expansion), so peak staging is modest and paced by parse+purge.
-MAX_DISK_BYTES="${MAX_DISK_BYTES:-800000000000}"
-# hpc-work is ALSO capped at 1 million inodes and this binds FIRST: each NOMAD entry stages
-# ~3-4 inodes (<entry_id>/extracted/calc/vasprun.xml), so ~200k entries fill it before bytes.
-# 800k leaves headroom for the dataset + manifests + the valve's in-flight overshoot.
-MAX_DISK_FILES="${MAX_DISK_FILES:-800000}"
+# DISK/INODE PARTITION (fixed-slice design). The valve bounds only THIS job's raw staging
+# ($NOMAD_HARVEST_DATA/raw); it cannot see the Zenodo tree or another job's staging. The 1 TB /
+# 1M-inode hpc-work quota is SHARED across everything you run, so give each job a fixed slice
+# that SUMS under quota after reserving the fixed/growing consumers. Worked budget (co-running
+# NOMAD + ONE small Zenodo recovery), quota ~1000 GB / 1.0M inodes:
+#     reserve  existing Zenodo raw+dataset ~100 GB / ~100k   (measured)
+#     reserve  NOMAD final dataset+manifests ~40-60 GB / ~few-k (grows during the run)
+#     NOMAD raw valve            600 GB / 600k   (this job, below)
+#     Zenodo-recovery raw valve  150 GB / 150k   (override MAX_DISK_* on scripts/csd3/46_*.sh)
+#     headroom                  ~100 GB / ~50k
+# Running NOMAD SOLO? You may raise these to ~800 GB / 800k. The valve charges every byte as
+# written + every inode as created and refunds on delete, so `staged <= limit` holds exactly.
+MAX_DISK_BYTES="${MAX_DISK_BYTES:-600000000000}"
+# hpc-work is ALSO capped at 1M inodes and this binds FIRST: each NOMAD entry stages ~3-4 inodes
+# (<entry_id>/extracted/calc/vasprun.xml), so ~150-200k entries fill 600k before bytes.
+MAX_DISK_FILES="${MAX_DISK_FILES:-600000}"
 # RAM guard: refuse to ATTEMPT a primary bigger than this (0 = attempt everything). pymatgen
 # peak RSS is ~10x the vasprun size; an over-budget parse is a cgroup SIGKILL, not a catchable
 # error. icelake-himem = 6760 MiB/core, so --cpus-per-task=4 gives ~26 GiB -> ~0.85x/10 ~= 2 GB.
@@ -69,20 +87,23 @@ MAX_ATTEMPTS="${MAX_ATTEMPTS:-8}"      # resubmission chain guard
 ATTEMPT="${ATTEMPT:-1}"
 # --------------------------------------------------------------------------------
 
-mkdir -p logs
-MAN="$ZENODO_HARVEST_DATA/manifests"
-DATASET_DIR="$ZENODO_HARVEST_DATA/dataset/nomad"
+mkdir -p logs_nomad
+MAN="$NOMAD_HARVEST_DATA/manifests"
+DATASET_DIR="$NOMAD_HARVEST_DATA/dataset"
+RAW="$NOMAD_HARVEST_DATA/raw"
 if [[ ! -s "$MAN/nomad_keep.jsonl" ]]; then
     echo "ERROR: $MAN/nomad_keep.jsonl missing — run scripts/csd3/nomad/10_discover.sh first." >&2
     exit 2
 fi
 
 echo "=== nomad pipeline attempt $ATTEMPT/$MAX_ATTEMPTS $(date -Is) on $(hostname) ==="
-# RDS usage vs the 1 TB / 1M-file quota. NB `df -h` shows the shared pool, not your quota;
-# prefer the CSD3 `quota` wrapper / `lfs quota`. The pipeline's own peak_staged_* (in its
-# per-fetch logs) is authoritative.
-quota 2>/dev/null || lfs quota -u "$USER" "$ZENODO_HARVEST_DATA" 2>/dev/null \
-    || df -h "$ZENODO_HARVEST_DATA" 2>/dev/null || true
+echo "    NOMAD tree: $NOMAD_HARVEST_DATA  (raw=$RAW dataset=$DATASET_DIR)"
+# RDS usage vs the 1 TB / 1M-file quota (SHARED across all your jobs). NB `df -h` shows the
+# shared pool, not your quota; prefer the CSD3 `quota` wrapper / `lfs quota`. lfs quota reports
+# the whole hpc-work filesystem regardless of the path given. The pipeline's own peak_staged_*
+# (in its per-fetch logs) is authoritative for THIS job's slice.
+quota 2>/dev/null || lfs quota -u "$USER" "$NOMAD_HARVEST_DATA" 2>/dev/null \
+    || df -h "$NOMAD_HARVEST_DATA" 2>/dev/null || true
 
 # ---- CLEAR A STALE PARSE LOCK ---------------------------------------------------
 # The RESUBMIT chain is STRICTLY SEQUENTIAL (--dependency=afterany), so when THIS job starts
@@ -96,7 +117,7 @@ if [[ -e "$DATASET_DIR/.parse.lock" ]]; then
     rm -f "$DATASET_DIR/.parse.lock"
 fi
 
-SUMMARY="logs/nomad-pipeline-${SLURM_JOB_ID:-local}.summary.json"
+SUMMARY="logs_nomad/nomad-pipeline-${SLURM_JOB_ID:-local}.summary.json"
 NEXT_JOBID=""
 submit_successor() {
     # Queue ONE resume job (idempotent). --export=ALL,... so the chained job sees the
@@ -125,7 +146,7 @@ python -m nomad_harvest.cli -v pipeline \
     --max-disk-files "$MAX_DISK_FILES" \
     --max-primary-bytes "$MAX_PRIMARY_BYTES" \
     --parse-timeout "$PARSE_TIMEOUT" \
-    --raw-dir "$ZENODO_HARVEST_DATA/raw" \
+    --raw-dir "$RAW" \
     --dataset-dir "$DATASET_DIR" \
     > >(tee "$SUMMARY") &
 PIPELINE_PID=$!
@@ -141,7 +162,7 @@ done
 set -e
 
 echo "=== nomad pipeline exit=$rc $(date -Is) ==="
-echo "staged files under raw/: $(find "$ZENODO_HARVEST_DATA/raw" -type f 2>/dev/null | wc -l)"
+echo "staged files under raw/: $(find "$RAW" -type f 2>/dev/null | wc -l)"
 
 # USR1 covers the wallclock-timeout case. This covers a hard NON-ZERO EXIT before the signal
 # (a caught fetch/parse failure — reported in the JSON summary): the harvest is resumable, so
