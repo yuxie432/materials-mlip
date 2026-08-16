@@ -79,9 +79,16 @@ def _add_disk_valve(p: argparse.ArgumentParser) -> None:
                         "bulk fetch (~2 requests per --batch-size entries). Bulk is ~100x "
                         "fewer requests — the difference between a ~months and a ~days run; "
                         "use per-entry only to debug or if bulk raw/query is unavailable.")
-    p.add_argument("--batch-size", type=int, default=300,
-                   help="entries per bulk raw/query zip (bulk mode; bounds zip size + the "
-                        "server's zip-assembly time)")
+    p.add_argument("--batch-size", type=int, default=50,
+                   help="entries per bulk raw/query zip (bulk mode). NOMAD returns an EMPTY "
+                        "200 above ~50 (measured), so 50 is the safe ceiling — do NOT raise it "
+                        "without re-checking; a bigger batch does not speed the transfer.")
+    p.add_argument("--no-rawdir", dest="rawdir_listing", action="store_false",
+                   help="skip the per-batch availability LISTING (rawdir/query — slow ~0.2 s/entry "
+                        "and 500-prone). Availability then comes from NOMAD's available_properties "
+                        "(DOS/eigenvalues) + the parse-time embedded probe + ISPIN (magnetization); "
+                        "you LOSE only charge_density/spin_density/wavefunction/LOCPOT/ELF flags. "
+                        "Use if section [3] of csd3_nomad_speed.py shows rawdir governs the run.")
     p.add_argument("--tmp-dir", default=None,
                    help="node-local dir for transient batch zips (bulk mode; default a temp "
                         "dir under $TMPDIR). Keep it OFF the rds quota — e.g. CSD3 /local.")
@@ -96,7 +103,8 @@ def _fetch(client: NomadClient, in_path: str, out_path: str | None, raw_dir: str
     if args.per_entry:
         return fetch_candidates(client, in_path, **kw)
     return fetch_candidates_bulk(client, in_path, batch_size=args.batch_size,
-                                 tmp_dir=args.tmp_dir, **kw)
+                                 tmp_dir=args.tmp_dir,
+                                 rawdir_listing=getattr(args, "rawdir_listing", True), **kw)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -110,13 +110,18 @@ floor is ~30 req/s / ≤10 concurrent per IP with 5xx under load (the client sel
 off; CSD3 parallelism cannot raise a server-side cap). Use `WORKERS=4-8` (long-lived batch streams
 multiply bandwidth without spiking the request rate).
 
-**One caveat — the availability listing (`rawdir/query`) is the slow/fragile part.** It 500s on a
-big id list (so `bulk_rawdir` splits it into 25-entry sub-requests) and costs ~0.2 s/entry, which
-at 7.1M can rival the download in wall-clock — measure it with `csd3_nomad_speed.py` section [3].
-`HTTP 500 /entries/rawdir/query … backoff` lines in the log are this endpoint under load; they are
-retried then fall back per-entry, so the harvest keeps going (no data lost — DOS/eigenvalue/
-magnetization availability don't need rawdir; only charge-density does). If it dominates, raise
-`WORKERS` or (code) `NomadClient.RAWDIR_CHUNK`. **Emailing NOMAD is NOT a documented prerequisite** for
+**Two measured NOMAD limits the code works around (don't override blindly):**
+* **`raw/query` DOWNLOAD caps at ~50 entries/batch** — above that it returns an empty 200, so
+  `--batch-size` defaults to **50** (a bigger batch does not transfer faster: server-side zip
+  assembly is ~0.7 s/file regardless). An unreadable/empty zip falls back per-entry, never crashes.
+* **`rawdir/query` availability listing is slow + fragile** — it 500s on a big id list (so it's
+  split into 25-entry sub-requests) and costs ~0.2 s/entry, which at 7.1M can rival the download in
+  wall-clock. `HTTP 500 /entries/rawdir/query … backoff` log lines are this endpoint under load;
+  they retry then fall back per-entry, so the harvest keeps going (no data lost). If section [3] of
+  `csd3_nomad_speed.py` shows it governs the run, add **`--no-rawdir`** to the pipeline/fetch: it
+  skips the listing (availability = `available_properties` DOS/eigenvalues + parse-time embedded
+  probe + ISPIN magnetization; you lose only charge-density/wavefunction/LOCPOT/ELF/spin-density
+  flags — the heavy files we never fetch anyway). **Emailing NOMAD is NOT a documented prerequisite** for
 a large harvest — it is only worth doing *reactively*, to request a rate-limit **exemption**
 (`support@nomad-lab.eu`, the documented purpose) if the speed script shows sustained throughput far
 below ~50 MB/s. Discovery (`10_discover.sh`) is single-stream by design — do not parallelise it.

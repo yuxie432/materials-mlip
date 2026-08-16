@@ -108,8 +108,10 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--workers", type=int, default=4,
                     help="concurrent batch zips for the aggregate test (the fetch's --workers)")
-    ap.add_argument("--batch-size", type=int, default=300,
-                    help="entries per bulk zip (the fetch's --batch-size; default 300)")
+    ap.add_argument("--batch-size", type=int, default=50,
+                    help="entries per bulk zip (the fetch's --batch-size; default 50). NOMAD "
+                         "returns an EMPTY 200 above ~50, so [1]/[2] FAIL if you raise this — "
+                         "that ceiling is the point, not a tuning knob.")
     ap.add_argument("--elements", nargs="+", default=None,
                     help="restrict the sample to materials containing ALL these elements")
     ap.add_argument("--tmp-dir", default=None,

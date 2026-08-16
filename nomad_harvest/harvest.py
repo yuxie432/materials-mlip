@@ -673,7 +673,11 @@ def fetch_candidates(client: NomadClient, in_path: str | Path,
 # enhanced parser recovers full calc_parameters), and any entry the zip can't deliver falls
 # back to the per-entry path.
 
-_BULK_MAX_BATCH = 300  # entries per raw/query zip (bounds zip size + server assembly time)
+# Entries per raw/query zip. NOMAD's raw/query returns an EMPTY 200 once the batch is too big
+# (live-measured 2026-08-16: real zips at 10/25/50 entries, empty 0-byte responses at 100/200/300),
+# so 50 is the safe ceiling — NOT 300. Server-side zip assembly is ~0.7 s/file regardless of batch,
+# so a larger batch would not speed the transfer anyway; it only risks the empty-response cliff.
+_BULK_MAX_BATCH = 50
 
 
 def _member_role(mainfile: str) -> str | None:
@@ -723,6 +727,7 @@ def _stage_zip_member(zf: zipfile.ZipFile, member: str, out: Path,
 def _bulk_stage_batch(
     client: NomadClient, batch: list[dict[str, Any]], raw_dir: Path,
     budget: StagingBudget | None, tmp_dir: Path, want_outcar: bool,
+    rawdir_listing: bool = True,
 ) -> tuple[dict[str, dict], list[dict], list[tuple[str, str, str]], bool]:
     """Fetch + stage one batch with TWO bulk requests. Returns ``(staged, fallback,
     rejects, deferred)``:
@@ -735,11 +740,15 @@ def _bulk_stage_batch(
         data): the already-staged entries are kept, the rest are left for a resumed run.
     """
     ids = [e["entry_id"] for e in batch]
-    try:
-        listings = client.bulk_rawdir(ids)          # fix #2: availability for the whole batch
-    except Exception as exc:  # noqa: BLE001 - availability is best-effort; proceed without it
-        logger.debug("bulk_rawdir failed (%s); staging without availability", type(exc).__name__)
-        listings = {}
+    if rawdir_listing:
+        try:
+            listings = client.bulk_rawdir(ids)      # fix #2: availability for the whole batch
+        except Exception as exc:  # noqa: BLE001 - availability is best-effort; proceed without it
+            logger.debug("bulk_rawdir failed (%s); staging without availability", type(exc).__name__)
+            listings = {}
+    else:
+        listings = {}   # --no-rawdir: skip the slow/fragile listing (see build_fetched_entry:
+                        # availability then = available_properties + embedded probe + ISPIN)
 
     include: list[str] = []
     outcar_of: dict[str, str] = {}
@@ -764,8 +773,18 @@ def _bulk_stage_batch(
     fallback: list[dict] = []
     rejects: list[tuple[str, str, str]] = []
     deferred = False
+    # NOMAD returns an EMPTY 200 (a 0-byte "zip") for a raw/query whose batch is too big
+    # (measured: fine ≤50, empty ≥100), which makes zipfile raise BadZipFile. Treat an
+    # unreadable/empty zip as "batch not delivered" -> per-entry fallback, never a crash.
     try:
-        with zipfile.ZipFile(zpath) as zf:
+        zf = zipfile.ZipFile(zpath)
+    except Exception as exc:  # noqa: BLE001 - BadZipFile / empty response / truncation
+        logger.warning("bulk zip unreadable for a %d-entry batch (%s: likely an empty 200 — "
+                       "batch too big?); per-entry fallback", len(batch), type(exc).__name__)
+        zpath.unlink(missing_ok=True)
+        return {}, list(batch), [], False
+    try:
+        with zf:
             members = set(zf.namelist())
             for e in batch:
                 eid, uid, mf = e["entry_id"], e.get("upload_id"), e.get("mainfile") or ""
@@ -799,10 +818,13 @@ def _bulk_stage_batch(
                     # requests/batch — and guarantees availability is never silently dropped.
                     listing = listings.get(eid)
                     if not (listing and listing.get("files")):
-                        try:
-                            listing = client.rawdir(eid)
-                        except Exception:  # noqa: BLE001 - keep the calc; availability stays empty
-                            listing = {"files": []}
+                        if rawdir_listing:
+                            try:
+                                listing = client.rawdir(eid)
+                            except Exception:  # noqa: BLE001 - keep the calc; availability stays empty
+                                listing = {"files": []}
+                        else:
+                            listing = {"files": []}  # --no-rawdir: no per-entry recovery either
                     fe = build_fetched_entry(e, raw_dir, dest, listing)
                     if fe is None:                     # staged a primary but no calc unit
                         _refund_and_delete(dest, budget, own)
@@ -827,7 +849,7 @@ def fetch_candidates_bulk(
     want_outcar: bool = False, max_records: int | None = None,
     max_disk_bytes: int | None = None, max_disk_files: int | None = None,
     workers: int = 1, batch_size: int = _BULK_MAX_BATCH,
-    tmp_dir: str | Path | None = None,
+    tmp_dir: str | Path | None = None, rawdir_listing: bool = True,
 ) -> dict[str, Any]:
     """Stage 2, BULK: stage the keep-list with ~2 requests per ``batch_size`` entries.
 
@@ -883,7 +905,7 @@ def fetch_candidates_bulk(
         ("reject", eid, (reason, detail))]``."""
         results: list = []
         staged, fallback, rejects, deferred = _bulk_stage_batch(
-            client, batch, raw_dir, budget, tmpd, want_outcar)
+            client, batch, raw_dir, budget, tmpd, want_outcar, rawdir_listing)
         for eid, fe in staged.items():
             results.append(("ok", eid, fe))
         for eid, reason, detail in rejects:

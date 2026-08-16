@@ -792,3 +792,49 @@ def test_bulk_rawdir_partial_on_chunk_failure(monkeypatch):
     out = client.bulk_rawdir(ids, chunk_size=25)
     assert len(out) == 50                              # chunks 1 + 3 kept; chunk 2 (E25..E49) lost
     assert "E0" in out and "E50" in out and "E25" not in out
+
+
+# --- bulk download: empty-zip fallback + --no-rawdir (batch ceiling / rawdir cost) ---
+
+def test_bulk_fetch_recovers_from_empty_zip(tmp_path):
+    # NOMAD returns an EMPTY 200 (0-byte body) for a too-big raw/query batch -> zipfile raises
+    # BadZipFile. That must fall back per-entry (no data lost), NEVER crash the fetch.
+    keep, entries, uploads = _bulk_setup(tmp_path, [
+        ("A", "U", "d/A_vasprun.xml", 30), ("B", "U", "d/B_vasprun.xml", 30)])
+
+    class EmptyZipClient(FakeBulkClient):
+        def bulk_raw_zip(self, ids, files, dest, on_chunk=None):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"")           # empty 200 -> 0-byte "zip"
+            self.zips += 1
+            return 0
+
+    client = EmptyZipClient(entries, uploads)
+    out = tmp_path / "fetched.jsonl"
+    summary = fetch_candidates_bulk(client, keep, raw_dir=tmp_path / "raw", out_path=out,
+                                    batch_size=5)
+    assert summary["staged"] == 2           # both recovered per-entry, no crash
+    assert client.rawdirs >= 2              # the per-entry fallback ran
+    assert set(r["recid"] for r in read_jsonl(out)) == {"A", "B"}
+
+
+def test_bulk_fetch_no_rawdir_skips_listing(tmp_path):
+    # rawdir_listing=False: the availability LISTING is skipped entirely (bulk_rawdir AND the
+    # per-entry rawdir recovery). Availability then comes only from available_properties
+    # (DOS/eigenvalues) — charge_density (a file-listing-only flag) stays False.
+    keep, entries, uploads = _bulk_setup(tmp_path, [("A", "U", "d/A_vasprun.xml", 30)])
+    entries["A"]["files"].append({"path": "d/CHGCAR", "size": 999})   # heavy file IS present
+    rows = list(read_jsonl(keep))
+    rows[0].setdefault("results", {})["properties"] = {
+        "available_properties": ["dos_electronic_new"]}                # DOS asserted in metadata
+    write_jsonl(keep, rows)
+    # fail_bulk_rawdir=True would RAISE if bulk_rawdir were called — proving it is NOT.
+    client = FakeBulkClient(entries, uploads, fail_bulk_rawdir=True)
+    out = tmp_path / "fetched.jsonl"
+    summary = fetch_candidates_bulk(client, keep, raw_dir=tmp_path / "raw", out_path=out,
+                                    batch_size=5, rawdir_listing=False)
+    assert summary["staged"] == 1
+    assert client.rawdirs == 0              # NO per-entry rawdir recovery either
+    rec = next(iter(read_jsonl(out)))
+    assert rec["availability"]["dos"] is True              # from available_properties (free)
+    assert rec["availability"]["charge_density"] is False  # listing skipped -> heavy file unseen
