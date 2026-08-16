@@ -190,6 +190,23 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
     atomic under `.parse.lock` + `metadata.jsonl.bak.pre_vasprun_refresh`, `--only-missing` for
     resume. CSD3 campaign: `scripts/csd3/45_vasprun_recover.sh` (mirrors 44). Run
     `enrich-metadata` after to regenerate `resolved` from the authoritative parameters.
+  - `availability_recover.py` — the **per-calc `availability`** analog of the OUTCAR/vasprun
+    recovery, for the dataset built before availability was scoped per-calc + probed. Applies the
+    corrected flags to the already-built dataset **without rebuilding shards**:
+    `build_availability_keeplist` selects EVERY record holding a dataset calc (availability is
+    universal, not a parser subset); re-fetch with the ordinary `fetch` (targeted-zip pulls the
+    vasprun + central-directory listing out of a `.zip`); `refresh_availability_metadata` recomputes
+    each calc's availability = per-calc filename flags (from the re-fetch's `calc_availability`) ∪
+    the embedded vasprun/vaspout probe (`parse._merge_embedded_availability`) + spin_density/
+    magnetization re-derived from the record's own `spin_polarized`/`site_magmoms_present`
+    (`outcar_recover._recompute_spin_availability`), and overwrites ONLY that record's
+    `availability` (`calc_id`/`frame_ids`/`shards`/`calc_parameters` byte-identical → verify passes).
+    CLI `availability-keeplist`/`refresh-availability`; atomic under `.parse.lock` +
+    `metadata.jsonl.bak.pre_availability_refresh`. **Resume-safe with NO metadata marker**: the
+    refresh only touches calcs whose primary is STILL STAGED, so a purged (already-done) batch is
+    skipped — presence of the source file IS the resume state. CSD3 campaign:
+    `scripts/csd3/46_availability_recover.sh` (mirrors 45; batched fetch→refresh→purge, dedicated
+    `raw_availability` dir, explicit pre-job metadata backup, verify-only finalize — no enrich).
   - `store.py` — stage 4: `ShardedExtxyzWriter` (rotating `shard-NNNNN.extxyz.gz`) +
     `MetadataWriter` (one JSONL record per calc), joined by `calc_id`/`frame_id`.
   - `status.py` — read-only progress snapshot: line-counts the append-only manifests +
@@ -212,7 +229,7 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
       every array job.
     - `purge-raw` — delete `<raw-dir>/<recid>/` trees whose every calc_id is already in the
       dataset (reclaim scratch); `--dry-run` reports without deleting.
-  - `cli.py` — `python -m zenodo_harvest.cli {discover,triage,fetch,parse,pipeline,split,merge-datasets,verify,enrich-metadata,outcar-keeplist,refresh-outcar,reclassify-outcar,vasprun-keeplist,refresh-vasprun,purge-raw,status} ...`
+  - `cli.py` — `python -m zenodo_harvest.cli {discover,triage,fetch,parse,pipeline,split,merge-datasets,verify,enrich-metadata,outcar-keeplist,refresh-outcar,reclassify-outcar,vasprun-keeplist,refresh-vasprun,availability-keeplist,refresh-availability,purge-raw,status} ...`
     (loads `.env`; `verify`/`merge-datasets`/`pipeline` exit non-zero on an integrity failure;
     `status` is read-only and always exits 0, `--json` for machine output).
     Parse and merge take a `.parse.lock` on the dataset dir so two writers never corrupt one
@@ -274,6 +291,21 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   python -m zenodo_harvest.cli enrich-metadata --dataset-dir data/dataset   # refresh resolved cache
   python -m zenodo_harvest.cli verify --dataset-dir data/dataset            # bijection still holds
   ```
+  **Availability recovery** (recompute per-calc `availability` for a dataset built before the
+  per-calc-scoping + embedded-probe fixes, metadata-only — shards untouched; CSD3 template
+  `scripts/csd3/46_availability_recover.sh` runs this as a self-resubmitting, disk-paced,
+  batched campaign that also takes an explicit pre-job metadata backup):
+  ```
+  python -m zenodo_harvest.cli availability-keeplist --dataset-dir data/dataset \
+      --keep data/manifests/keep.jsonl --out data/manifests/availability_keep.jsonl  # EVERY record
+  python -m zenodo_harvest.cli fetch --in data/manifests/availability_keep.jsonl \
+      --out data/manifests/availability_fetched.jsonl --raw-dir data/raw_availability --max-bytes 0
+  python -m zenodo_harvest.cli refresh-availability --dataset-dir data/dataset \
+      --fetched data/manifests/availability_fetched.jsonl --raw-dir data/raw_availability  # overwrites `availability` only
+  python -m zenodo_harvest.cli verify --dataset-dir data/dataset            # bijection still holds
+  ```
+  (no `enrich-metadata` step — availability does not feed the resolver. The refresh must run
+  BEFORE `purge-raw` each batch: the embedded DOS/eigen probe reads the STAGED vasprun.)
 - `ZENODO_TOKEN` lives in `.env` (gitignored, loaded by `config.load_dotenv`). Stage 0–1 depend
   only on `requests`; stages 2–4 need `pymatgen` + `ase` (`pip install -e .[parse]`).
 - **Frame properties**: per-ionic-step energy (`e_0_energy`, σ→0, with pymatgen's `final_energy`

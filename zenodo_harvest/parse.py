@@ -458,6 +458,24 @@ def _embedded_electronic_structure(vasprun: str | None, vaspout: str | None) -> 
     return {"dos": False, "eigenvalues": False, "projected": False}
 
 
+def _merge_embedded_availability(base_avail: dict, vasprun: str | None,
+                                 vaspout: str | None) -> dict:
+    """Base (per-calc, filename-derived) availability OR'd with the embedded content probe.
+
+    Returns a NEW dict: a copy of ``base_avail`` with ``dos``/``eigenvalues``/``projected``
+    turned ON where the primary output embeds them (the probe only ever adds). Spin-derived
+    flags (``spin_density``/``magnetization``) are NOT set here — they depend on the calc's
+    ``spin_polarized``/``site_magmoms_present`` and are added by the caller. This is the SINGLE
+    source of the fetch↔parse availability merge, shared with ``availability_recover`` so a
+    live parse and a recovered record compute byte-identical flags.
+    """
+    avail = dict(base_avail)
+    for kind, present in _embedded_electronic_structure(vasprun, vaspout).items():
+        if present:
+            avail[kind] = True
+    return avail
+
+
 def _site_props_from_outcar(outcar_path: str, natoms: int) -> dict:
     """Per-atom total charge / magnetic moment from an OUTCAR (end-of-run only)."""
     out: dict = {"magmoms": None, "charges": None}
@@ -828,15 +846,11 @@ def parse_calc_unit(unit: dict, base_meta: dict, availability: dict,
         rej.reject("parse", calc_id, "frames_no_energy", dropped=n_dropped, kept=len(frames))
 
     # merge availability (from the fetch listing — now per-calc, scoped to this calc's
-    # directory) with what the parser can confirm from the primary output itself.
-    avail = dict(availability)
-    # DOS / eigenvalues / projected data embedded IN the vasprun.xml / vaspout.h5 (no
-    # standalone DOSCAR/EIGENVAL/PROCAR file for the fetch scan to see) — OR it in so those
-    # calcs are no longer under-counted. Only ever turns a flag ON.
-    embedded = _embedded_electronic_structure(probe_vasprun, probe_vaspout)
-    for kind, present in embedded.items():
-        if present:
-            avail[kind] = True
+    # directory) with what the parser can confirm from the primary output itself: DOS /
+    # eigenvalues / projected embedded IN the vasprun.xml / vaspout.h5 (no standalone
+    # DOSCAR/EIGENVAL/PROCAR file for the fetch scan to see) are OR'd on so those calcs are
+    # no longer under-counted. The same helper backs availability_recover (no drift).
+    avail = _merge_embedded_availability(availability, probe_vasprun, probe_vaspout)
     avail["spin_density"] = avail.get("charge_density", False) and meta["calc_parameters"].get("spin_polarized", False)
     avail["magnetization"] = meta.get("site_magmoms_present", False) or meta["calc_parameters"].get("spin_polarized", False)
     meta["availability"] = avail

@@ -58,6 +58,10 @@ from .outcar_recover import (
     refresh_outcar_metadata,
 )
 from .vasprun_recover import build_vasprun_keeplist, refresh_vasprun_metadata
+from .availability_recover import (
+    build_availability_keeplist,
+    refresh_availability_metadata,
+)
 from .parse import parse
 from .store import DatasetLockError
 from .triage import triage
@@ -313,6 +317,34 @@ def _add_refresh_vasprun(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--json", action="store_true", help="machine-readable output")
 
 
+def _add_availability_keeplist(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("availability-keeplist",
+                       help="stage 0 of availability recovery: emit a keep-list of EVERY record "
+                            "holding a dataset calc (availability is recomputed for all calcs)")
+    p.add_argument("--dataset-dir", default=str(config.DATASET_DIR))
+    p.add_argument("--keep", required=True,
+                   help="the original triaged keep-list (has each record's file URLs)")
+    p.add_argument("--out", required=True, help="where to write the availability keep-list JSONL")
+
+
+def _add_refresh_availability(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("refresh-availability",
+                       help="stage 2 of availability recovery: recompute per-calc availability "
+                            "(per-calc filename flags ∪ embedded vasprun/vaspout probe + spin) "
+                            "for re-fetched calcs whose primary is still staged, and overwrite "
+                            "ONLY those records' `availability` (calc_id/frame_ids/shards untouched)")
+    p.add_argument("--dataset-dir", default=str(config.DATASET_DIR))
+    p.add_argument("--fetched", required=True,
+                   help="fetched manifest from re-fetching the availability keep-list")
+    p.add_argument("--raw-dir", default=str(config.RAW_DIR),
+                   help="where the re-fetch staged the files; manifest paths resolve against it")
+    p.add_argument("--dry-run", action="store_true",
+                   help="report what would change; write nothing")
+    p.add_argument("--no-backup", action="store_true",
+                   help="skip the one-time metadata.jsonl.bak.pre_availability_refresh snapshot")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+
+
 def _add_reclassify_outcar(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("reclassify-outcar",
                        help="re-derive run_type/functional for OUTCAR-header calcs from their "
@@ -406,6 +438,8 @@ def main(argv: list[str] | None = None) -> int:
     _add_reclassify_outcar(sub)
     _add_vasprun_keeplist(sub)
     _add_refresh_vasprun(sub)
+    _add_availability_keeplist(sub)
+    _add_refresh_availability(sub)
     _add_purge_raw(sub)
     _add_status(sub)
     _add_pipeline(sub)
@@ -544,6 +578,26 @@ def main(argv: list[str] | None = None) -> int:
                 args.dataset_dir, args.fetched, args.raw_dir,
                 dry_run=args.dry_run, backup=not args.no_backup,
                 only_missing=args.only_missing)
+        except DatasetLockError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        if not summary.get("ok"):
+            print(f"ERROR: {summary.get('error')}", file=sys.stderr)
+            return 1
+        print(json.dumps(summary, indent=2))
+        return 0
+    elif args.cmd == "availability-keeplist":
+        summary = build_availability_keeplist(args.dataset_dir, args.keep, args.out)
+        if not summary.get("ok"):
+            print(f"ERROR: {summary.get('error')}", file=sys.stderr)
+            return 1
+        print(json.dumps(summary, indent=2))
+        return 0
+    elif args.cmd == "refresh-availability":
+        try:
+            summary = refresh_availability_metadata(
+                args.dataset_dir, args.fetched, args.raw_dir,
+                dry_run=args.dry_run, backup=not args.no_backup)
         except DatasetLockError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
