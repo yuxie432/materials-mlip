@@ -750,3 +750,45 @@ def test_status_zenodo_defaults_unchanged(tmp_path):
     assert r["triage"]["keep"] == 4
     assert r["fetch"]["fetched_records"] == 1          # fetched.jsonl now counted too
     assert r["records"]["fetch_rejected"] == 1
+
+
+# --- chunked, resilient bulk_rawdir (rawdir/query 500s on a big id list) ---------
+
+def test_bulk_rawdir_chunks_and_covers_all(monkeypatch):
+    # rawdir/query 500s on a ~300-id query (live-verified), so bulk_rawdir must split into
+    # RAWDIR_CHUNK-sized sub-requests. Record the sub-request sizes and assert full coverage.
+    client = NomadClient()
+    seen_sizes: list[int] = []
+
+    def fake_post(path, body):
+        assert path == "/entries/rawdir/query"
+        ids = body["query"]["entry_id:any"]
+        seen_sizes.append(len(ids))
+        assert len(ids) <= client.RAWDIR_CHUNK        # never an oversized query
+        return {"data": [{"entry_id": e, "mainfile": "d/vasprun.xml", "files": []} for e in ids]}
+
+    monkeypatch.setattr(client, "_post", fake_post)
+    ids = [f"E{i}" for i in range(60)]
+    out = client.bulk_rawdir(ids, chunk_size=25)
+    assert seen_sizes == [25, 25, 10]                 # 60 split into 25+25+10
+    assert set(out) == set(ids)                       # every entry covered
+
+
+def test_bulk_rawdir_partial_on_chunk_failure(monkeypatch):
+    # A failing sub-request must NOT discard the good chunks — those entries are simply absent
+    # (the caller recovers them per-entry). No exception escapes bulk_rawdir.
+    client = NomadClient()
+    calls = {"n": 0}
+
+    def flaky_post(path, body):
+        calls["n"] += 1
+        if calls["n"] == 2:                            # 2nd chunk always fails
+            raise RuntimeError("HTTP 500 rawdir/query")
+        ids = body["query"]["entry_id:any"]
+        return {"data": [{"entry_id": e, "files": []} for e in ids]}
+
+    monkeypatch.setattr(client, "_post", flaky_post)
+    ids = [f"E{i}" for i in range(75)]                 # 3 chunks of 25
+    out = client.bulk_rawdir(ids, chunk_size=25)
+    assert len(out) == 50                              # chunks 1 + 3 kept; chunk 2 (E25..E49) lost
+    assert "E0" in out and "E50" in out and "E25" not in out

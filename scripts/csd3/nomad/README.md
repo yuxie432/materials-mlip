@@ -105,10 +105,18 @@ the whole scope onto disk at once — **inodes bind first** (~3–4 per entry).
 ## Rate limits & etiquette
 
 Fetch is the rate-limiting stage, but after the **bulk redesign it is bandwidth-bound, not
-request-bound** (~2 requests per ~300-entry batch, ~47k total for the whole 7.1M). NOMAD's floor is
-~30 req/s / ≤10 concurrent per IP with 5xx under load (the client self-throttles + backs off; CSD3
-parallelism cannot raise a server-side cap). Use `WORKERS=4-8` (long-lived batch streams multiply
-bandwidth without spiking the request rate). **Emailing NOMAD is NOT a documented prerequisite** for
+request-bound** for the DOWNLOAD (~1 `raw/query` zip per ~300-entry batch, ~47k total). NOMAD's
+floor is ~30 req/s / ≤10 concurrent per IP with 5xx under load (the client self-throttles + backs
+off; CSD3 parallelism cannot raise a server-side cap). Use `WORKERS=4-8` (long-lived batch streams
+multiply bandwidth without spiking the request rate).
+
+**One caveat — the availability listing (`rawdir/query`) is the slow/fragile part.** It 500s on a
+big id list (so `bulk_rawdir` splits it into 25-entry sub-requests) and costs ~0.2 s/entry, which
+at 7.1M can rival the download in wall-clock — measure it with `csd3_nomad_speed.py` section [3].
+`HTTP 500 /entries/rawdir/query … backoff` lines in the log are this endpoint under load; they are
+retried then fall back per-entry, so the harvest keeps going (no data lost — DOS/eigenvalue/
+magnetization availability don't need rawdir; only charge-density does). If it dominates, raise
+`WORKERS` or (code) `NomadClient.RAWDIR_CHUNK`. **Emailing NOMAD is NOT a documented prerequisite** for
 a large harvest — it is only worth doing *reactively*, to request a rate-limit **exemption**
 (`support@nomad-lab.eu`, the documented purpose) if the speed script shows sustained throughput far
 below ~50 MB/s. Discovery (`10_discover.sh`) is single-stream by design — do not parallelise it.

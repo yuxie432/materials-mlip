@@ -9,12 +9,23 @@ docs/NOMAD_HARVEST.md); what governs the wall-clock is MB/s. This script measure
 on the real code path (`nomad_harvest.client`), so `WORKERS`/`--batch-size` and the campaign
 length can be chosen from data instead of a guess.
 
-Run it on a compute node (it needs the same outbound HTTPS the fetch stage needs):
+Run it on a compute node (it needs the same outbound HTTPS the fetch stage needs). BEST is an
+INTERACTIVE session, so you see output live and can re-run with different --workers without
+re-queuing (CSD3's `sintr` wraps salloc+srun):
 
     export SBATCH_ACCOUNT=MYGROUP-SL3-CPU
+    sintr -A "$SBATCH_ACCOUNT" -p icelake -N1 -n1 -c4 -t 1:0:0     # interactive shell on a node
+    # ...then, inside that shell:
     module load python/3.11.0-icl && source ~/materials-mlip/.venv/bin/activate
-    srun -A "$SBATCH_ACCOUNT" -p icelake --nodes=1 --ntasks=1 --cpus-per-task=4 \
-        --time=00:25:00 python scripts/csd3/nomad/csd3_nomad_speed.py --workers 4
+    python -u scripts/csd3/nomad/csd3_nomad_speed.py --workers 4    # -u = unbuffered, live output
+    python -u scripts/csd3/nomad/csd3_nomad_speed.py --workers 8    # re-run to sweep, no re-queue
+
+Or one-shot via srun — NB `--time` is only the MAX wallclock, not a fixed wait: srun streams the
+script's stdout and returns THE MOMENT it exits (a ~2-3 min test does not block for 25 min). Add
+`-u`/`PYTHONUNBUFFERED=1` or srun's `--unbuffered` so lines appear live rather than block-buffered:
+
+    srun -A "$SBATCH_ACCOUNT" -p icelake -N1 -n1 -c4 -t 0:25:0 --unbuffered \
+        python -u scripts/csd3/nomad/csd3_nomad_speed.py --workers 4
 
 What it reports, and why each matters:
 
@@ -161,20 +172,35 @@ def main() -> None:
                     print(f"    (single-stream x workers would be ~{single_mbs*len(batches):.0f} "
                           f"MB/s if perfectly parallel; ratio {agg_mbs/single_mbs:.1f}x)")
 
-        # 3. bulk_rawdir latency (the availability request, one per batch) --------
-        print("\n[3] bulk_rawdir latency (availability request, ~1 per batch)")
+        # 3. rawdir availability-listing cost -------------------------------------
+        # rawdir/query is the fragile+slow endpoint (500s on a big id list), so bulk_rawdir
+        # fetches it in RAWDIR_CHUNK-sized sub-requests. Time ONE chunk (the real unit) and
+        # extrapolate the per-batch availability cost — it can rival the zip transfer, so it
+        # is worth knowing before the run (NOT "negligible").
+        from nomad_harvest.client import NomadClient as _NC
+        cs = _NC.RAWDIR_CHUNK
+        print(f"\n[3] rawdir availability-listing cost (chunk={cs}; the slow/fragile endpoint)")
         lat = []
-        ids0 = [e["entry_id"] for e in b0]
-        for _ in range(5):
+        ids0 = [e["entry_id"] for e in b0[:cs]]
+        for _ in range(4):
             t0 = time.monotonic()
             try:
-                client.bulk_rawdir(ids0)
-                lat.append((time.monotonic() - t0) * 1000)
+                got = client.bulk_rawdir(ids0, chunk_size=cs)
+                if got:
+                    lat.append((time.monotonic() - t0) * 1000)
             except Exception:  # noqa: BLE001
                 pass
         if lat:
-            print(f"    n={len(lat)}  median {statistics.median(lat):.0f} ms  "
-                  f"min {min(lat):.0f}  max {max(lat):.0f}   (negligible vs the zip transfer)")
+            per_entry_ms = statistics.median(lat) / max(len(ids0), 1)
+            chunks_per_batch = (args.batch_size + cs - 1) // cs
+            print(f"    {len(ids0)} ids/chunk: median {statistics.median(lat):.0f} ms  "
+                  f"(~{per_entry_ms:.0f} ms/entry)  -> ~{chunks_per_batch} chunks/batch")
+            print(f"    => availability listing ~{N_FULL*per_entry_ms/1000/86400:,.1f} "
+                  f"days single-stream for 7.1M ({args.workers}x workers divides it). If this "
+                  f"rivals [5]'s transfer, it — not bandwidth — may govern the run.")
+        else:
+            print("    (all rawdir sub-requests 500'd — NOMAD's rawdir/query is degraded right "
+                  "now; the harvest still works (per-entry availability fallback), just slower.)")
 
         # 4. per-entry contrast (the --per-entry fallback path) ------------------
         if args.per_entry_n > 0 and len(entries) > args.batch_size:

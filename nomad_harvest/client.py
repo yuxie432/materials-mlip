@@ -241,20 +241,46 @@ class NomadClient:
 
     # -- bulk raw access (fixes #1 + #2: collapse per-entry requests) -------
 
-    def bulk_rawdir(self, entry_ids: list[str]) -> dict[str, dict[str, Any]]:
-        """Raw-file listings for many entries in ONE request (``POST /entries/rawdir/query``).
+    # rawdir/query is genuinely fragile: measured live 2026-08-16, an ``entry_id:any`` rawdir
+    # query 500s (server-side timeout assembling the listings) once the id list is large — n=300
+    # reliably fails, n≈50 is borderline under load. So the bulk listing is fetched in SMALL
+    # sub-requests (``RAWDIR_CHUNK``), decoupled from the (robust) download batch size, which the
+    # ``raw/query`` DOWNLOAD endpoint handles fine at 300. Small chunks stay under the server's
+    # cost limit, and each is independently retried by ``_post`` on a transient 5xx.
+    RAWDIR_CHUNK = 25
 
-        Returns ``{entry_id: {"mainfile", "upload_id", "files": [{"path","size"}, …]}}``.
-        This replaces the per-entry ``rawdir`` round-trip (**fix #2**): one request covers a
-        whole batch, so availability + file listings cost ~1 request per few-hundred entries
-        instead of one each.
+    def bulk_rawdir(self, entry_ids: list[str],
+                    chunk_size: int | None = None) -> dict[str, dict[str, Any]]:
+        """Raw-file listings for many entries via ``POST /entries/rawdir/query`` (**fix #2**),
+        split into ``chunk_size`` (default :data:`RAWDIR_CHUNK`) sub-requests so a big batch
+        never trips the endpoint's size-500.
+
+        Returns ``{entry_id: {"mainfile", "upload_id", "files": [{"path","size"}, …]}}``. Still
+        far cheaper than a per-entry ``rawdir`` each (~1 request per ``chunk_size`` entries),
+        while avoiding the hard 500 a whole-batch (~300) query hits. A sub-request that still
+        fails after the client's retries raises — the caller treats the listing as best-effort
+        and recovers per-entry.
         """
-        if not entry_ids:
-            return {}
-        body = {"owner": "public", "query": {"entry_id:any": list(entry_ids)},
-                "pagination": {"page_size": len(entry_ids)}}
-        d = self._post("/entries/rawdir/query", body)
-        return {row["entry_id"]: row for row in d.get("data", []) if row.get("entry_id")}
+        cs = max(1, chunk_size if chunk_size is not None else self.RAWDIR_CHUNK)
+        out: dict[str, dict[str, Any]] = {}
+        n_failed = 0
+        for i in range(0, len(entry_ids), cs):
+            chunk = entry_ids[i:i + cs]
+            body = {"owner": "public", "query": {"entry_id:any": list(chunk)},
+                    "pagination": {"page_size": len(chunk)}}
+            try:
+                d = self._post("/entries/rawdir/query", body)
+            except Exception:  # noqa: BLE001 - one bad sub-request must not lose the good ones;
+                n_failed += 1   # those entries are simply absent from `out` -> caller recovers per-entry.
+                continue
+            for row in d.get("data", []):
+                if row.get("entry_id"):
+                    out[row["entry_id"]] = row
+        if n_failed:
+            logger.warning("bulk_rawdir: %d/%d rawdir sub-request(s) failed; those entries' "
+                           "availability recovers per-entry", n_failed,
+                           (len(entry_ids) + cs - 1) // cs)
+        return out
 
     def bulk_raw_zip(self, entry_ids: list[str], files: dict[str, Any], dest: Path,
                      on_chunk: "Callable[[int], None] | None" = None) -> int:
