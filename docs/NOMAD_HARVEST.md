@@ -94,7 +94,7 @@ curl -sS -X POST 'https://nomad-lab.eu/prod/v1/api/v1/entries/query' \
 
 ### Auth & rate limits
 
-- **Anonymous read works** (every query in this doc ran token-free). Pass `owner="public"` for published + non-embargoed scope. Tokens are only for private/own data or writes; **no documented read-rate benefit** from a token. ⚠
+- **Anonymous read works** (every query in this doc ran token-free). Pass `owner="public"` for published + non-embargoed scope. **A token does NOT raise the read rate limit** (the ~30 req/s / ≤10-concurrent floor is enforced **per IP**, not per user — a token changes *who* you are, not *how fast* a given IP may pull), so for this public harvest a token buys nothing. Tokens exist only for private/own uploads or writes. If you ever want one anyway: register a free account at https://nomad-lab.eu, then either `POST /auth/token` (username+password grant, ~short-lived) or `GET /auth/app_token` (a long-lived "app token"); send it as `Authorization: Bearer <token>`. The genuine lever for more throughput is a **rate-limit exemption** requested from `support@nomad-lab.eu` (§7) — an IP-level allowance, not a token. ⚠
 - Documented limits are installation-dependent, floor **"as low as 30 requests per second or 10 concurrent"**, enforced **per IP** (shared across a NAT), per the API how-to
   (https://docs.nomad-lab.eu/1.4.3/howto/manage/program/api.html). **HTTP 503 = rate-limited** → back off. There are **no `RateLimit-*`/`Retry-After` headers**, so self-throttle.
 - **Contacting NOMAD is NOT a documented prerequisite for a large harvest** (checked 2026-08-14 across the API how-to, download how-to, FAQ, Terms, and Support pages — none require or request it). The *only* contact text is **reactive**: the 503 FAQ
@@ -387,14 +387,25 @@ forces/energies, so it's a discovery/dedup aid only, never a label source.
   `support@nomad-lab.eu` to request a rate-limit exemption for a multi-million-entry pull
   (not required — see §2).
 
-**Run it (bounded sample):**
+**Run it (bounded sample).** NOMAD writes to its OWN tree (`$NOMAD_HARVEST_DATA`, default a
+sibling `/rds/user/$USER/hpc-work/nomad`), kept fully separate from the Zenodo tree; the CLI
+defaults resolve there, so no `--raw-dir`/`--dataset-dir` are needed. The only Zenodo path read
+is `dataset/metadata.jsonl` for cross-source dedup.
 ```bash
-python -m nomad_harvest.cli discover --max-entries 200000 --out data/manifests/nomad_keep.jsonl
-python -m nomad_harvest.cli pipeline --in data/manifests/nomad_keep.jsonl \
-    --parts 40 --workers 4 --dataset-dir data/dataset/nomad \
-    --max-disk-bytes 800000000000 --max-disk-files 800000 --max-primary-bytes 2000000000
-python -m zenodo_harvest.cli verify --dataset-dir data/dataset/nomad
+export NOMAD_HARVEST_DATA=/rds/user/$USER/hpc-work/nomad     # NOMAD's own root (sibling of zenodo/)
+python -m nomad_harvest.cli discover --max-entries 200000    # -> $NOMAD_HARVEST_DATA/manifests/nomad_keep.jsonl
+python -m nomad_harvest.cli pipeline --in $NOMAD_HARVEST_DATA/manifests/nomad_keep.jsonl \
+    --parts 40 --workers 4 \
+    --max-disk-bytes 600000000000 --max-disk-files 600000 --max-primary-bytes 2000000000
+python -m nomad_harvest.cli status                           # read-only progress (NOMAD-aware)
+python -m zenodo_harvest.cli verify --dataset-dir $NOMAD_HARVEST_DATA/dataset
 ```
+Before sizing `--workers`, measure real bandwidth from a compute node with
+`scripts/csd3/nomad/csd3_nomad_speed.py` (it times the BULK-zip path and extrapolates the
+full-harvest transfer time). Disk budget when co-running with Zenodo jobs: the valve bounds only
+its own raw dir, so give each job a **fixed slice** summing under the shared 1 TB / 1M-inode quota
+(NOMAD 600 GB/600k + a Zenodo recovery 150 GB/150k + ~100 GB existing + headroom) — see
+`scripts/csd3/nomad/README.md`.
 
 ## 10. Open questions for the mentor
 

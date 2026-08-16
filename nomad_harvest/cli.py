@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -37,6 +38,26 @@ from zenodo_harvest.store import DatasetLockError
 
 from .client import NomadClient, direct_upload_vasp_query
 from .harvest import discover_candidates, fetch_candidates, fetch_candidates_bulk
+
+
+def nomad_paths() -> tuple[Path, Path, Path, Path]:
+    """NOMAD's OWN ``(root, manifests, raw, dataset)`` — kept SEPARATE from the Zenodo tree
+    so the two harvests never share a raw/manifests dir (a concurrent Zenodo job would
+    otherwise land in the same staging tree, and the disk valve — which walks its raw dir —
+    would count the other harvest's files).
+
+    Root precedence: ``$NOMAD_HARVEST_DATA`` if set, else a **sibling** of the Zenodo data
+    root named ``nomad`` when that root is absolute (CSD3 scratch:
+    ``/rds/.../hpc-work/zenodo`` → ``/rds/.../hpc-work/nomad``), else nested under it
+    (the local ``data`` default → ``data/nomad``, which stays gitignored). The Zenodo dataset
+    used for cross-source dedup is unaffected — discover still reads ``config.DATASET_DIR``.
+    Call after :func:`config.refresh_paths` so a ``.env`` root is already applied.
+    """
+    env = os.environ.get("NOMAD_HARVEST_DATA")
+    root = Path(env) if env else (
+        config.DATA_ROOT.parent / "nomad" if config.DATA_ROOT.is_absolute()
+        else config.DATA_ROOT / "nomad")
+    return root, root / "manifests", root / "raw", root / "dataset"
 
 
 def _add_disk_valve(p: argparse.ArgumentParser) -> None:
@@ -81,6 +102,7 @@ def _fetch(client: NomadClient, in_path: str, out_path: str | None, raw_dir: str
 def main(argv: list[str] | None = None) -> int:
     config.load_dotenv()
     config.refresh_paths()  # honour ZENODO_HARVEST_DATA from .env (write to scratch, not /home)
+    n_root, n_man, n_raw, n_ds = nomad_paths()  # NOMAD's own tree (separate from Zenodo)
     p = argparse.ArgumentParser(prog="nomad_harvest", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("-v", "--verbose", action="store_true")
@@ -88,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
 
     d = sub.add_parser("discover", help="stage 0/1: keyset scan -> license-gated, "
                                         "Zenodo-deduped keep-list")
-    d.add_argument("--out", default=str(config.MANIFEST_DIR / "nomad_keep.jsonl"))
+    d.add_argument("--out", default=str(n_man / "nomad_keep.jsonl"))
     d.add_argument("--elements", nargs="+", default=None,
                    help="restrict to materials containing ALL these elements")
     d.add_argument("--max-entries", type=int, default=None,
@@ -103,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--in", dest="in_path", required=True, help="keep-list JSONL from discover")
     f.add_argument("--out", default=None,
                    help="fetched manifest (default: <raw-dir>/../manifests/nomad_fetched.jsonl)")
-    f.add_argument("--raw-dir", default=str(config.RAW_DIR))
+    f.add_argument("--raw-dir", default=str(n_raw))
     f.add_argument("--max-records", type=int, default=None,
                    help="cap entries newly staged THIS run (resumed skips don't count)")
     _add_disk_valve(f)
@@ -116,8 +138,8 @@ def main(argv: list[str] | None = None) -> int:
                          "purged in turn; fetch of batch i+1 overlaps parse+purge of batch i)")
     pi.add_argument("--parts-dir", default=None,
                     help="dir for the split part manifests (default: <in>.pipeline_parts/)")
-    pi.add_argument("--raw-dir", default=str(config.RAW_DIR))
-    pi.add_argument("--dataset-dir", default=str(config.DATASET_DIR / "nomad"),
+    pi.add_argument("--raw-dir", default=str(n_raw))
+    pi.add_argument("--dataset-dir", default=str(n_ds),
                     help="dataset dir for the NOMAD shards + metadata (kept separate from the "
                          "Zenodo dataset; merge-datasets folds them together later)")
     pi.add_argument("--max-primary-bytes", type=int, default=2_000_000_000,
@@ -127,6 +149,22 @@ def main(argv: list[str] | None = None) -> int:
                     help="hard-kill a single calc's parse after N seconds (0 = off), so one "
                          "non-terminating pymatgen/ASE parse can't freeze the pipeline")
     _add_disk_valve(pi)
+
+    st = sub.add_parser("status", help="read-only snapshot of NOMAD harvest progress "
+                                       "(counts, staging vs quota, rejection reasons)")
+    st.add_argument("--manifests-dir", default=str(n_man))
+    st.add_argument("--raw-dir", default=str(n_raw))
+    st.add_argument("--dataset-dir", default=str(n_ds))
+    st.add_argument("--keep", default=None,
+                    help="keep-list for the fetch %% denominator (default: <manifests>/nomad_keep.jsonl)")
+    st.add_argument("--max-disk-bytes", type=int, default=0,
+                    help="show staging bytes as %% of this budget (match the pipeline's value)")
+    st.add_argument("--max-disk-files", type=int, default=0,
+                    help="show staging inodes as %% of this file budget (match the pipeline's value)")
+    st.add_argument("--no-staging-walk", action="store_true",
+                    help="skip the STAGING walk over raw/ (slow on Lustre with a live job); read "
+                         "/rds usage from `lfs quota` instead")
+    st.add_argument("--json", action="store_true", help="machine-readable output instead of text")
 
     s = sub.add_parser("smoke", help="Phase-0 live end-to-end validation (isolated temp dir)")
     s.add_argument("-n", type=int, default=12)
@@ -143,6 +181,8 @@ def main(argv: list[str] | None = None) -> int:
         import tempfile
         work = Path(args.work_dir) if args.work_dir else Path(tempfile.mkdtemp(prefix="nomad_smoke_"))
         return run(args.n, args.elements, work, args.keep)
+    if args.cmd == "status":
+        return _status(args)
 
     client = NomadClient()
     if args.cmd == "discover":
@@ -162,6 +202,23 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _status(args: argparse.Namespace) -> int:
+    """Read-only NOMAD progress snapshot. Reuses the shared status walker, told NOMAD's
+    manifest names (``nomad_keep.jsonl`` is both the discover output AND the fetch
+    denominator — NOMAD folds triage into discover — and its two rejection logs). Safe to
+    run while the pipeline writes these files; always exits 0."""
+    from zenodo_harvest.status import format_status, status_report
+    report = status_report(
+        manifests_dir=args.manifests_dir, raw_dir=args.raw_dir, dataset_dir=args.dataset_dir,
+        keep_path=args.keep, max_disk_bytes=(args.max_disk_bytes or None),
+        max_disk_files=(args.max_disk_files or None), staging_walk=not args.no_staging_walk,
+        candidate_globs=["nomad_keep.jsonl"], keep_name="nomad_keep.jsonl",
+        extra_rejection_names=("nomad_rejections.jsonl", "nomad_fetch_rejections.jsonl"),
+        fetched_globs=["*.fetched.jsonl", "nomad_fetched.jsonl"])
+    print(json.dumps(report, indent=2) if args.json else format_status(report))
+    return 0
+
+
 def _run_pipeline(client: NomadClient, args: argparse.Namespace) -> int:
     """Overlapped fetch || parse+purge over the keep-list, ending with verify.
 
@@ -177,9 +234,7 @@ def _run_pipeline(client: NomadClient, args: argparse.Namespace) -> int:
     parts_dir = Path(args.parts_dir or str(Path(args.in_path).with_suffix("")) + ".pipeline_parts")
     split_info = split_manifest(args.in_path, args.parts, parts_dir)
     part_paths = [Path(pw["path"]) for pw in split_info["parts_written"] if pw["lines"] > 0]
-    max_disk_bytes = args.max_disk_bytes or None
-    max_disk_files = args.max_disk_files or None
-    parse_rej = str(ds_dir / "rejections.jsonl")
+    parse_rej = str(ds_dir / "rejections.jsonl")  # disk-valve limits are read from `args` by _fetch
 
     def _fetched_path(part: Path) -> Path:
         return part.with_name(part.stem + ".fetched.jsonl")

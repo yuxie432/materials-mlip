@@ -77,6 +77,10 @@ def status_report(
     max_disk_bytes: int | None = None,
     max_disk_files: int | None = None,
     staging_walk: bool = True,
+    candidate_globs: list[str] | None = None,
+    keep_name: str = "keep.jsonl",
+    extra_rejection_names: tuple[str, ...] = (),
+    fetched_globs: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the machine-readable status snapshot (see module docstring).
 
@@ -84,36 +88,53 @@ def status_report(
     ``stat``s every inode under ``raw/``, which on Lustre with a live job is slow (minutes
     at high inode counts); skipping it returns the rest of the report instantly. Read the
     /rds bytes+inodes from ``lfs quota -u $USER <hpc-work>`` instead.
+
+    A second source (NOMAD) names its manifests differently and folds triage into discover,
+    so three knobs adapt the SAME counting logic to it (defaults are the Zenodo names, so
+    Zenodo behaviour is unchanged): ``candidate_globs`` = the DISCOVER manifest glob(s)
+    (Zenodo ``candidates*.jsonl``; NOMAD ``nomad_keep.jsonl``); ``keep_name`` = the fetch
+    denominator when ``keep_path`` is None (Zenodo ``keep.jsonl``; NOMAD ``nomad_keep.jsonl``);
+    ``extra_rejection_names`` = further rejection logs under ``manifests_dir`` to fold into the
+    ERRORS histogram (NOMAD's ``nomad_rejections.jsonl``/``nomad_fetch_rejections.jsonl``);
+    ``fetched_globs`` = the fetched-manifest glob(s) for the FETCH count (default covers the
+    pipeline part sidecars + Zenodo's standalone ``fetched.jsonl``; NOMAD adds ``nomad_fetched.jsonl``).
     """
     manifests_dir, raw_dir, dataset_dir = Path(manifests_dir), Path(raw_dir), Path(dataset_dir)
 
     # DISCOVER — deduplicated candidate manifest(s); exclude the raw <out>.hits.jsonl checkpoint.
-    cand_files = [p for p in sorted(manifests_dir.glob("candidates*.jsonl"))
+    globs = candidate_globs or ["candidates*.jsonl"]
+    cand_files = [p for g in globs for p in sorted(manifests_dir.glob(g))
                   if not p.name.endswith(".hits.jsonl")]
     n_candidates = sum(_count_nonempty_lines(p) for p in cand_files)
 
     # TRIAGE — the keep-list is the fetch denominator.
-    keep = Path(keep_path) if keep_path else manifests_dir / "keep.jsonl"
+    keep = Path(keep_path) if keep_path else manifests_dir / keep_name
     n_keep = _count_nonempty_lines(keep)
     # Record ids on the keep-list, so record-level progress can be counted against the
     # SAME set the fetch works over (and never exceed 100% from a stale rejection recid).
     keep_recids: set[str] = set()
     if keep.is_file():
         for rec in read_jsonl(keep):
-            rid = rec.get("recid")
+            # Zenodo keep-lists key the record as ``recid``; NOMAD's key it as ``entry_id``
+            # (== the ``recid`` the NOMAD fetch manifest later writes), so accept either.
+            rid = rec.get("recid") or rec.get("entry_id")
             if rid:
                 keep_recids.add(str(rid))
 
-    # FETCH — aggregate across every *.fetched.jsonl (pipeline writes one per part; a
-    # standalone `fetch` writes a single manifests/fetched.jsonl). rglob covers both.
+    # FETCH — aggregate across every fetched manifest. The pipeline writes one per part
+    # (``part-NNN.fetched.jsonl``, matched by ``*.fetched.jsonl``); a standalone ``fetch``
+    # writes a single ``fetched.jsonl`` (Zenodo) / ``nomad_fetched.jsonl`` (NOMAD) — NB those
+    # do NOT match ``*.fetched.jsonl`` (no dot before "fetched"), so they are listed explicitly.
     # DEDUPE BY recid: within one harvest the part sidecars hold DISJOINT recids (round-robin
     # split), so deduping == summing; but if fetched manifests from more than one flow coexist
-    # under the tree (e.g. a leftover `--parts-dir`, or the array flow's fetched.jsonl beside
-    # the pipeline's part sidecars), the SAME recid appears twice and a naive sum over-counts
+    # under the tree (e.g. a leftover `--parts-dir`, or the standalone fetched.jsonl beside the
+    # pipeline's part sidecars), the SAME recid appears twice and a naive sum over-counts
     # (observed as a >100% FETCH figure). Counting distinct recids is correct in both cases.
+    fglobs = fetched_globs or ["*.fetched.jsonl", "fetched.jsonl"]
+    fetched_files = sorted({p for g in fglobs for p in manifests_dir.rglob(g)})
     n_fetched = n_calc_units = 0
     seen_recids: set[str] = set()
-    for p in sorted(manifests_dir.rglob("*.fetched.jsonl")):
+    for p in fetched_files:
         for rec in read_jsonl(p):
             recid = rec.get("recid")
             if recid and recid in seen_recids:
@@ -138,8 +159,10 @@ def status_report(
             if not rid:
                 cid = rec.get("calc_id") or ""
                 if cid:
+                    # calc_ids are "<source>:<recid>:<path>" (source is zenodo/nomad/…), so
+                    # the record id is the middle segment; fall back to the whole id otherwise.
                     parts = cid.split(":")
-                    rid = parts[1] if cid.startswith("zenodo:") and len(parts) > 1 else parts[0]
+                    rid = parts[1] if len(parts) >= 3 else parts[0]
             if rid:
                 parsed_recids.add(str(rid))
 
@@ -165,7 +188,9 @@ def status_report(
     rej_by_stage: Counter = Counter()
     fetch_reject_recids: set[str] = set()  # RECORD-level fetch rejects (id has no ':')
     n_rej = 0
-    for rp in (manifests_dir / "rejections.jsonl", dataset_dir / "rejections.jsonl"):
+    rej_paths = [manifests_dir / "rejections.jsonl", dataset_dir / "rejections.jsonl"]
+    rej_paths += [manifests_dir / n for n in extra_rejection_names]
+    for rp in rej_paths:
         if rp.is_file():
             for rec in read_jsonl(rp):
                 n_rej += 1
@@ -173,8 +198,10 @@ def status_report(
                 rej_by_stage[str(rec.get("stage", "?"))] += 1
                 rid = rec.get("id")
                 # A record-level fetch rejection (per-file ids are "<recid>:<key>",
-                # parse ids are "zenodo:<recid>:<path>" — both carry ':').
-                if rec.get("stage") == "fetch" and isinstance(rid, str) and ":" not in rid:
+                # parse ids are "<source>:<recid>:<path>" — both carry ':'). The stage is
+                # "fetch" (Zenodo) or "nomad_fetch" (NOMAD), so match on the suffix.
+                if (str(rec.get("stage", "")).endswith("fetch")
+                        and isinstance(rid, str) and ":" not in rid):
                     fetch_reject_recids.add(rid)
 
     # RECORD-level progress: a record is "attempted" once it is fetched (yielded VASP) or
