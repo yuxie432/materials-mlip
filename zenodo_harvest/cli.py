@@ -62,6 +62,11 @@ from .availability_recover import (
     build_availability_keeplist,
     refresh_availability_metadata,
 )
+from .net_properties_recover import (
+    apply_net_properties,
+    build_net_properties_keeplist,
+    compute_net_properties,
+)
 from .parse import parse
 from .store import DatasetLockError
 from .triage import triage
@@ -345,6 +350,47 @@ def _add_refresh_availability(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--json", action="store_true", help="machine-readable output")
 
 
+def _add_net_properties_keeplist(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("net-properties-keeplist",
+                       help="stage 0 of net-moment/net-charge recovery: emit a keep-list of "
+                            "EVERY record holding a dataset calc (net props are computed for all)")
+    p.add_argument("--dataset-dir", default=str(config.DATASET_DIR))
+    p.add_argument("--keep", required=True,
+                   help="the original keep.jsonl (needs each record's file download URLs)")
+    p.add_argument("--out", required=True, help="where to write the net-properties keep-list JSONL")
+
+
+def _add_compute_net_properties(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("compute-net-properties",
+                       help="stage 1 of net-moment/net-charge recovery: compute each re-fetched "
+                            "calc's net magnetization + net charge into a net_properties.jsonl map "
+                            "(no shard access; disk-paced+resumable via the map)")
+    p.add_argument("--fetched", required=True,
+                   help="fetched manifest from re-fetching the net-properties keep-list")
+    p.add_argument("--raw-dir", default=str(config.RAW_DIR),
+                   help="where the re-fetch staged the files; manifest paths resolve against it")
+    p.add_argument("--out", required=True, help="net_properties.jsonl map to append to (resumable)")
+    p.add_argument("--dataset-dir", default=None,
+                   help="optional: restrict to calc_ids present in this dataset's metadata.jsonl")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+
+
+def _add_apply_net_properties(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("apply-net-properties",
+                       help="stage 2 of net-moment/net-charge recovery: drive the net_properties "
+                            "map into the dataset — REWRITES SHARDS (adds total_magnetization/"
+                            "total_charge per frame, strips per-atom dft_magmom/dft_charge) + "
+                            "rewrites metadata (adds `electronic`, drops site_*_present)")
+    p.add_argument("--dataset-dir", default=str(config.DATASET_DIR))
+    p.add_argument("--net-properties", required=True,
+                   help="the net_properties.jsonl map from compute-net-properties")
+    p.add_argument("--dry-run", action="store_true",
+                   help="report shards/records that would change; write nothing")
+    p.add_argument("--no-backup", action="store_true",
+                   help="skip the one-time metadata.jsonl.bak.pre_net_properties snapshot")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+
+
 def _add_reclassify_outcar(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("reclassify-outcar",
                        help="re-derive run_type/functional for OUTCAR-header calcs from their "
@@ -440,6 +486,9 @@ def main(argv: list[str] | None = None) -> int:
     _add_refresh_vasprun(sub)
     _add_availability_keeplist(sub)
     _add_refresh_availability(sub)
+    _add_net_properties_keeplist(sub)
+    _add_compute_net_properties(sub)
+    _add_apply_net_properties(sub)
     _add_purge_raw(sub)
     _add_status(sub)
     _add_pipeline(sub)
@@ -597,6 +646,34 @@ def main(argv: list[str] | None = None) -> int:
         try:
             summary = refresh_availability_metadata(
                 args.dataset_dir, args.fetched, args.raw_dir,
+                dry_run=args.dry_run, backup=not args.no_backup)
+        except DatasetLockError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        if not summary.get("ok"):
+            print(f"ERROR: {summary.get('error')}", file=sys.stderr)
+            return 1
+        print(json.dumps(summary, indent=2))
+        return 0
+    elif args.cmd == "net-properties-keeplist":
+        summary = build_net_properties_keeplist(args.dataset_dir, args.keep, args.out)
+        if not summary.get("ok"):
+            print(f"ERROR: {summary.get('error')}", file=sys.stderr)
+            return 1
+        print(json.dumps(summary, indent=2))
+        return 0
+    elif args.cmd == "compute-net-properties":
+        summary = compute_net_properties(args.fetched, args.raw_dir, args.out,
+                                         dataset_dir=args.dataset_dir)
+        if not summary.get("ok"):
+            print(f"ERROR: {summary.get('error')}", file=sys.stderr)
+            return 1
+        print(json.dumps(summary, indent=2))
+        return 0
+    elif args.cmd == "apply-net-properties":
+        try:
+            summary = apply_net_properties(
+                args.dataset_dir, args.net_properties,
                 dry_run=args.dry_run, backup=not args.no_backup)
         except DatasetLockError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
