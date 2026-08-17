@@ -112,7 +112,13 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   - `parse.py` — stage 3: pymatgen `Vasprun` (primary) → per-ionic-step ASE frames; tags each
     frame with *its own* step's electronic convergence bool + magnitude (`scf_dE`), drops steps
     with no recoverable energy, records `run_type`, full INCAR/k-points/POTCAR, availability
-    flags. Availability is taken PER CALC from fetch's `calc_availability` (falling back to the
+    flags. Every frame also carries the calc's **net magnetic moment** `total_magnetization` +
+    **net charge** `total_charge` (broadcast; `electronic.py`), mirrored into a metadata
+    `electronic` block. `parse_vasprun` enables `parse_eigen` (for the occupancy method) ONLY
+    for a collinear spin-polarised vasprun **without** an OUTCAR — a cheap streaming ISPIN
+    pre-scan (`_scan_vasprun_spin_flags`) gates it, so the ISPIN=1 majority and every
+    OUTCAR-accompanied calc parse unchanged. **Per-atom** `dft_charge`/`dft_magmom` are NO LONGER
+    stored (removed for cross-parser consistency — OUTCAR-only never had them); only the totals. Availability is taken PER CALC from fetch's `calc_availability` (falling back to the
     record-level union for pre-fix manifests) and **refined by a cheap embedded probe of the
     primary**: DOS/eigenvalues/projected written straight into a vasprun.xml (a streaming
     `<dos`/`<eigenvalues`/`<projected` tag scan, never parsing the arrays) or vaspout.h5 (its
@@ -207,6 +213,32 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
     skipped — presence of the source file IS the resume state. CSD3 campaign:
     `scripts/csd3/46_availability_recover.sh` (mirrors 45; batched fetch→refresh→purge, dedicated
     `raw_availability` dir, explicit pre-job metadata backup, verify-only finalize — no enrich).
+  - `electronic.py` — per-calc **net magnetic moment** (μ_B, = N_up−N_down = 2·S) + **net charge**
+    (e, = Z_neutral−NELECT; + = electron-deficient), the values stored on every frame
+    (`total_magnetization`/`total_charge`) and mirrored into the metadata `electronic` block. Net
+    moment: `Outcar.total_mag`-style last-`magnetization`-line scan when an OUTCAR is present (norm
+    for non-collinear); else doped's eigenvalue-**occupancy** method (`N_up−N_down`, needs
+    `parse_eigen`) for a collinear spin vasprun/vaspout without an OUTCAR; 0 for ISPIN=1; **null**
+    for non-collinear without an OUTCAR (needs the heavy projected magnetization). Net charge:
+    `NELECT` from parameters + Z_neutral from the vasprun `<atominfo>` valence col (pymatgen
+    discards it) / OUTCAR header `POMASS;ZVAL`×`ions per type` / the bundled `potcar-summary-stats`
+    titel→ZVAL table (vaspout fallback). Unknowns stay `None` (never a fabricated 0). Also
+    `is_magnetic` (spin-polarised OR non-collinear) — the single source of the
+    `availability["magnetization"]` flag now that per-atom magmoms are gone. Pure-ish + offline-tested.
+  - `net_properties_recover.py` — retrofit net moment/charge onto an **already-built** dataset;
+    UNLIKE the other recoveries this **REWRITES SHARDS** (the values live on the frames). A shard
+    mixes calcs, so **two phases**: `compute_net_properties` (Phase 1, disk-paced) re-fetches every
+    record and computes each calc's net moment/charge (`parse.electronic_block_for_unit`, the same
+    code a fresh parse uses) into a `net_properties.jsonl` map (resumable by map membership, no shard
+    touched); `apply_net_properties` (Phase 2, local, ONCE after Phase 1 completes) drives the map in
+    via a **text-level** shard edit — append the two totals to each frame's comment line + strip the
+    `dft_magmom`/`dft_charge` columns, leaving every untouched value **byte-identical** (no ASE
+    re-serialise → no float drift) — then an atomic metadata rewrite (add `electronic`, drop
+    `site_*_present`). Idempotent + resumable (`.net_properties_applied` marker); `verify` still
+    passes (frame_ids/shards/calc_id untouched). CLI `net-properties-keeplist`/`compute-net-properties`/
+    `apply-net-properties`; CSD3 campaign `scripts/csd3/47_net_properties_recover.sh` (Phase-1 batched
+    loop, then Phase-2 apply+verify once). Structured so a later per-frame field (e.g. an OUTCAR
+    ionic-convergence ΔE) is another Phase-1 field + the same Phase-2 edit.
   - `store.py` — stage 4: `ShardedExtxyzWriter` (rotating `shard-NNNNN.extxyz.gz`) +
     `MetadataWriter` (one JSONL record per calc), joined by `calc_id`/`frame_id`.
   - `status.py` — read-only progress snapshot: line-counts the append-only manifests +
@@ -229,7 +261,7 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
       every array job.
     - `purge-raw` — delete `<raw-dir>/<recid>/` trees whose every calc_id is already in the
       dataset (reclaim scratch); `--dry-run` reports without deleting.
-  - `cli.py` — `python -m zenodo_harvest.cli {discover,triage,fetch,parse,pipeline,split,merge-datasets,verify,enrich-metadata,outcar-keeplist,refresh-outcar,reclassify-outcar,vasprun-keeplist,refresh-vasprun,availability-keeplist,refresh-availability,purge-raw,status} ...`
+  - `cli.py` — `python -m zenodo_harvest.cli {discover,triage,fetch,parse,pipeline,split,merge-datasets,verify,enrich-metadata,outcar-keeplist,refresh-outcar,reclassify-outcar,vasprun-keeplist,refresh-vasprun,availability-keeplist,refresh-availability,net-properties-keeplist,compute-net-properties,apply-net-properties,purge-raw,status} ...`
     (loads `.env`; `verify`/`merge-datasets`/`pipeline` exit non-zero on an integrity failure;
     `status` is read-only and always exits 0, `--json` for machine output).
     Parse and merge take a `.parse.lock` on the dataset dir so two writers never corrupt one
@@ -306,6 +338,26 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   ```
   (no `enrich-metadata` step — availability does not feed the resolver. The refresh must run
   BEFORE `purge-raw` each batch: the embedded DOS/eigen probe reads the STAGED vasprun.)
+  **Net moment/charge recovery** (add `total_magnetization`/`total_charge` to every frame + the
+  metadata `electronic` block, and strip per-atom `dft_*`, on a dataset built before this — this
+  one **REWRITES SHARDS**; CSD3 template `scripts/csd3/47_net_properties_recover.sh` runs the whole
+  two-phase campaign). Phase 1 is a batched fetch→compute→purge loop building the map; Phase 2
+  applies it ONCE (verify still passes; frame_ids/shards/calc_id untouched):
+  ```
+  python -m zenodo_harvest.cli net-properties-keeplist --dataset-dir data/dataset \
+      --keep data/manifests/keep.jsonl --out data/manifests/net_properties_keep.jsonl  # EVERY record
+  python -m zenodo_harvest.cli fetch --in data/manifests/net_properties_keep.jsonl \
+      --out data/manifests/net_properties_fetched.jsonl --raw-dir data/raw_net_properties --max-bytes 0
+  python -m zenodo_harvest.cli compute-net-properties --fetched data/manifests/net_properties_fetched.jsonl \
+      --raw-dir data/raw_net_properties --out data/manifests/net_properties.jsonl --dataset-dir data/dataset
+  python -m zenodo_harvest.cli apply-net-properties --dataset-dir data/dataset \
+      --net-properties data/manifests/net_properties.jsonl   # REWRITES SHARDS (adds totals, strips dft_*)
+  python -m zenodo_harvest.cli verify --dataset-dir data/dataset            # bijection still holds
+  ```
+  (`compute-net-properties` re-uses the SAME `electronic.py` code a fresh parse uses, so a
+  recovered value is identical to a freshly-parsed one. `apply` is idempotent + resumable via a
+  `.net_properties_applied` marker; run Phase 2 only after Phase 1 is complete — a shard mixes
+  calcs, so a partial map would leave some frames' totals unset.)
 - `ZENODO_TOKEN` lives in `.env` (gitignored, loaded by `config.load_dotenv`). Stage 0–1 depend
   only on `requests`; stages 2–4 need `pymatgen` + `ase` (`pip install -e .[parse]`).
 - **Frame properties**: per-ionic-step energy (`e_0_energy`, σ→0, with pymatgen's `final_energy`
@@ -321,9 +373,15 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   stress is written under MACE's **`REF_stress`** key in **ASE's convention** — a Voigt-6 vector
   `[xx,yy,zz,yz,xz,xy]` in eV/Å³ with ASE's sign. The vasprun/vaspout path converts VASP's raw
   kBar tensor (`× −0.1 × ase.units.GPa` + Voigt reorder, exactly ASE's own vasprun.xml reader);
-  the OUTCAR path uses ASE's already-converted `vasp-out` stress. Per-atom DFT charges/spins come
-  from OUTCAR (end-of-run) and attach to the final frame only, under explicit output keys
-  `dft_charge`/`dft_magmom` (not ASE's `initial_*` input fields).
+  the OUTCAR path uses ASE's already-converted `vasp-out` stress. **Net magnetic moment +
+  net charge** (`electronic.py`): every frame carries the calc's `total_magnetization` (μ_B,
+  = N_up−N_down = 2·S) and `total_charge` (e, = Z_neutral−NELECT), broadcast (net charge is
+  frame-invariant; net moment is the calc's converged value) and mirrored into the metadata
+  `electronic` block. Net moment ← OUTCAR magnetization line when present, else the eigenvalue-
+  occupancy method (doped's `N_up−N_down`) for a collinear spin vasprun/vaspout without an
+  OUTCAR (0 for ISPIN=1; null for non-collinear-without-OUTCAR). **Per-atom** DFT charges/spins
+  are NOT stored (only the totals) — removed for cross-parser consistency (OUTCAR-only never
+  had them); retrofit the existing dataset with `net_properties_recover.py` (CSD3 script 47).
 - **Energy-reference tracking** (2026-07-20): the label is E0 (σ→0) but VASP's forces/stress are
   consistent with the *free* energy F, so every frame stores F as `E_free` (vasprun also the exact
   entropy term `entropy_TS` = E−F); `quality.max_abs_free_minus_e0_per_atom` lets a train-time
@@ -424,8 +482,10 @@ tail is ~170 TB).
 - **Storage format**: default to **extxyz(.gz)** for the training dataset — easy to read/write with ASE
   and pymatgen, and a de facto standard for MLIP training data. Revisit only if a clearly better option
   is identified.
-- **Properties to store** (per structure/frame): positions, chemical symbols, energy, forces, charges,
-  spin (if available). Just *record the availability* (not the full data, for storage-size reasons) of:
+- **Properties to store** (per structure/frame): positions, chemical symbols, energy, forces, and the
+  per-structure **net charge** (`total_charge`) + **net magnetic moment / total spin**
+  (`total_magnetization`) — the TOTALS, not per-atom charges/spins (which are not stored; see
+  `electronic.py`). Just *record the availability* (not the full data, for storage-size reasons) of:
   charge density, spin density, electronic structure (eigenvalues), magnetization.
 - **Provenance is mandatory** for every record: source database, database-specific ID, and any citation
   attached to the data. Also record the full calculation parameter set (k-points, pseudopotentials/POTCARs,

@@ -89,8 +89,11 @@ before ingesting).
   joined by `calc_id` / `frame_id`.
 - **Labels (MACE keys, in `atoms.info`/`atoms.arrays`):** per-ionic-step `REF_energy`
   (E0, σ→0), `REF_forces`, `REF_stress` (ASE Voigt convention, eV/Å³), plus `E_free`
-  (+`entropy_TS`) for the force/stress-consistent free energy. Per-atom `dft_charge`/
-  `dft_magmom` on the final frame.
+  (+`entropy_TS`) for the force/stress-consistent free energy, and the per-structure
+  `total_magnetization` (net moment) + `total_charge` on every frame (`electronic.py`).
+  *(Superseded 2026-08-17: the earlier per-atom `dft_charge`/`dft_magmom` on the final frame are
+  replaced by the totals; run the `net_properties_recover` campaign — CSD3 script 47 — to retrofit
+  the existing dataset.)*
 - **Per-frame quality:** `electronic_converged` + `scf_dE` (that step's own SCF verdict),
   and calc-level `quality` (frame counts, `max_abs_free_minus_e0_per_atom`).
 - **Provenance/filtering:** source DOI, `resource_type`, `license`, full INCAR/k-points/

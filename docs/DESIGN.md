@@ -26,9 +26,15 @@ vasprun.xml → 4047 frames) + 17378016 (OUTCAR-only → 40 frames):
   (`× −0.1 × ase.units.GPa` + Voigt reorder — exactly ASE's own vasprun.xml reader);
   the OUTCAR path takes ASE's `vasp-out` stress, already in this convention. Both paths
   emit an identical `REF_stress`.
-- **Per-atom charges/spins** exist only in OUTCAR (end-of-run), so they attach to
-  the final frame only (as `dft_charge`/`dft_magmom` output arrays), and only when
-  an OUTCAR sits beside the vasprun.
+- **Net magnetic moment + net charge** are stored per calc (see `zenodo_harvest/electronic.py`)
+  and broadcast onto *every* frame as `total_magnetization` (μ_B, = N_up−N_down = 2·S) and
+  `total_charge` (e, = Z_neutral−NELECT; + = electron-deficient), plus mirrored into the metadata
+  `electronic` block. Net moment: from the OUTCAR magnetization line when present; else, for a
+  collinear spin-polarised vasprun/vaspout without an OUTCAR, the eigenvalue-occupancy method
+  (`N_up−N_down`, doped's approach, needs `parse_eigen`); 0 for ISPIN=1; null for non-collinear
+  without an OUTCAR. Net charge: `NELECT` from parameters and Z_neutral from the vasprun
+  `<atominfo>` valence / OUTCAR header ZVAL / the bundled POTCAR-stats table. **Per-atom**
+  charges/spins are NOT stored (only the totals).
 - **POTCAR** files are not parsed (copyright + often absent): we keep the `titel`
   strings; `hash` is null.
 - Parser precedence: `pymatgen.Vasprun` (primary) → ASE `vasp-out` (OUTCAR-only
@@ -154,13 +160,16 @@ Per-frame layout (ASE `Atoms`, written with `ase.io.write(..., format="extxyz")`
 | chemical symbols | per-atom | `species` |
 | cell + PBC | frame header | `Lattice`, `pbc` |
 | forces | per-atom array | `REF_forces` (MACE default) |
-| charges (Bader/Mulliken/…) | per-atom array | `dft_charge` |
-| spins / magmoms | per-atom array | `dft_magmom` |
+| net magnetic moment | frame info | `total_magnetization` (μ_B, = N_up−N_down; per-calc, every frame) |
+| net charge | frame info | `total_charge` (e, = Z_neutral−NELECT; per-calc, every frame) |
 | total energy | frame info | `REF_energy` (MACE default; σ→0 E0) |
 | stress (if present) | frame info | `REF_stress` (eV/Å³, ASE Voigt; training label) |
 | free energy F (force-consistent) | frame info | `E_free`; vasprun also `entropy_TS` (=E−F) |
 | convergence flags | frame info | `electronic_converged`, `scf_dE` (this frame's OWN ionic step) |
 | **link to metadata** | frame info | `frame_id`, `source_recid` |
+
+(Per-atom `dft_charge`/`dft_magmom` are **not** stored — only the per-structure `total_charge` /
+`total_magnetization` above. Net charge is frame-invariant; net moment is the calc's converged value.)
 
 Keep the extxyz header **small**: only physical data + a `frame_id` foreign key.
 Do **not** repeat the full calculation parameters / provenance in every frame —
@@ -230,10 +239,18 @@ Proposed metadata record (one per calculation; frames reference it):
     "n_frames_dropped_no_energy": 1,         // GW/response steps dropped (no recoverable energy)
     "max_abs_free_minus_e0_per_atom": 4e-5   // worst |F - E0|/atom: E0-label vs force-consistency
   },
+  "electronic": {                            // net moment + net charge (see electronic.py)
+    "net_magnetization": 2.0,                // μ_B, = N_up-N_down = 2·S (same as every frame's total_magnetization)
+    "magnetization_units": "mu_B",
+    "magnetization_source": "outcar",        // outcar|outcar_ncl|occupancies|nonmagnetic|unavailable(_ncl)
+    "net_charge": 0.0,                        // e, = nelect_neutral - nelect (+ = electron-deficient)
+    "nelect": 34.0, "nelect_neutral": 34.0,  // actual NELECT; Z_neutral = Σ ZVAL
+    "charge_source": "vasprun_atominfo"       // vasprun_atominfo|outcar_header|potcar_stats|unavailable
+  },
   "availability": {                          // recorded, not stored (too big)
     "charge_density": true, "chgcar_file": "CHGCAR",
     "spin_density": true, "eigenvalues": true,
-    "dos": false, "magnetization": true
+    "dos": false, "magnetization": true       // = spin-polarised OR non-collinear (is_magnetic)
   },
   "frame_ids": ["...#0", "...#1", ...]
 }

@@ -118,9 +118,10 @@ server-assembled zip, which is ~100× slower (server-CPU-bound).
 
 - **Pros:** reuses *everything* already built and mentor-approved — per-ionic-step
   `e_0_energy` (σ→0) with pymatgen's `final_energy` bugfix, `E_free`/`entropy_TS`,
-  `REF_stress` in ASE convention, per-frame `scf_dE`, `dft_charge`/`dft_magmom`,
-  POTCAR `titel`, `run_type`, availability flags. The NOMAD dataset comes out
-  **schema-identical** to the Zenodo one → `merge-datasets` + `verify` just work.
+  `REF_stress` in ASE convention, per-frame `scf_dE`, per-structure `total_magnetization`
+  (net moment) + `total_charge` (`electronic.py`; a NOMAD spin vasprun without an OUTCAR uses
+  the occupancy method), POTCAR `titel`, `run_type`, availability flags. The NOMAD dataset comes
+  out **schema-identical** to the Zenodo one → `merge-datasets` + `verify` just work.
 - **Cons:** must re-download + re-parse; must handle NOMAD's mainfile **naming**
   (`vasprun.xml.relax1`, not bare `vasprun.xml`) — point pymatgen at the exact file.
 - **Effort:** small. New = a NOMAD client + discover/fetch adapter; parse/store/merge unchanged.
@@ -372,10 +373,11 @@ pull only the vasprun (`--want-outcar` also grabs a sibling OUTCAR from the same
 file is fetched, so the enhanced parser recovers full `calc_parameters`. **Anything the pre-packed
 path can't deliver** — a non-published upload, or a member missing/CRC-failing — **falls back to the
 per-entry `entries/{id}/raw` path** (a separate throttle bucket), so no coverage is lost.
-**Consequence of vasprun-only (mentor-agreed):** per-atom `dft_charge`/`dft_magmom` come only from an
-OUTCAR, so they exist for the ~7.5% OUTCAR-mainfile entries (or under `--want-outcar`); for vasprun
-entries they are absent (the "if available" clause), while DOS/eigen/magnetization/charge-density
-*availability* is still recorded for every entry. Wholesale OUTCAR is ~170 TB (§5), hence excluded.
+**Consequence of vasprun-only (mentor-agreed):** the per-structure `total_magnetization` (net moment)
++ `total_charge` are computed for **every** entry (`electronic.py`) — a spin-polarised vasprun with no
+OUTCAR uses the eigenvalue-occupancy method, so no OUTCAR is needed for the net moment — while
+DOS/eigen/magnetization/charge-density *availability* is still recorded for every entry. (Per-atom
+charges/spins are not stored on either source.) Wholesale OUTCAR is ~170 TB (§5), hence excluded.
 
 **Complementary path — OPTIMADE.** NOMAD implements OPTIMADE at
 `https://nomad-lab.eu/prod/v1/optimade/v1` (18.8M structures). Standardized
