@@ -252,6 +252,21 @@ Unit economics for scoping a subset: **per 100k entries** ≈ 0.5M frames, ~90 G
 download, ~1 GB `extxyz.gz`. Re-measure on your own sample with
 `python -m nomad_harvest.smoke -n 200 --keep` (it prints this calibration live).
 
+### ⚠ Measured CSD3 throughput (2026-08-17) — the real blocker
+
+Live-measured on CSD3 icelake nodes (`scripts/csd3/nomad/csd3_nomad_speed.py`, batch_size=50):
+the corpus is **~262 KB/entry** (→ **~1.9 TB** total transient, less than the 6.5 TB estimated above),
+but the **bulk download is throttled to ~0.5–1.7 MB/s aggregate, highly variable and NOMAD-load-gated**.
+The governor is **~2 s/file of server-side zip assembly** on `POST /entries/raw/query`, enforced
+**per IP** (CSD3 shares a NAT, so more nodes hit the same cap) — it is **file-count-bound (~2.3 files/s)**,
+not bandwidth-bound. Worker scaling is inconsistent: 8 workers hit 1.7 MB/s (5.8×) once and 0.6 (1.8×)
+another time; 10 gave 0.7 — the variance swamps the worker signal. So the **full 7.1M is ~2–6 weeks
+wall-clock** on a mostly-idle himem node, and **more workers/nodes cannot break the per-IP cap**. The
+levers are: a **rate-limit exemption** from `support@nomad-lab.eu` (the only path to a fast full run),
+**scoping down** to a diverse 1–2M slice (`--max-entries`, ~5–10 days), or an **untested per-upload glob
+fetch** (`raw/query` with `upload_id:any` + `glob_pattern`; verify the ~50-entry empty-response ceiling
+is not also on file count). See the `nomad-throughput-bottleneck` memory for the full sweep + decision.
+
 ---
 
 ## 6. Licensing & provenance
