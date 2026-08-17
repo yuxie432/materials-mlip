@@ -246,30 +246,32 @@ def run(n: int, elements: list[str] | None, work: Path, keep: bool) -> int:
         except Exception as exc:  # noqa: BLE001
             rep.failed("parse_compat", f"{type(exc).__name__}: {exc}")
 
-    # 8b. BULK fetch path (fixes #1/#2 — the DEFAULT for the real run) -------------
+    # 8b. Targeted upload-zip fetch (the DEFAULT for the real run) -----------------
+    # Groups the sample by upload and pulls each mainfile out of the upload's PRE-PACKED zip
+    # over HTTP Range (nomad_harvest.upload_zip). This exercises the real fast path end-to-end
+    # against live NOMAD; it is paced by the 1-conn/5s throttle, so a few uploads take a few s.
     if not entries:
-        rep.skip("bulk_fetch", "no entries")
+        rep.skip("upload_fetch", "no entries")
     else:
         try:
             from zenodo_harvest.parse import parse as _parse
 
-            from .harvest import fetch_candidates_bulk
-            bkeep = manifests / "bulk_keep.jsonl"
-            write_jsonl(bkeep, entries)
-            braw, bout, bds = work / "bulk_raw", manifests / "bulk_fetched.jsonl", work / "bulk_ds"
-            bsum = fetch_candidates_bulk(client, str(bkeep), raw_dir=str(braw),
-                                         out_path=str(bout),
-                                         batch_size=max(2, len(entries) // 2), workers=2)
-            bstats = _parse(str(bout), dataset_dir=str(bds), raw_dir=str(braw),
-                            rejections_path=str(bds / "rej.jsonl"), parse_timeout_s=0)
-            ok = bsum["staged"] > 0 and bstats["calcs_parsed"] > 0
-            rep.add("bulk_fetch", "PASS" if ok else "FAIL",
-                    f"{bsum['staged']}/{len(entries)} staged in {bsum['batches']} batch(es) "
-                    f"(~{2 * bsum['batches']} reqs vs {2 * len(entries)} per-entry), "
-                    f"fallback={bsum['bulk_fallback']}; parsed {bstats['calcs_parsed']} "
-                    f"-> {bstats['frames']} frames")
+            from .harvest import fetch_candidates
+            ukeep = manifests / "upload_keep.jsonl"
+            write_jsonl(ukeep, entries)
+            uraw = work / "upload_raw"
+            uout, uds = manifests / "upload_fetched.jsonl", work / "upload_ds"
+            usum = fetch_candidates(client, str(ukeep), raw_dir=str(uraw), out_path=str(uout))
+            ustats = _parse(str(uout), dataset_dir=str(uds), raw_dir=str(uraw),
+                            rejections_path=str(uds / "rej.jsonl"), parse_timeout_s=0)
+            ok = usum["staged"] > 0 and ustats["calcs_parsed"] > 0
+            rep.add("upload_fetch", "PASS" if ok else "FAIL",
+                    f"{usum['staged']}/{len(entries)} staged from {usum['uploads']} upload(s) "
+                    f"(pre-packed zip Range-extraction; per-entry fallback="
+                    f"{usum['per_entry_fallback']}); parsed {ustats['calcs_parsed']} "
+                    f"-> {ustats['frames']} frames")
         except Exception as exc:  # noqa: BLE001
-            rep.failed("bulk_fetch", f"{type(exc).__name__}: {exc}")
+            rep.failed("upload_fetch", f"{type(exc).__name__}: {exc}")
 
     # 9. verify bijection ---------------------------------------------------------
     meta_path = ds_dir / "metadata.jsonl"

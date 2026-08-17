@@ -11,7 +11,7 @@ code, so the NOMAD dataset comes out schema-identical to the Zenodo one::
     # One overlapped, disk-paced command (fetch batch i+1 while parse+purge batch i), the
     # recommended shape for a long CSD3 job — reuses the shared parse/store/verify + valve:
     python -m nomad_harvest.cli pipeline --in data/manifests/nomad_keep.jsonl \
-        --parts 40 --workers 4 --dataset-dir data/dataset/nomad \
+        --parts 40 --dataset-dir data/dataset/nomad \
         --max-disk-bytes 800000000000 --max-disk-files 800000
 
     # ...or the stages by hand (fetch, then the shared parser/verifier):
@@ -32,12 +32,12 @@ import sys
 from pathlib import Path
 
 from zenodo_harvest import config
-from zenodo_harvest.dataset_ops import purge_raw, split_manifest, verify_dataset
+from zenodo_harvest.dataset_ops import purge_raw, verify_dataset
 from zenodo_harvest.parse import parse
 from zenodo_harvest.store import DatasetLockError
 
 from .client import NomadClient, direct_upload_vasp_query
-from .harvest import discover_candidates, fetch_candidates, fetch_candidates_bulk
+from .harvest import discover_candidates, fetch_candidates, split_by_upload
 
 
 def nomad_paths() -> tuple[Path, Path, Path, Path]:
@@ -61,50 +61,31 @@ def nomad_paths() -> tuple[Path, Path, Path, Path]:
 
 
 def _add_disk_valve(p: argparse.ArgumentParser) -> None:
-    """Shared disk/inode-valve + worker flags (fetch and pipeline both pace with these)."""
+    """Disk/inode-valve flags (fetch and pipeline both pace with these).
+
+    NB there is no ``--workers`` here: the fetch pulls members out of each upload's pre-packed
+    zip via ``GET /uploads/{id}/raw``, which NOMAD rate-limits to **one connection per IP every
+    ~5 s**, so it is intrinsically serial (a 2nd connection just 429s). Grouping entries by
+    upload — not concurrency — is what keeps the run fast.
+    """
     p.add_argument("--max-disk-bytes", type=int, default=0,
                    help="stop staging cleanly once raw/ reaches this many bytes (0 = no "
                         "limit); ~0.8x the CSD3 1 TB hpc-work quota")
     p.add_argument("--max-disk-files", type=int, default=0,
                    help="stop staging once raw/ reaches this many inodes (0 = no limit); "
                         "the CSD3 1M-file quota binds first, so ~800000")
-    p.add_argument("--workers", type=int, default=1,
-                   help="concurrent downloads (NOMAD allows ~10; the raw endpoint is "
-                        "latency-bound, so ~4-8 helps). Discovery is single-stream by design.")
     p.add_argument("--want-outcar", action="store_true",
                    help="also fetch OUTCAR when present (per-atom charges/spins on the final "
                         "frame; larger transfer — vasprun-only is the default)")
-    p.add_argument("--per-entry", action="store_true",
-                   help="use the per-entry fetch (2 requests/entry) instead of the DEFAULT "
-                        "bulk fetch (~2 requests per --batch-size entries). Bulk is ~100x "
-                        "fewer requests — the difference between a ~months and a ~days run; "
-                        "use per-entry only to debug or if bulk raw/query is unavailable.")
-    p.add_argument("--batch-size", type=int, default=50,
-                   help="entries per bulk raw/query zip (bulk mode). NOMAD returns an EMPTY "
-                        "200 above ~50 (measured), so 50 is the safe ceiling — do NOT raise it "
-                        "without re-checking; a bigger batch does not speed the transfer.")
-    p.add_argument("--no-rawdir", dest="rawdir_listing", action="store_false",
-                   help="skip the per-batch availability LISTING (rawdir/query — slow ~0.2 s/entry "
-                        "and 500-prone). Availability then comes from NOMAD's available_properties "
-                        "(DOS/eigenvalues) + the parse-time embedded probe + ISPIN (magnetization); "
-                        "you LOSE only charge_density/spin_density/wavefunction/LOCPOT/ELF flags. "
-                        "Use if section [3] of csd3_nomad_speed.py shows rawdir governs the run.")
-    p.add_argument("--tmp-dir", default=None,
-                   help="node-local dir for transient batch zips (bulk mode; default a temp "
-                        "dir under $TMPDIR). Keep it OFF the rds quota — e.g. CSD3 /local.")
 
 
 def _fetch(client: NomadClient, in_path: str, out_path: str | None, raw_dir: str,
            args: argparse.Namespace, max_records: int | None) -> dict:
-    """Run the selected fetch (bulk by default, per-entry with ``--per-entry``)."""
-    kw = dict(raw_dir=raw_dir, out_path=out_path, want_outcar=args.want_outcar,
-              max_records=max_records, max_disk_bytes=(args.max_disk_bytes or None),
-              max_disk_files=(args.max_disk_files or None), workers=args.workers)
-    if args.per_entry:
-        return fetch_candidates(client, in_path, **kw)
-    return fetch_candidates_bulk(client, in_path, batch_size=args.batch_size,
-                                 tmp_dir=args.tmp_dir,
-                                 rawdir_listing=getattr(args, "rawdir_listing", True), **kw)
+    """Run the targeted upload-zip fetch (the only NOMAD fetch path)."""
+    return fetch_candidates(client, in_path, raw_dir=raw_dir, out_path=out_path,
+                            want_outcar=args.want_outcar, max_records=max_records,
+                            max_disk_bytes=(args.max_disk_bytes or None),
+                            max_disk_files=(args.max_disk_files or None))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -240,7 +221,9 @@ def _run_pipeline(client: NomadClient, args: argparse.Namespace) -> int:
 
     raw_dir, ds_dir = Path(args.raw_dir), Path(args.dataset_dir)
     parts_dir = Path(args.parts_dir or str(Path(args.in_path).with_suffix("")) + ".pipeline_parts")
-    split_info = split_manifest(args.in_path, args.parts, parts_dir)
+    # Split BY UPLOAD (not round-robin): each upload's entries stay in one part so its zip
+    # central directory is read once, not once per part. Same {"parts_written"} shape.
+    split_info = split_by_upload(args.in_path, args.parts, parts_dir)
     part_paths = [Path(pw["path"]) for pw in split_info["parts_written"] if pw["lines"] > 0]
     parse_rej = str(ds_dir / "rejections.jsonl")  # disk-valve limits are read from `args` by _fetch
 

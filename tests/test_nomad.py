@@ -29,19 +29,19 @@ from nomad_harvest.client import (
     _backoff_seconds,
     direct_upload_vasp_query,
 )
+from nomad_harvest import upload_zip
 from nomad_harvest.harvest import (
     RecordTooBig,
-    _member_role,
     build_fetched_entry,
     canonical_staged_name,
     choose_primary,
     fetch_candidates,
-    fetch_candidates_bulk,
     nomad_metadata_availability,
     normalize_doi,
     raw_path_rel,
     references_of,
     slim_candidate,
+    split_by_upload,
     stage_entry,
     zenodo_dois,
     zenodo_overlap,
@@ -466,7 +466,7 @@ def test_fetch_candidates_stops_on_disk_budget_then_resumes(tmp_path):
     out = tmp_path / "fetched.jsonl"
     # Budget ~ 1 record: the second record defers -> stop cleanly, flag set.
     s1 = fetch_candidates(client, keep, raw_dir=raw, out_path=out,
-                          max_disk_bytes=1000, max_disk_files=None, workers=1)
+                          max_disk_bytes=1000, max_disk_files=None)
     assert s1["stopped_disk_budget"] is True
     assert s1["staged"] == 1
     staged_ids = {r["recid"] for r in read_jsonl(out)}
@@ -476,7 +476,7 @@ def test_fetch_candidates_stops_on_disk_budget_then_resumes(tmp_path):
     for rid in staged_ids:
         shutil.rmtree(raw / rid)
     s2 = fetch_candidates(client, keep, raw_dir=raw, out_path=out,
-                          max_disk_bytes=1000, max_disk_files=None, workers=1)
+                          max_disk_bytes=1000, max_disk_files=None)
     assert s2["skipped_existing"] == 1              # the already-staged record is not re-fetched
     # Iterate purge+resume until every record is staged (the pacing loop the pipeline runs).
     for _ in range(5):
@@ -487,22 +487,25 @@ def test_fetch_candidates_stops_on_disk_budget_then_resumes(tmp_path):
             if (raw / rid).exists():
                 shutil.rmtree(raw / rid)
         fetch_candidates(client, keep, raw_dir=raw, out_path=out,
-                         max_disk_bytes=1000, max_disk_files=None, workers=1)
+                         max_disk_bytes=1000, max_disk_files=None)
     final = [r["recid"] for r in read_jsonl(out)]
     assert sorted(final) == ["A", "B", "C"]         # all staged, exactly once each
     assert len(final) == len(set(final))
 
 
-def test_fetch_candidates_workers_stage_all(tmp_path):
+def test_fetch_candidates_fallback_stages_all(tmp_path):
+    # Entries with no addressable upload zip (this fake serves only the per-entry endpoints)
+    # fall back to entries/{id}/raw and are all staged — coverage is never lost.
     raw = tmp_path / "raw"
     keep = _keeplist(tmp_path, [f"E{i}" for i in range(8)])
     client = FakeNomadClient({f"E{i}": _fake_entry(f"E{i}", 100) for i in range(8)})
     out = tmp_path / "fetched.jsonl"
-    summary = fetch_candidates(client, keep, raw_dir=raw, out_path=out, workers=4)
+    summary = fetch_candidates(client, keep, raw_dir=raw, out_path=out)
     ids = [r["recid"] for r in read_jsonl(out)]
     assert summary["staged"] == 8
+    assert summary["per_entry_fallback"] == 8       # all via the fallback path
     assert sorted(ids) == sorted(f"E{i}" for i in range(8))
-    assert len(ids) == len(set(ids))                # thread-safe writer: no duplicate lines
+    assert len(ids) == len(set(ids))
 
 
 def test_fetch_candidates_resume_skips_manifest(tmp_path):
@@ -517,143 +520,6 @@ def test_fetch_candidates_resume_skips_manifest(tmp_path):
     assert summary["staged"] == 0
     assert client.downloads == before                                   # no re-downloads
     assert len(list(read_jsonl(out))) == 2                              # no duplicate manifest lines
-
-
-# --- bulk fetch (fixes #1/#2): batching + exact member mapping + fallback + valve --
-
-class FakeBulkClient(FakeNomadClient):
-    """Adds the two bulk endpoints: ``bulk_rawdir`` (batch listings) and ``bulk_raw_zip``
-    (writes a REAL zip whose members are ``<upload_id>/<mainfile>`` with each entry's blob
-    as content). ``omit`` forces given entries to be MISSING from the zip, exercising the
-    per-entry fallback. Inherits ``rawdir``/``download_raw_file`` so that fallback works."""
-
-    def __init__(self, entries: dict, uploads: dict, omit=(), fail_bulk_rawdir=False):
-        super().__init__(entries)
-        self.uploads = uploads
-        self.mains = {eid: e["mainfile"] for eid, e in entries.items()}
-        self.omit = set(omit)
-        self.fail_bulk_rawdir = fail_bulk_rawdir
-        self.zips = 0
-        self.rawdirs = 0
-
-    def rawdir(self, entry_id: str) -> dict:
-        self.rawdirs += 1
-        return super().rawdir(entry_id)
-
-    def bulk_rawdir(self, ids):
-        if self.fail_bulk_rawdir:
-            raise RuntimeError("simulated bulk_rawdir 5xx for the whole batch")
-        return {eid: {"entry_id": eid, "upload_id": self.uploads[eid],
-                      "mainfile": self.mains[eid], "files": self.entries[eid]["files"]}
-                for eid in ids if eid in self.entries}
-
-    def bulk_raw_zip(self, ids, files, dest, on_chunk=None):
-        import zipfile
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(dest, "w") as zf:
-            for eid in ids:
-                if eid in self.omit or eid not in self.entries:
-                    continue
-                base = self.mains[eid].rsplit("/", 1)[-1]
-                zf.writestr(f"{self.uploads[eid]}/{self.mains[eid]}",
-                            self.entries[eid]["blobs"][base])
-        if on_chunk is not None:
-            on_chunk(dest.stat().st_size)
-        self.zips += 1
-        return dest.stat().st_size
-
-
-def _bulk_setup(tmp_path: Path, specs):
-    """specs: [(entry_id, upload_id, mainfile, size)]. Returns (keeplist, entries, uploads)."""
-    entries, uploads, rows = {}, {}, []
-    for eid, uid, mf, size in specs:
-        base = mf.rsplit("/", 1)[-1]
-        entries[eid] = {"mainfile": mf, "files": [{"path": mf, "size": size}],
-                        "blobs": {base: b"x" * size}}
-        uploads[eid] = uid
-        rows.append({"entry_id": eid, "upload_id": uid, "mainfile": mf,
-                     "license": "CC BY 4.0", "references": [],
-                     "results": {"material": {"elements": ["Si"]}}})
-    keep = tmp_path / "bulk_keep.jsonl"
-    write_jsonl(keep, rows)
-    return keep, entries, uploads
-
-
-@pytest.mark.parametrize("mainfile,role", [
-    ("d/vasprun.xml.bz2", "vasprun"), ("GEO3_vasprun.xml", "vasprun"),
-    ("run/OUTCAR", "outcar"), ("d/OUTCAR.gz", "outcar"), ("d/INCAR", None),
-])
-def test_member_role(mainfile, role):
-    assert _member_role(mainfile) == role
-
-
-def test_bulk_fetch_stages_vasprun_and_outcar(tmp_path):
-    # one vasprun-primary + one OUTCAR-only entry -> both covered by include_files
-    keep, entries, uploads = _bulk_setup(tmp_path, [
-        ("V", "U1", "a/vasprun.xml", 40),
-        ("O", "U2", "b/OUTCAR", 40)])
-    client = FakeBulkClient(entries, uploads)
-    out = tmp_path / "fetched.jsonl"
-    summary = fetch_candidates_bulk(client, keep, raw_dir=tmp_path / "raw",
-                                    out_path=out, batch_size=5)
-    assert summary["staged"] == 2 and summary["batches"] == 1 and client.zips == 1
-    recs = {r["recid"]: r for r in read_jsonl(out)}
-    assert set(recs) == {"V", "O"}
-    assert recs["V"]["provenance"]["source"] == "nomad"
-    assert recs["V"]["calc_units"][0]["vasprun"].endswith("vasprun.xml")
-    assert recs["O"]["calc_units"][0]["outcar"].endswith("OUTCAR")
-
-
-def test_bulk_fetch_falls_back_for_missing_member(tmp_path):
-    # B is omitted from the zip -> must be recovered by the per-entry fallback (no data lost)
-    keep, entries, uploads = _bulk_setup(tmp_path, [
-        ("A", "U", "d/A_vasprun.xml", 30), ("B", "U", "d/B_vasprun.xml", 30)])
-    client = FakeBulkClient(entries, uploads, omit=["B"])
-    out = tmp_path / "fetched.jsonl"
-    summary = fetch_candidates_bulk(client, keep, raw_dir=tmp_path / "raw", out_path=out)
-    assert summary["staged"] == 2                 # both staged (B via fallback)
-    assert summary["bulk_fallback"] >= 1
-    assert client.downloads >= 1                  # the per-entry download ran for B
-    assert {r["recid"] for r in read_jsonl(out)} == {"A", "B"}
-
-
-def test_bulk_fetch_resume_skips_manifest(tmp_path):
-    keep, entries, uploads = _bulk_setup(tmp_path, [
-        ("A", "U", "d/A_vasprun.xml", 20), ("B", "U", "d/B_vasprun.xml", 20)])
-    client = FakeBulkClient(entries, uploads)
-    out = tmp_path / "fetched.jsonl"
-    fetch_candidates_bulk(client, keep, raw_dir=tmp_path / "raw", out_path=out)
-    z = client.zips
-    summary = fetch_candidates_bulk(client, keep, raw_dir=tmp_path / "raw", out_path=out)
-    assert summary["skipped_existing"] == 2 and summary["staged"] == 0
-    assert client.zips == z                        # nothing re-fetched
-    assert len(list(read_jsonl(out))) == 2         # no duplicate manifest lines
-
-
-def test_bulk_fetch_recovers_availability_when_bulk_rawdir_fails(tmp_path):
-    # bulk_rawdir 5xx's for the batch -> availability (a mandatory field) must be recovered
-    # per-entry, NOT written as all-False. The upload holds a CHGCAR, so charge_density=True.
-    keep, entries, uploads = _bulk_setup(tmp_path, [("A", "U", "d/vasprun.xml", 30)])
-    entries["A"]["files"].append({"path": "d/CHGCAR", "size": 999})   # heavy output present
-    client = FakeBulkClient(entries, uploads, fail_bulk_rawdir=True)
-    out = tmp_path / "fetched.jsonl"
-    summary = fetch_candidates_bulk(client, keep, raw_dir=tmp_path / "raw", out_path=out)
-    assert summary["staged"] == 1
-    assert client.rawdirs == 1                        # per-entry rawdir recovered the listing
-    rec = next(iter(read_jsonl(out)))
-    assert rec["availability"]["charge_density"] is True   # NOT silently lost
-
-
-def test_bulk_fetch_valve_defers(tmp_path):
-    # two 600 B members, one batch, 1000 B budget: first stages, second defers (reclaimable)
-    keep, entries, uploads = _bulk_setup(tmp_path, [
-        ("A", "U", "d/A_vasprun.xml", 600), ("B", "U", "d/B_vasprun.xml", 600)])
-    client = FakeBulkClient(entries, uploads)
-    out = tmp_path / "fetched.jsonl"
-    summary = fetch_candidates_bulk(client, keep, raw_dir=tmp_path / "raw", out_path=out,
-                                    max_disk_bytes=1000, batch_size=5)
-    assert summary["staged"] == 1                  # only the first fit
-    assert summary["stopped_disk_budget"] is True  # signals pipeline to reclaim + resume
 
 
 # --- NOMAD data-root separation + status (the standalone-tree design) -----------
@@ -752,89 +618,299 @@ def test_status_zenodo_defaults_unchanged(tmp_path):
     assert r["records"]["fetch_rejected"] == 1
 
 
-# --- chunked, resilient bulk_rawdir (rawdir/query 500s on a big id list) ---------
+# --- targeted extraction from the pre-packed upload zip (the fast fetch path) ----
 
-def test_bulk_rawdir_chunks_and_covers_all(monkeypatch):
-    # rawdir/query 500s on a ~300-id query (live-verified), so bulk_rawdir must split into
-    # RAWDIR_CHUNK-sized sub-requests. Record the sub-request sizes and assert full coverage.
-    client = NomadClient()
-    seen_sizes: list[int] = []
-
-    def fake_post(path, body):
-        assert path == "/entries/rawdir/query"
-        ids = body["query"]["entry_id:any"]
-        seen_sizes.append(len(ids))
-        assert len(ids) <= client.RAWDIR_CHUNK        # never an oversized query
-        return {"data": [{"entry_id": e, "mainfile": "d/vasprun.xml", "files": []} for e in ids]}
-
-    monkeypatch.setattr(client, "_post", fake_post)
-    ids = [f"E{i}" for i in range(60)]
-    out = client.bulk_rawdir(ids, chunk_size=25)
-    assert seen_sizes == [25, 25, 10]                 # 60 split into 25+25+10
-    assert set(out) == set(ids)                       # every entry covered
+import io  # noqa: E402
+import struct  # noqa: E402
+import zipfile  # noqa: E402
 
 
-def test_bulk_rawdir_partial_on_chunk_failure(monkeypatch):
-    # A failing sub-request must NOT discard the good chunks — those entries are simply absent
-    # (the caller recovers them per-entry). No exception escapes bulk_rawdir.
-    client = NomadClient()
-    calls = {"n": 0}
-
-    def flaky_post(path, body):
-        calls["n"] += 1
-        if calls["n"] == 2:                            # 2nd chunk always fails
-            raise RuntimeError("HTTP 500 rawdir/query")
-        ids = body["query"]["entry_id:any"]
-        return {"data": [{"entry_id": e, "files": []} for e in ids]}
-
-    monkeypatch.setattr(client, "_post", flaky_post)
-    ids = [f"E{i}" for i in range(75)]                 # 3 chunks of 25
-    out = client.bulk_rawdir(ids, chunk_size=25)
-    assert len(out) == 50                              # chunks 1 + 3 kept; chunk 2 (E25..E49) lost
-    assert "E0" in out and "E50" in out and "E25" not in out
+def _make_zip(members: dict[str, bytes]) -> bytes:
+    """A real STORED zip whose members are ``{name: bytes}`` (like NOMAD's raw-public.zip)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for name, data in members.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
 
 
-# --- bulk download: empty-zip fallback + --no-rawdir (batch ceiling / rawdir cost) ---
+def _parse_ranges(range_header: str, total: int) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for part in range_header.split("=", 1)[1].split(","):
+        a, b = part.split("-")
+        if a == "":                                    # suffix: bytes=-N
+            out.append((max(0, total - int(b)), total - 1))
+        else:
+            out.append((int(a), min(int(b) if b else total - 1, total - 1)))
+    return out
 
-def test_bulk_fetch_recovers_from_empty_zip(tmp_path):
-    # NOMAD returns an EMPTY 200 (0-byte body) for a too-big raw/query batch -> zipfile raises
-    # BadZipFile. That must fall back per-entry (no data lost), NEVER crash the fetch.
-    keep, entries, uploads = _bulk_setup(tmp_path, [
-        ("A", "U", "d/A_vasprun.xml", 30), ("B", "U", "d/B_vasprun.xml", 30)])
 
-    class EmptyZipClient(FakeBulkClient):
-        def bulk_raw_zip(self, ids, files, dest, on_chunk=None):
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(b"")           # empty 200 -> 0-byte "zip"
-            self.zips += 1
-            return 0
+class _FakeResp:
+    """A minimal stand-in for a streamed requests.Response over a byte range (single or
+    multi-range), matching what :mod:`nomad_harvest.upload_zip` reads."""
 
-    client = EmptyZipClient(entries, uploads)
+    def __init__(self, data: bytes, ranges: list[tuple[int, int]]):
+        total = len(data)
+        if len(ranges) == 1:
+            s, e = ranges[0]
+            self.content = data[s:e + 1]
+            self.headers = {"Content-Range": f"bytes {s}-{e}/{total}",
+                            "Content-Type": "application/zip"}
+        else:
+            b = b"BOUND"
+            buf = b""
+            for s, e in ranges:
+                buf += b"--" + b + b"\r\n"
+                buf += f"Content-Range: bytes {s}-{e}/{total}\r\n\r\n".encode()
+                buf += data[s:e + 1] + b"\r\n"
+            buf += b"--" + b + b"--\r\n"
+            self.content = buf
+            self.headers = {"Content-Type": "multipart/byteranges; boundary=BOUND"}
+        self.status_code = 206
+
+    def iter_content(self, n):
+        for i in range(0, len(self.content), n):
+            yield self.content[i:i + n]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def close(self):
+        pass
+
+
+class FakeUploadClient:
+    """Serves an in-memory pre-packed upload zip over HTTP Range (single + multi-range) via
+    ``upload_raw_get``, plus the per-entry ``rawdir``/``download_raw_file`` endpoints for the
+    fallback path. Uploads NOT present raise (→ UploadNotAvailable → per-entry fallback)."""
+
+    def __init__(self, uploads: dict[str, bytes], entries: dict | None = None):
+        self.uploads = uploads
+        self.entries = entries or {}
+        self.upload_gets = 0
+        self.downloads = 0
+
+    def upload_raw_get(self, upload_id, range_header, stream=False):
+        self.upload_gets += 1
+        if upload_id not in self.uploads:
+            import requests
+            raise requests.HTTPError(f"no such upload {upload_id}")
+        data = self.uploads[upload_id]
+        return _FakeResp(data, _parse_ranges(range_header, len(data)))
+
+    def rawdir(self, entry_id):
+        e = self.entries[entry_id]
+        return {"mainfile": e["mainfile"], "files": e["files"]}
+
+    def download_raw_file(self, entry_id, path, dest, decompress=False, on_chunk=None):
+        blob = self.entries[entry_id]["blobs"][path]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        with tmp.open("wb") as fh:
+            if on_chunk is not None:
+                on_chunk(len(blob))
+            fh.write(blob)
+        tmp.replace(dest)
+        self.downloads += 1
+        return len(blob)
+
+
+def test_read_central_directory_parses_all_members(tmp_path):
+    members = {"calc1/vasprun.xml": b"<modeling>1</modeling>",
+               "calc1/CHGCAR": b"chg" * 50,
+               "calc2/vasprun.xml.bz2": b"\x42\x5a\x68payload"}
+    client = FakeUploadClient({"U": _make_zip(members)})
+    cd, total = upload_zip.read_central_directory(client, "U")
+    assert set(cd) == set(members)
+    assert cd["calc1/vasprun.xml"].method == 0               # STORED
+    assert cd["calc1/vasprun.xml"].uncomp_size == len(members["calc1/vasprun.xml"])
+
+
+def test_fetch_members_extracts_and_verifies_crc(tmp_path):
+    members = {f"c{i}/vasprun.xml": (f"<modeling>{i}</modeling>".encode() * (i + 1))
+               for i in range(5)}
+    client = FakeUploadClient({"U": _make_zip(members)})
+    cd, _ = upload_zip.read_central_directory(client, "U")
+    items = [(cd[name], tmp_path / f"out{i}.xml") for i, name in enumerate(members)]
+    results = upload_zip.fetch_members(client, "U", items)
+    assert all(results.values())
+    for (m, dest), name in zip(items, members):
+        assert dest.read_bytes() == members[name]           # exact bytes, CRC-verified
+
+
+def test_fetch_members_flags_crc_mismatch(tmp_path, monkeypatch):
+    members = {"c/vasprun.xml": b"<modeling/>"}
+    client = FakeUploadClient({"U": _make_zip(members)})
+    cd, _ = upload_zip.read_central_directory(client, "U")
+    m = cd["c/vasprun.xml"]
+    m.crc = (m.crc ^ 0xFFFF) & 0xFFFFFFFF                    # corrupt the expected CRC
+    results = upload_zip.fetch_members(client, "U", [(m, tmp_path / "out.xml")])
+    assert results[tmp_path / "out.xml"] is False
+    assert not (tmp_path / "out.xml").exists()              # a CRC-failed member is not written
+
+
+def _upload_keep(tmp_path, specs):
+    """specs: [(entry_id, upload_id, mainfile)] -> keep-list path."""
+    rows = [{"entry_id": e, "upload_id": u, "mainfile": mf, "license": "CC BY 4.0",
+             "references": [], "results": {"material": {"elements": ["Si"]}}}
+            for e, u, mf in specs]
+    p = tmp_path / "keep.jsonl"
+    write_jsonl(p, rows)
+    return p
+
+
+def test_fetch_candidates_upload_path_stages_and_availability(tmp_path):
+    # Two entries in ONE upload; the second's directory holds a CHGCAR -> charge_density=True,
+    # derived from the central directory (no rawdir/query call).
+    zbytes = _make_zip({"a/vasprun.xml": b"<modeling>a</modeling>",
+                        "b/vasprun.xml": b"<modeling>b</modeling>",
+                        "b/CHGCAR": b"z" * 100})
+    client = FakeUploadClient({"U": zbytes})
+    keep = _upload_keep(tmp_path, [("A", "U", "a/vasprun.xml"), ("B", "U", "b/vasprun.xml")])
     out = tmp_path / "fetched.jsonl"
-    summary = fetch_candidates_bulk(client, keep, raw_dir=tmp_path / "raw", out_path=out,
-                                    batch_size=5)
-    assert summary["staged"] == 2           # both recovered per-entry, no crash
-    assert client.rawdirs >= 2              # the per-entry fallback ran
-    assert set(r["recid"] for r in read_jsonl(out)) == {"A", "B"}
+    summary = fetch_candidates(client, keep, raw_dir=tmp_path / "raw", out_path=out)
+    assert summary["staged"] == 2 and summary["uploads"] == 1
+    assert summary["per_entry_fallback"] == 0               # everything via the fast path
+    recs = {r["recid"]: r for r in read_jsonl(out)}
+    assert set(recs) == {"A", "B"}
+    assert recs["A"]["provenance"]["source"] == "nomad"
+    assert recs["A"]["calc_units"][0]["vasprun"].endswith("vasprun.xml")
+    assert recs["A"]["availability"]["charge_density"] is False
+    assert recs["B"]["availability"]["charge_density"] is True   # CHGCAR sibling seen in the CD
+    # the actual staged file is byte-identical to the zip member
+    staged = tmp_path / "raw" / "A" / "extracted" / "calc" / "vasprun.xml"
+    assert staged.read_bytes() == b"<modeling>a</modeling>"
 
 
-def test_bulk_fetch_no_rawdir_skips_listing(tmp_path):
-    # rawdir_listing=False: the availability LISTING is skipped entirely (bulk_rawdir AND the
-    # per-entry rawdir recovery). Availability then comes only from available_properties
-    # (DOS/eigenvalues) — charge_density (a file-listing-only flag) stays False.
-    keep, entries, uploads = _bulk_setup(tmp_path, [("A", "U", "d/A_vasprun.xml", 30)])
-    entries["A"]["files"].append({"path": "d/CHGCAR", "size": 999})   # heavy file IS present
-    rows = list(read_jsonl(keep))
-    rows[0].setdefault("results", {})["properties"] = {
-        "available_properties": ["dos_electronic_new"]}                # DOS asserted in metadata
-    write_jsonl(keep, rows)
-    # fail_bulk_rawdir=True would RAISE if bulk_rawdir were called — proving it is NOT.
-    client = FakeBulkClient(entries, uploads, fail_bulk_rawdir=True)
+def test_fetch_candidates_upload_falls_back_for_missing_member(tmp_path):
+    # B's mainfile is absent from the zip -> recovered via the per-entry fallback (no loss).
+    zbytes = _make_zip({"a/vasprun.xml": b"<modeling>a</modeling>"})
+    entries = {"B": {"mainfile": "b/vasprun.xml",
+                     "files": [{"path": "b/vasprun.xml", "size": 11}],
+                     "blobs": {"vasprun.xml": b"<modeling/>"}}}
+    client = FakeUploadClient({"U": zbytes}, entries=entries)
+    keep = _upload_keep(tmp_path, [("A", "U", "a/vasprun.xml"), ("B", "U", "b/vasprun.xml")])
     out = tmp_path / "fetched.jsonl"
-    summary = fetch_candidates_bulk(client, keep, raw_dir=tmp_path / "raw", out_path=out,
-                                    batch_size=5, rawdir_listing=False)
+    summary = fetch_candidates(client, keep, raw_dir=tmp_path / "raw", out_path=out)
+    assert summary["staged"] == 2
+    assert summary["per_entry_fallback"] == 1               # B recovered per-entry
+    assert client.downloads == 1
+    assert {r["recid"] for r in read_jsonl(out)} == {"A", "B"}
+
+
+def test_fetch_candidates_upload_valve_defers(tmp_path):
+    # two members in one upload, budget ~1 record: first stages, second defers (reclaimable).
+    big = b"x" * 600
+    zbytes = _make_zip({"a/vasprun.xml": big, "b/vasprun.xml": big})
+    client = FakeUploadClient({"U": zbytes})
+    keep = _upload_keep(tmp_path, [("A", "U", "a/vasprun.xml"), ("B", "U", "b/vasprun.xml")])
+    out = tmp_path / "fetched.jsonl"
+    summary = fetch_candidates(client, keep, raw_dir=tmp_path / "raw", out_path=out,
+                               max_disk_bytes=1000)
     assert summary["staged"] == 1
-    assert client.rawdirs == 0              # NO per-entry rawdir recovery either
-    rec = next(iter(read_jsonl(out)))
-    assert rec["availability"]["dos"] is True              # from available_properties (free)
-    assert rec["availability"]["charge_density"] is False  # listing skipped -> heavy file unseen
+    assert summary["stopped_disk_budget"] is True
+
+
+def test_fetch_candidates_upload_want_outcar(tmp_path):
+    zbytes = _make_zip({"c/vasprun.xml": b"<modeling/>", "c/OUTCAR": b"outcar-bytes"})
+    client = FakeUploadClient({"U": zbytes})
+    keep = _upload_keep(tmp_path, [("A", "U", "c/vasprun.xml")])
+    out = tmp_path / "fetched.jsonl"
+    fetch_candidates(client, keep, raw_dir=tmp_path / "raw", out_path=out, want_outcar=True)
+    calc = tmp_path / "raw" / "A" / "extracted" / "calc"
+    assert (calc / "vasprun.xml").read_bytes() == b"<modeling/>"
+    assert (calc / "OUTCAR").read_bytes() == b"outcar-bytes"    # sibling OUTCAR also staged
+
+
+def test_fetch_candidates_upload_resume_skips(tmp_path):
+    zbytes = _make_zip({"a/vasprun.xml": b"<modeling>a</modeling>"})
+    client = FakeUploadClient({"U": zbytes})
+    keep = _upload_keep(tmp_path, [("A", "U", "a/vasprun.xml")])
+    out = tmp_path / "fetched.jsonl"
+    fetch_candidates(client, keep, raw_dir=tmp_path / "raw", out_path=out)
+    gets = client.upload_gets
+    summary = fetch_candidates(client, keep, raw_dir=tmp_path / "raw", out_path=out)
+    assert summary["skipped_existing"] == 1 and summary["staged"] == 0
+    assert client.upload_gets == gets                        # no re-fetch (upload skipped wholesale)
+    assert len(list(read_jsonl(out))) == 1
+
+
+# --- split by upload ------------------------------------------------------------
+
+def test_split_by_upload_keeps_uploads_whole_and_balances(tmp_path):
+    # 3 uploads (sizes 5,3,2) over 2 parts: each upload lands whole in ONE part; LPT balances.
+    rows = ([{"entry_id": f"u1-{i}", "upload_id": "U1"} for i in range(5)]
+            + [{"entry_id": f"u2-{i}", "upload_id": "U2"} for i in range(3)]
+            + [{"entry_id": f"u3-{i}", "upload_id": "U3"} for i in range(2)])
+    keep = tmp_path / "keep.jsonl"
+    write_jsonl(keep, rows)
+    info = split_by_upload(keep, 2, tmp_path / "parts")
+    assert info["uploads"] == 3
+    part_uploads = []
+    for pw in info["parts_written"]:
+        ups = {r["upload_id"] for r in read_jsonl(Path(pw["path"]))}
+        part_uploads.append(ups)
+    # every upload appears in exactly one part
+    all_ups = set().union(*part_uploads)
+    assert all_ups == {"U1", "U2", "U3"}
+    assert sum(len(u) for u in part_uploads) == 3            # no upload split across parts
+    # LPT: U1(5) -> part0; U2(3) -> part1; U3(2) -> part1  => 5 vs 5, balanced
+    assert sorted(pw["lines"] for pw in info["parts_written"]) == [5, 5]
+
+
+def test_split_by_upload_deterministic(tmp_path):
+    rows = [{"entry_id": f"e{i}", "upload_id": f"U{i % 4}"} for i in range(20)]
+    keep = tmp_path / "keep.jsonl"
+    write_jsonl(keep, rows)
+    a = split_by_upload(keep, 3, tmp_path / "p1")
+    b = split_by_upload(keep, 3, tmp_path / "p2")
+    assert [pw["lines"] for pw in a["parts_written"]] == [pw["lines"] for pw in b["parts_written"]]
+
+
+# --- zip64 central-directory parsing (the >4 GB upload case) ---------------------
+
+def test_parse_central_directory_zip64_extra():
+    # A single CD header whose comp/uncomp/offset are the 32-bit sentinel, with the real
+    # 64-bit values in the zip64 extra (0x0001) — exactly NOMAD's >4 GB uploads.
+    name = b"deep/vasprun.xml"
+    uncomp = comp = 5_000_000_000
+    offset = 6_000_000_000
+    extra = struct.pack("<HH", 0x0001, 24) + struct.pack("<QQQ", uncomp, comp, offset)
+    S = 0xFFFFFFFF
+    cdh = struct.pack("<IHHHHHHIIIHHHHHII",
+                      0x02014b50, 20, 20, 0, 0, 0, 0, 0x1234,   # sig..crc
+                      S, S,                                       # comp, uncomp (sentinels)
+                      len(name), len(extra), 0, 0, 0, 0, S)       # nlen,elen,clen,disk,iattr,eattr,offset
+    members = upload_zip._parse_central_directory(cdh + name + extra)
+    assert len(members) == 1
+    m = members[0]
+    assert m.name == "deep/vasprun.xml"
+    assert m.comp_size == comp and m.uncomp_size == uncomp and m.local_offset == offset
+
+
+def test_fetch_members_big_member_streams_to_disk(tmp_path, monkeypatch):
+    # Force the single-member streaming path (used for large OUTCARs > MAX_BATCH_BYTES).
+    monkeypatch.setattr(upload_zip, "MAX_BATCH_BYTES", 1)
+    members = {"c/OUTCAR": b"outcar-line\n" * 5000, "c/vasprun.xml": b"<modeling/>"}
+    client = FakeUploadClient({"U": _make_zip(members)})
+    cd, _ = upload_zip.read_central_directory(client, "U")
+    dests = {name: tmp_path / name.replace("/", "_") for name in members}
+    results = upload_zip.fetch_members(client, "U", [(cd[n], dests[n]) for n in members])
+    assert all(results.values())
+    for name in members:
+        assert dests[name].read_bytes() == members[name]        # exact bytes, CRC-verified
+
+
+def test_fetch_members_big_member_crc_mismatch(tmp_path, monkeypatch):
+    monkeypatch.setattr(upload_zip, "MAX_BATCH_BYTES", 1)
+    members = {"c/OUTCAR": b"x" * 4000}
+    client = FakeUploadClient({"U": _make_zip(members)})
+    cd, _ = upload_zip.read_central_directory(client, "U")
+    m = cd["c/OUTCAR"]
+    m.crc ^= 0x1
+    dest = tmp_path / "OUTCAR"
+    assert upload_zip.fetch_members(client, "U", [(m, dest)])[dest] is False
+    assert not dest.exists()

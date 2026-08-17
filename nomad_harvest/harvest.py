@@ -13,13 +13,11 @@ stage under a canonical name so varied NOMAD naming/compression parses unchanged
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import shutil
-import tempfile
-import threading
-import zipfile
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable
 
@@ -39,7 +37,9 @@ from zenodo_harvest.fetch import (
 from zenodo_harvest.manifest import JsonlWriter, RejectionLogger, read_jsonl
 from zenodo_harvest.models import is_reusable_license
 
+from . import upload_zip
 from .client import CANDIDATE_REQUIRED, NomadClient, direct_upload_vasp_query
+from .upload_zip import UploadNotAvailable, ZipMember
 
 logger = logging.getLogger(__name__)
 
@@ -480,33 +480,224 @@ def discover_candidates(client: NomadClient, out_path: str | Path,
     return {"out": str(out), "kept": kept, "dropped": dropped}
 
 
+# --- fetch: targeted extraction from the pre-packed upload zip ------------------
+# NOMAD stores each published upload as ONE zip (raw-public.plain.zip); GET /uploads/{id}/raw
+# streams it straight off disk with HTTP Range + multi-range. So the fetch addresses data BY
+# UPLOAD: read each upload's central directory once, then multi-range-pull just the kept
+# entries' mainfiles out of the zip (see nomad_harvest.upload_zip + docs/NOMAD_HARVEST.md §3).
+# That is ~15-30 MB/s vs ~0.3 for the old entries/raw/query path, which re-parses the whole
+# upload zip's central directory ~4x per file. The endpoint is rate-limited to one connection
+# per IP every ~5 s, so the fetch is SERIAL (concurrency cannot help); grouping entries by
+# upload keeps the request count small (~30k for the whole 7.1M corpus). An upload whose zip
+# cannot be read, or any individual member that fails to extract, falls back to the per-entry
+# entries/{id}/raw path (a SEPARATE throttle bucket) — coverage is never reduced.
+
+
+def _role_of(name: str) -> str | None:
+    """Calc-unit role of a filename: ``vasprun``/``outcar``, else None."""
+    base = name.rsplit("/", 1)[-1]
+    if _VASPRUN_RE.search(base):
+        return "vasprun"
+    if _OUTCAR_RE.search(base):
+        return "outcar"
+    return None
+
+
+def _dir_of(path: str) -> str:
+    return path.rsplit("/", 1)[0] if "/" in path else ""
+
+
+def _sibling_outcar(members: dict[str, ZipMember], mainfile: str) -> ZipMember | None:
+    """First OUTCAR member in the same directory as ``mainfile`` (for ``--want-outcar``)."""
+    d = _dir_of(mainfile)
+    for name, m in members.items():
+        if _dir_of(name) == d and _OUTCAR_RE.search(name.rsplit("/", 1)[-1]):
+            return m
+    return None
+
+
+def _cd_listing_for_entry(members: dict[str, ZipMember], mainfile: str) -> dict[str, Any]:
+    """A synthetic rawdir listing (``{"mainfile", "files": [{"path","size"}]}``) of the files
+    in the entry's calc directory, drawn from the upload's central directory. Fed to
+    :func:`build_fetched_entry` so availability (CHGCAR/DOSCAR/…) is derived from the zip's own
+    member list — reliable and free, replacing the old fragile per-batch ``rawdir/query`` call.
+    """
+    d = _dir_of(mainfile)
+    files = [{"path": name, "size": m.uncomp_size}
+             for name, m in members.items() if _dir_of(name) == d]
+    return {"mainfile": mainfile, "files": files}
+
+
+def _fallback_stage(client: NomadClient, entry: dict[str, Any], raw_dir: Path,
+                    want_outcar: bool, budget: StagingBudget
+                    ) -> tuple[dict[str, Any] | None, tuple[str, str] | None]:
+    """Per-entry fallback (the robust ``entries/{id}/raw`` path — a SEPARATE throttle bucket
+    from the uploads endpoint) for an entry the pre-packed path could not deliver. Returns
+    ``(fetched_entry|None, (reason, detail)|None)``; raises :class:`BudgetExceeded` to defer."""
+    res = stage_entry(client, entry, raw_dir, want_outcar=want_outcar, budget=budget)
+    if res is None:
+        return None, ("no_vasp_primary", "")
+    dest, rd = res
+    fe = build_fetched_entry(entry, raw_dir, dest, rd)
+    if fe is None:
+        _refund_and_delete(dest, budget, budget.own_handle() if budget.enabled else None)
+        return None, ("no_calc_units_after_stage", "")
+    return fe, None
+
+
+def _fallback_entries(client: NomadClient, entries: list[dict[str, Any]], raw_dir: Path,
+                      budget: StagingBudget, want_outcar: bool, w: JsonlWriter,
+                      done: set[str], rej: RejectionLogger, stats: dict[str, Any],
+                      max_records: int | None) -> bool:
+    """Per-entry fallback for a list of entries. Returns True if the disk valve deferred."""
+    for entry in entries:
+        eid = entry["entry_id"]
+        if eid in done:
+            continue
+        if max_records and stats["staged"] >= max_records:
+            return False
+        if budget.full():
+            return True
+        try:
+            fe, reject = _fallback_stage(client, entry, raw_dir, want_outcar, budget)
+        except BudgetExceeded:
+            return True
+        except RecordTooBig as exc:
+            rej.reject("nomad_fetch", eid, "record_exceeds_disk_budget", detail=str(exc))
+            stats["failed"] += 1
+            continue
+        except Exception as exc:  # noqa: BLE001 - one bad entry must not abort the run
+            rej.reject("nomad_fetch", eid, "fetch_error", detail=f"{type(exc).__name__}: {exc}")
+            stats["failed"] += 1
+            continue
+        stats["per_entry_fallback"] += 1
+        if fe is None:
+            assert reject is not None
+            rej.reject("nomad_fetch", eid, reject[0], detail=reject[1])
+            stats["failed"] += 1
+        else:
+            w.write(fe)
+            done.add(eid)
+            stats["staged"] += 1
+    return False
+
+
+def _fetch_upload(client: NomadClient, upload_id: str, entries: list[dict[str, Any]],
+                  raw_dir: Path, budget: StagingBudget, want_outcar: bool, w: JsonlWriter,
+                  done: set[str], rej: RejectionLogger, stats: dict[str, Any],
+                  max_records: int | None) -> bool:
+    """Fetch one upload's kept entries by targeted extraction from its pre-packed zip.
+
+    Reads the upload's central directory once, admits each entry against the disk/inode valve
+    (reserving its EXACT footprint from the CD), and pulls the members in multi-range batches,
+    each CRC-verified. Writes staged entries to ``w``; anything the zip cannot deliver goes to
+    the per-entry fallback. Returns True if the valve deferred (budget full of reclaimable
+    data → caller stops and the pacing loop resumes this part after a parse+purge).
+    """
+    try:
+        members, _total = upload_zip.read_central_directory(client, upload_id)
+    except UploadNotAvailable as exc:
+        logger.info("upload %s not addressable (%s); per-entry fallback for %d entries",
+                    upload_id, exc, len(entries))
+        return _fallback_entries(client, entries, raw_dir, budget, want_outcar,
+                                 w, done, rej, stats, max_records)
+
+    pending: list[tuple[dict[str, Any], list[tuple[ZipMember, Path, str]], list[int]]] = []
+    batch: list[tuple[ZipMember, Path]] = []
+    to_fallback: list[dict[str, Any]] = []
+    deferred = False
+
+    def flush() -> None:
+        nonlocal pending, batch
+        if not batch:
+            return
+        results = upload_zip.fetch_members(client, upload_id, batch)
+        for entry, plan, own in pending:
+            dest_root = raw_dir / entry["entry_id"]
+            if all(results.get(dp) for _m, dp, _r in plan):
+                listing = _cd_listing_for_entry(members, entry.get("mainfile") or "")
+                fe = build_fetched_entry(entry, raw_dir, dest_root, listing)
+                if fe is not None:
+                    w.write(fe)
+                    done.add(entry["entry_id"])
+                    stats["staged"] += 1
+                else:                                   # staged files but no parseable calc unit
+                    _refund_and_delete(dest_root, budget, own)
+                    rej.reject("nomad_fetch", entry["entry_id"],
+                               "no_calc_units_after_stage", detail="")
+                    stats["failed"] += 1
+            else:                                       # a member failed (CRC/short/transport)
+                _refund_and_delete(dest_root, budget, own)
+                to_fallback.append(entry)
+        pending = []
+        batch = []
+
+    for entry in entries:
+        if max_records and stats["staged"] >= max_records:
+            break
+        eid = entry["entry_id"]
+        mainfile = entry.get("mainfile") or ""
+        member = members.get(mainfile)
+        role = _role_of(mainfile)
+        if member is None or role is None:              # mainfile absent from the zip (rare)
+            to_fallback.append(entry)
+            continue
+        targets = [(member, role)]
+        if want_outcar and role == "vasprun":
+            oc = _sibling_outcar(members, mainfile)
+            if oc is not None:
+                targets.append((oc, "outcar"))
+        footprint_bytes = sum(m.on_disk_size for m, _ in targets)
+        footprint_inodes = len(targets) + 3            # <entry_id>/extracted/calc + the files
+        own = [0, 0]
+        try:
+            fits = budget.charge(footprint_bytes, footprint_inodes, own=own)
+        except BudgetExceeded:
+            deferred = True                            # budget full of reclaimable data -> stop
+            break
+        if not fits:                                   # this entry alone exceeds the budget
+            rej.reject("nomad_fetch", eid, "record_exceeds_disk_budget",
+                       detail=f"{footprint_bytes} B / {footprint_inodes} inode(s)")
+            stats["failed"] += 1
+            continue
+        calc_dir = raw_dir / eid / "extracted" / "calc"
+        plan = [(m, calc_dir / canonical_staged_name(m.name, r), r) for m, r in targets]
+        pending.append((entry, plan, own))
+        batch.extend((m, dp) for m, dp, _r in plan)
+        if len(batch) >= upload_zip.MAX_RANGES_PER_REQUEST:
+            flush()
+    flush()                                            # stage the admitted remainder, then...
+
+    if to_fallback and not deferred:                   # ...recover anything the zip missed
+        deferred = _fallback_entries(client, to_fallback, raw_dir, budget, want_outcar,
+                                     w, done, rej, stats, max_records)
+    return deferred
+
+
 def fetch_candidates(client: NomadClient, in_path: str | Path,
                      raw_dir: str | Path = config.RAW_DIR,
                      out_path: str | Path | None = None,
                      want_outcar: bool = False,
                      max_records: int | None = None,
                      max_disk_bytes: int | None = None,
-                     max_disk_files: int | None = None,
-                     workers: int = 1) -> dict[str, Any]:
-    """Stage 2: stage each candidate's vasprun (+optional OUTCAR) -> ``fetched.jsonl``.
+                     max_disk_files: int | None = None) -> dict[str, Any]:
+    """Stage 2: pull each candidate's mainfile out of its upload's PRE-PACKED zip.
 
-    Resumable (entries already in ``out_path`` are skipped) and audited (every failure is
-    logged with a reason, never silently dropped). Output is consumed unchanged by
-    ``zenodo_harvest.parse``.
+    The default (and only) NOMAD fetch path. Groups the input's entries by ``upload_id`` and
+    processes upload by upload — reading each upload's central directory once and multi-range
+    fetching just the wanted members (``nomad_harvest.upload_zip``). Same contract as before:
 
-    ``max_disk_bytes`` / ``max_disk_files`` (``None`` = unbounded) are the **disk/inode
-    valve**: staging stops cleanly once the raw tree reaches a limit, setting
-    ``stopped_disk_budget`` in the returned stats, so the overlapped ``pipeline`` can
-    ``parse``+``purge-raw`` to reclaim and then resume this batch. This is how a harvest far
-    bigger than the CSD3 quota (1 TB **and** 1M inodes) runs inside it — paced, not capped
-    on total volume. ``workers`` > 1 downloads that many entries concurrently (entries are
-    independent; :class:`StagingBudget` is thread-safe), which matters because NOMAD's raw
-    endpoint is latency-bound and allows ~10 concurrent. ``max_records`` caps entries newly
-    staged THIS run (resumed skips don't count).
+    * **Resumable** — entries already in ``out_path`` are skipped.
+    * **Disk/inode paced** — ``max_disk_bytes``/``max_disk_files`` (``None`` = unbounded) set
+      ``stopped_disk_budget`` so the overlapped ``pipeline`` reclaims (parse+purge) and resumes.
+    * **Audited** — every drop is logged with a reason.
+    * **Serial** — the ``/uploads/{id}/raw`` endpoint allows one connection per IP every ~5 s,
+      so there is no ``workers`` knob here (a 2nd connection just 429s). Requests are paced in
+      :meth:`~nomad_harvest.client.NomadClient.upload_raw_get`.
 
-    The returned stats carry ``staged``/``failed``/``skipped_existing``,
-    ``stopped_disk_budget``/``stopped_on``, and the budget's high-water marks
-    (``peak_staged_bytes``/``peak_staged_files``) so a run is auditable from its summary.
+    Coverage is identical to the exact-mainfile design: the vasprun (or OUTCAR for OUTCAR-
+    mainfile entries) is fetched whole, so the shared parser recovers full ``calc_parameters``;
+    availability is derived from the upload's central directory + ``available_properties``.
     """
     raw_dir = Path(raw_dir)
     manifests = raw_dir.parent / "manifests"
@@ -516,142 +707,37 @@ def fetch_candidates(client: NomadClient, in_path: str | Path,
     done = {rec["recid"] for rec in read_jsonl(out)} if out.is_file() else set()
     rej = RejectionLogger(manifests / "nomad_fetch_rejections.jsonl")
     stats: dict[str, Any] = {"records": 0, "staged": 0, "failed": 0, "skipped_existing": 0,
+                             "uploads": 0, "per_entry_fallback": 0,
                              "stopped_disk_budget": False, "stopped_on": ""}
-
-    # Create the staging root FIRST (it is the accounting root; a walk of it never counts
-    # the root itself), then seed the budget with whatever a prior, not-yet-purged run left
-    # staged (resume-aware). From here the accounting is incremental and exact.
     raw_dir.mkdir(parents=True, exist_ok=True)
-    base_bytes, base_files = (_dir_usage(raw_dir) if (max_disk_bytes or max_disk_files)
-                              else (0, 0))
-    budget = StagingBudget(max_disk_bytes, max_disk_files, base_bytes, base_files)
+    base_b, base_f = (_dir_usage(raw_dir) if (max_disk_bytes or max_disk_files) else (0, 0))
+    budget = StagingBudget(max_disk_bytes, max_disk_files, base_b, base_f)
 
-    def _build(entry: dict[str, Any]) -> tuple[dict[str, Any] | None, tuple[str, str] | None]:
-        """Stage + assemble one entry. Returns ``(fetched_entry|None, (reason,detail)|None)``.
-        Raises :class:`BudgetExceeded` to signal a defer (budget full of reclaimable data)."""
-        try:
-            res = stage_entry(client, entry, raw_dir, want_outcar=want_outcar, budget=budget)
-        except RecordTooBig as exc:
-            return None, ("record_exceeds_disk_budget", str(exc))
-        if res is None:
-            return None, ("no_vasp_primary", "")
-        dest, rd = res
-        fe = build_fetched_entry(entry, raw_dir, dest, rd)
-        if fe is None:  # staged a primary but no calc unit resolved: reclaim its space now
-            _refund_and_delete(dest, budget, budget.own_handle() if budget.enabled else None)
-            return None, ("no_calc_units_after_stage", "")
-        return fe, None
+    # Group this input's entries by upload_id (first-seen order). A pipeline part is bounded
+    # and holds each upload WHOLE (split_by_upload), so this is bounded memory and guarantees
+    # each upload's central directory is read exactly once.
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    order: list[str] = []
+    for entry in read_jsonl(in_path):
+        stats["records"] += 1
+        if entry.get("entry_id") in done:
+            stats["skipped_existing"] += 1
+            continue
+        up = entry.get("upload_id") or ""
+        if up not in groups:
+            order.append(up)
+        groups[up].append(entry)
 
-    def _serial(count_records: bool) -> None:
-        with JsonlWriter(out) as w:
-            for entry in read_jsonl(in_path):
-                if count_records:
-                    stats["records"] += 1
-                eid = entry["entry_id"]
-                if eid in done:
-                    if count_records:
-                        stats["skipped_existing"] += 1
-                    continue
-                if max_records and stats["staged"] >= max_records:
-                    break
-                if budget.full():  # stop before starting a new record once a limit is hit
-                    stats["stopped_disk_budget"], stats["stopped_on"] = True, budget.hit_limit
-                    break
-                try:
-                    fe, reject = _build(entry)
-                except BudgetExceeded:
-                    stats["stopped_disk_budget"] = True
-                    stats["stopped_on"] = budget.pause or budget.hit_limit
-                    break
-                except Exception as exc:  # noqa: BLE001 - one bad entry must not abort the run
-                    rej.reject("nomad_fetch", eid, "fetch_error",
-                               detail=f"{type(exc).__name__}: {exc}")
-                    stats["failed"] += 1
-                    continue
-                if fe is None:
-                    assert reject is not None
-                    rej.reject("nomad_fetch", eid, reject[0], detail=reject[1])
-                    stats["failed"] += 1
-                    continue
-                w.write(fe)
-                done.add(eid)
-                stats["staged"] += 1
-
-    def _parallel(count_records: bool) -> None:
-        rej_lock = threading.Lock()
-
-        def _proc(entry: dict[str, Any]) -> tuple[str, str, Any]:
-            eid = entry["entry_id"]
-            try:
-                fe, reject = _build(entry)
-                return ("ok", eid, fe) if fe is not None else ("reject", eid, reject)
-            except BudgetExceeded:
-                return ("defer", eid, None)
-            except Exception as exc:  # noqa: BLE001
-                return ("error", eid, f"{type(exc).__name__}: {exc}")
-
-        def _collect(fut: Any, w: JsonlWriter) -> None:
-            kind, eid, payload = fut.result()
-            if kind == "ok":
-                w.write(payload)
-                done.add(eid)
-                stats["staged"] += 1
-            elif kind == "reject":
-                with rej_lock:
-                    rej.reject("nomad_fetch", eid, payload[0], detail=payload[1])
-                stats["failed"] += 1
-            elif kind == "error":
-                with rej_lock:
-                    rej.reject("nomad_fetch", eid, "fetch_error", detail=payload)
-                stats["failed"] += 1
-            # "defer": budget full, nothing staged; the post-loop budget check reports it.
-
-        with JsonlWriter(out) as w, ThreadPoolExecutor(max_workers=workers) as ex:
-            inflight: set = set()
-            submitted = 0
-            for entry in read_jsonl(in_path):
-                if count_records:
-                    stats["records"] += 1
-                eid = entry["entry_id"]
-                if eid in done:
-                    if count_records:
-                        stats["skipped_existing"] += 1
-                    continue
-                if max_records and submitted >= max_records:
-                    break
-                if budget.full():
-                    stats["stopped_disk_budget"], stats["stopped_on"] = True, budget.hit_limit
-                    break
-                inflight.add(ex.submit(_proc, entry))
-                submitted += 1
-                if len(inflight) >= workers * 2:  # bound memory + refresh admission decisions
-                    finished, inflight = wait(inflight, return_when=FIRST_COMPLETED)
-                    for f in finished:
-                        _collect(f, w)
-            for f in wait(inflight)[0]:  # drain the rest
-                _collect(f, w)
-
-    if workers > 1:
-        _parallel(count_records=True)
-        # Forward-progress guard (mirrors the Zenodo fetch): if a whole parallel pass staged
-        # NOTHING and stopped on the budget, the in-flight entries each fitted alone but
-        # filled the budget between them and were all rolled back — handing the same batch
-        # back would repeat that forever. Retry serially against the just-emptied budget,
-        # where each entry either stages or is recognised as too big for the whole budget.
-        if stats["staged"] == 0 and budget.full():
-            logger.warning("nomad parallel fetch staged nothing (%s limit); retrying "
-                           "serially so the pacing loop cannot stall", budget.hit_limit)
-            budget.pause = ""
-            stats["stopped_disk_budget"], stats["stopped_on"] = False, ""
-            _serial(count_records=False)
-    else:
-        _serial(count_records=True)
+    with JsonlWriter(out) as w:
+        for up in order:
+            if budget.full() or (max_records and stats["staged"] >= max_records):
+                break
+            stats["uploads"] += 1
+            if _fetch_upload(client, up, groups[up], raw_dir, budget, want_outcar,
+                             w, done, rej, stats, max_records):
+                break
 
     rej.close()
-    # Authoritative post-loop check: a worker can fill the budget after the submit loop's
-    # last admission decision (or the very last record can), and stopped_disk_budget is what
-    # tells `pipeline` to reclaim + resume this part (deferred entries are absent from the
-    # manifest, so they are re-fetched).
     if budget.full():
         stats["stopped_disk_budget"] = True
         stats["stopped_on"] = budget.pause or budget.hit_limit
@@ -661,326 +747,44 @@ def fetch_candidates(client: NomadClient, in_path: str | Path,
     return {"out": str(out), **stats}
 
 
-# --- BULK fetch (fixes #1 + #2: ~2 requests per BATCH, not 2 per entry) ----------
-# Measured: per-entry fetch is latency-bound (~1 s/entry, 2 requests each) -> ~89 days for
-# 7.1M, and per-entry concurrency trips NOMAD's rate limiter (503 storm). The fix is to
-# collapse requests: one `rawdir/query` (availability) + one `raw/query` with
-# `include_files=[<exact mainfiles>]` (the download, verified to return EXACTLY the wanted
-# files -> no over-fetch) per batch. That turns a latency-bound fetch into a bandwidth-bound
-# one, and lets a few concurrent long-lived batch streams multiply throughput WITHOUT
-# spiking the request rate. Coverage/quality are unchanged: the exact mainfile is pulled
-# (vasprun OR OUTCAR, so OUTCAR-only entries are kept), the FULL vasprun is fetched (so the
-# enhanced parser recovers full calc_parameters), and any entry the zip can't deliver falls
-# back to the per-entry path.
+def split_by_upload(in_path: str | Path, parts: int, out_dir: str | Path) -> dict[str, Any]:
+    """Split a keep-list into ``parts`` part-files, keeping every upload's entries in ONE part.
 
-# Entries per raw/query zip. NOMAD's raw/query returns an EMPTY 200 once the batch is too big
-# (live-measured 2026-08-16: real zips at 10/25/50 entries, empty 0-byte responses at 100/200/300),
-# so 50 is the safe ceiling — NOT 300. Server-side zip assembly is ~0.7 s/file regardless of batch,
-# so a larger batch would not speed the transfer anyway; it only risks the empty-response cliff.
-_BULK_MAX_BATCH = 50
-
-
-def _member_role(mainfile: str) -> str | None:
-    """The calc-unit role of an entry's mainfile: ``vasprun``/``outcar``, else None."""
-    base = (mainfile or "").rsplit("/", 1)[-1]
-    if _VASPRUN_RE.search(base):
-        return "vasprun"
-    if _OUTCAR_RE.search(base):
-        return "outcar"
-    return None
-
-
-def _outcar_in_listing(listing: dict[str, Any]) -> str | None:
-    """First OUTCAR path in a rawdir listing (for ``--want-outcar``), else None."""
-    for f in listing.get("files") or []:
-        p = f.get("path") or ""
-        if _OUTCAR_RE.search(p.rsplit("/", 1)[-1]):
-            return p
-    return None
-
-
-def _stage_zip_member(zf: zipfile.ZipFile, member: str, out: Path,
-                      budget: StagingBudget | None, own: list[int] | None) -> None:
-    """Extract one zip member to ``out``, charging the disk/inode valve exactly as
-    :func:`stage_entry` does per download. Raises :class:`RecordTooBig` (this file alone
-    exceeds the whole budget) or :class:`BudgetExceeded` (budget full of reclaimable data →
-    defer). The member is a VASP file stored verbatim in the zip, so the bytes written equal
-    ``ZipInfo.file_size`` and charging per chunk keeps the on-disk footprint exact."""
-    if not _charged_mkdir(out.parent, budget, own):
-        raise RecordTooBig(f"{member}: staging dirs exceed the whole inode budget")
-    size = zf.getinfo(member).file_size
-    if budget is not None and budget.enabled:
-        if not budget.check(size, 1, own=own):
-            raise RecordTooBig(f"{member}: {size} B exceeds the whole disk budget")
-        if not budget.charge(0, 1, own=own):
-            raise BudgetExceeded("inode budget reached before a zip member")
-    with zf.open(member) as src, out.open("wb") as dst:
-        while True:
-            chunk = src.read(1 << 20)
-            if not chunk:
-                break
-            if budget is not None and budget.enabled and not budget.charge(len(chunk), 0, own=own):
-                raise BudgetExceeded("disk-byte budget reached mid-member")
-            dst.write(chunk)
-
-
-def _bulk_stage_batch(
-    client: NomadClient, batch: list[dict[str, Any]], raw_dir: Path,
-    budget: StagingBudget | None, tmp_dir: Path, want_outcar: bool,
-    rawdir_listing: bool = True,
-) -> tuple[dict[str, dict], list[dict], list[tuple[str, str, str]], bool]:
-    """Fetch + stage one batch with TWO bulk requests. Returns ``(staged, fallback,
-    rejects, deferred)``:
-
-      * ``staged``   — ``{entry_id: fetched_entry}`` fully staged + assembled here;
-      * ``fallback`` — entries the zip did not deliver (missing member / no role) → the
-        caller retries them per-entry, so **coverage is never reduced**;
-      * ``rejects``  — ``(entry_id, reason, detail)`` for entries that alone exceed the budget;
-      * ``deferred`` — True if a valve limit was hit mid-batch (budget full of reclaimable
-        data): the already-staged entries are kept, the rest are left for a resumed run.
+    This is the NOMAD analog of :func:`zenodo_harvest.dataset_ops.split_manifest`, but it
+    partitions by **upload** rather than by line: all of an upload's entries land in the same
+    part, so the fetch reads each upload's central directory exactly once (a round-robin split
+    would scatter an upload across all parts → one CD read per part). Parts are balanced by
+    entry count via LPT (assign the biggest uploads first to the least-loaded part), fully
+    deterministic (``(-count, upload_id)`` sort) so a resumed pipeline re-derives identical
+    parts. Returns the same ``{"parts_written": [{"path","lines"}], …}`` shape as
+    ``split_manifest`` so the shared pipeline drives it unchanged. Two streaming passes over the
+    keep-list; only the per-upload counts (~3,800 entries) are held in memory.
     """
-    ids = [e["entry_id"] for e in batch]
-    if rawdir_listing:
-        try:
-            listings = client.bulk_rawdir(ids)      # fix #2: availability for the whole batch
-        except Exception as exc:  # noqa: BLE001 - availability is best-effort; proceed without it
-            logger.debug("bulk_rawdir failed (%s); staging without availability", type(exc).__name__)
-            listings = {}
-    else:
-        listings = {}   # --no-rawdir: skip the slow/fragile listing (see build_fetched_entry:
-                        # availability then = available_properties + embedded probe + ISPIN)
-
-    include: list[str] = []
-    outcar_of: dict[str, str] = {}
-    for e in batch:
-        mf = e.get("mainfile") or ""
-        include.append(mf)
-        if want_outcar and _member_role(mf) == "vasprun":
-            oc = _outcar_in_listing(listings.get(e["entry_id"], {}))
-            if oc:
-                include.append(oc)
-                outcar_of[e["entry_id"]] = oc
-
-    zpath = tmp_dir / f"batch_{ids[0][:10]}_{len(ids)}.zip"
+    if parts < 1:
+        raise ValueError(f"parts must be >= 1, got {parts}")
+    in_path = Path(in_path)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    counts: dict[str, int] = defaultdict(int)
+    for entry in read_jsonl(in_path):
+        counts[entry.get("upload_id") or ""] += 1
+    load = [0] * parts
+    assign: dict[str, int] = {}
+    for up, c in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        i = min(range(parts), key=lambda k: load[k])
+        assign[up] = i
+        load[i] += c
+    stem = in_path.stem
+    paths = [out_dir / f"{stem}.part-{i:03d}.jsonl" for i in range(parts)]
+    handles = [p.open("w") for p in paths]
+    lines = [0] * parts
     try:
-        client.bulk_raw_zip(ids, {"include_files": include}, zpath)   # fix #1: one zip
-    except Exception as exc:  # noqa: BLE001 - whole batch failed -> everyone falls back
-        logger.warning("bulk zip failed for a %d-entry batch (%s); per-entry fallback",
-                       len(batch), type(exc).__name__)
-        return {}, list(batch), [], False
-
-    staged: dict[str, dict] = {}
-    fallback: list[dict] = []
-    rejects: list[tuple[str, str, str]] = []
-    deferred = False
-    # NOMAD returns an EMPTY 200 (a 0-byte "zip") for a raw/query whose batch is too big
-    # (measured: fine ≤50, empty ≥100), which makes zipfile raise BadZipFile. Treat an
-    # unreadable/empty zip as "batch not delivered" -> per-entry fallback, never a crash.
-    try:
-        zf = zipfile.ZipFile(zpath)
-    except Exception as exc:  # noqa: BLE001 - BadZipFile / empty response / truncation
-        logger.warning("bulk zip unreadable for a %d-entry batch (%s: likely an empty 200 — "
-                       "batch too big?); per-entry fallback", len(batch), type(exc).__name__)
-        zpath.unlink(missing_ok=True)
-        return {}, list(batch), [], False
-    try:
-        with zf:
-            members = set(zf.namelist())
-            for e in batch:
-                eid, uid, mf = e["entry_id"], e.get("upload_id"), e.get("mainfile") or ""
-                role = _member_role(mf)
-                member = f"{uid}/{mf}"
-                if role is None or member not in members:
-                    fallback.append(e)                 # zip didn't deliver -> per-entry path
-                    continue
-                dest = raw_dir / eid
-                own: list[int] | None = None
-                if budget is not None and budget.enabled:
-                    budget.begin_record()
-                    own = budget.own_handle()
-                try:
-                    _stage_zip_member(
-                        zf, member,
-                        dest / "extracted" / "calc" / canonical_staged_name(mf, role),
-                        budget, own)
-                    oc = outcar_of.get(eid)
-                    if oc and f"{uid}/{oc}" in members:
-                        _stage_zip_member(
-                            zf, f"{uid}/{oc}",
-                            dest / "extracted" / "calc" / canonical_staged_name(oc, "outcar"),
-                            budget, own)
-                    # Availability (charge density / DOS / eigenvalues / …) comes from the
-                    # rawdir file listing and is a MANDATORY provenance field. bulk_rawdir is
-                    # best-effort (it can 5xx for a whole batch — the bulk endpoints are flaky);
-                    # when it didn't cover this entry, recover the listing with a per-entry
-                    # rawdir rather than writing an all-False availability block. This costs one
-                    # extra request ONLY on the (rare) failure path — the common path stays ~2
-                    # requests/batch — and guarantees availability is never silently dropped.
-                    listing = listings.get(eid)
-                    if not (listing and listing.get("files")):
-                        if rawdir_listing:
-                            try:
-                                listing = client.rawdir(eid)
-                            except Exception:  # noqa: BLE001 - keep the calc; availability stays empty
-                                listing = {"files": []}
-                        else:
-                            listing = {"files": []}  # --no-rawdir: no per-entry recovery either
-                    fe = build_fetched_entry(e, raw_dir, dest, listing)
-                    if fe is None:                     # staged a primary but no calc unit
-                        _refund_and_delete(dest, budget, own)
-                        rejects.append((eid, "no_calc_units_after_stage", ""))
-                    else:
-                        staged[eid] = fe
-                except RecordTooBig as exc:
-                    _refund_and_delete(dest, budget, own)
-                    rejects.append((eid, "record_exceeds_disk_budget", str(exc)))
-                except BudgetExceeded:
-                    _refund_and_delete(dest, budget, own)
-                    deferred = True
-                    break                              # keep what's staged; resume the rest
-    finally:
-        zpath.unlink(missing_ok=True)
-    return staged, fallback, rejects, deferred
-
-
-def fetch_candidates_bulk(
-    client: NomadClient, in_path: str | Path,
-    raw_dir: str | Path = config.RAW_DIR, out_path: str | Path | None = None,
-    want_outcar: bool = False, max_records: int | None = None,
-    max_disk_bytes: int | None = None, max_disk_files: int | None = None,
-    workers: int = 1, batch_size: int = _BULK_MAX_BATCH,
-    tmp_dir: str | Path | None = None, rawdir_listing: bool = True,
-) -> dict[str, Any]:
-    """Stage 2, BULK: stage the keep-list with ~2 requests per ``batch_size`` entries.
-
-    The recommended fetch path (the per-entry :func:`fetch_candidates` is the fallback).
-    Same contract — resumable via ``out_path``; the disk/inode valve sets
-    ``stopped_disk_budget`` so the overlapped ``pipeline`` reclaims + resumes; every drop is
-    audited — and identical coverage/quality (exact mainfiles → OUTCAR-only entries kept; the
-    full vasprun → enhanced ``calc_parameters``; any undelivered entry falls back per-entry).
-
-    ``workers`` streams that many batch zips concurrently — safe here because bulk requests
-    are few and long-lived (they multiply bandwidth without tripping NOMAD's req/s limiter,
-    unlike per-entry concurrency). The transient batch zips live in ``tmp_dir`` (node-local,
-    e.g. ``$TMPDIR`` / CSD3 ``/local``), NOT under ``raw_dir``, so they never count against
-    the staging quota.
-    """
-    raw_dir = Path(raw_dir)
-    manifests = raw_dir.parent / "manifests"
-    manifests.mkdir(parents=True, exist_ok=True)
-    out = Path(out_path) if out_path else manifests / "nomad_fetched.jsonl"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    done = {rec["recid"] for rec in read_jsonl(out)} if out.is_file() else set()
-    rej = RejectionLogger(manifests / "nomad_fetch_rejections.jsonl")
-    stats: dict[str, Any] = {"records": 0, "staged": 0, "failed": 0, "skipped_existing": 0,
-                             "bulk_fallback": 0, "batches": 0,
-                             "stopped_disk_budget": False, "stopped_on": ""}
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    base_b, base_f = (_dir_usage(raw_dir) if (max_disk_bytes or max_disk_files) else (0, 0))
-    budget = StagingBudget(max_disk_bytes, max_disk_files, base_b, base_f)
-    own_tmp = tmp_dir is None
-    tmpd = Path(tmp_dir) if tmp_dir else Path(tempfile.mkdtemp(prefix="nomad_bulkzip_"))
-    tmpd.mkdir(parents=True, exist_ok=True)
-    write_lock = threading.Lock()
-    rej_lock = threading.Lock()
-
-    def _fallback_one(entry: dict[str, Any]) -> tuple[dict | None, tuple[str, str] | None]:
-        """Per-entry staging (the robust path) for entries the bulk zip couldn't deliver."""
-        try:
-            res = stage_entry(client, entry, raw_dir, want_outcar=want_outcar, budget=budget)
-        except RecordTooBig as exc:
-            return None, ("record_exceeds_disk_budget", str(exc))
-        if res is None:
-            return None, ("no_vasp_primary", "")
-        dest, rd = res
-        fe = build_fetched_entry(entry, raw_dir, dest, rd)
-        if fe is None:
-            _refund_and_delete(dest, budget, budget.own_handle() if budget.enabled else None)
-            return None, ("no_calc_units_after_stage", "")
-        return fe, None
-
-    def _process(batch: list[dict[str, Any]]) -> tuple[list, bool, int]:
-        """Worker task: bulk-stage a batch + per-entry fallback. Returns
-        ``(results, deferred, n_fallback)`` where results is ``[("ok", eid, fe) |
-        ("reject", eid, (reason, detail))]``."""
-        results: list = []
-        staged, fallback, rejects, deferred = _bulk_stage_batch(
-            client, batch, raw_dir, budget, tmpd, want_outcar, rawdir_listing)
-        for eid, fe in staged.items():
-            results.append(("ok", eid, fe))
-        for eid, reason, detail in rejects:
-            results.append(("reject", eid, (reason, detail)))
-        if not deferred:
-            for entry in fallback:
-                try:
-                    fe2, rj = _fallback_one(entry)
-                except BudgetExceeded:
-                    deferred = True
-                    break
-                if fe2 is not None:
-                    results.append(("ok", entry["entry_id"], fe2))
-                else:
-                    assert rj is not None
-                    results.append(("reject", entry["entry_id"], rj))
-        return results, deferred, len(fallback)
-
-    deferred = False
-
-    def _handle(results: list, w: JsonlWriter) -> None:
-        for kind, eid, payload in results:
-            if kind == "ok":
-                with write_lock:
-                    w.write(payload)
-                done.add(eid)
-                stats["staged"] += 1
-            else:  # reject
-                with rej_lock:
-                    rej.reject("nomad_fetch", eid, payload[0], detail=payload[1])
-                stats["failed"] += 1
-
-    def _batches() -> Any:
-        batch: list[dict[str, Any]] = []
         for entry in read_jsonl(in_path):
-            stats["records"] += 1
-            if entry["entry_id"] in done:
-                stats["skipped_existing"] += 1
-                continue
-            batch.append(entry)
-            if len(batch) >= batch_size:
-                yield batch
-                batch = []
-        if batch:
-            yield batch
-
-    try:
-        with JsonlWriter(out) as w, ThreadPoolExecutor(max_workers=max(workers, 1)) as ex:
-            inflight: set = set()
-            for batch in _batches():
-                if deferred or budget.full() or (max_records and stats["staged"] >= max_records):
-                    break
-                stats["batches"] += 1
-                inflight.add(ex.submit(_process, batch))
-                if len(inflight) >= max(workers, 1):
-                    finished, inflight = wait(inflight, return_when=FIRST_COMPLETED)
-                    for f in finished:
-                        results, dfr, nfb = f.result()
-                        _handle(results, w)
-                        stats["bulk_fallback"] += nfb
-                        deferred = deferred or dfr
-            for f in wait(inflight)[0]:                 # drain
-                results, dfr, nfb = f.result()
-                _handle(results, w)
-                stats["bulk_fallback"] += nfb
-                deferred = deferred or dfr
+            i = assign.get(entry.get("upload_id") or "", 0)
+            handles[i].write(json.dumps(entry) + "\n")
+            lines[i] += 1
     finally:
-        if own_tmp:
-            shutil.rmtree(tmpd, ignore_errors=True)
-
-    rej.close()
-    if deferred or budget.full():
-        stats["stopped_disk_budget"] = True
-        stats["stopped_on"] = budget.pause or budget.hit_limit
-    stats.update(budget.stats())
-    stats["items_over_whole_budget"] = budget.unfittable
-    logger.info("nomad bulk fetch: %s", stats)
-    return {"out": str(out), **stats}
+        for h in handles:
+            h.close()
+    return {"parts_written": [{"path": str(paths[i]), "lines": lines[i]} for i in range(parts)],
+            "parts": parts, "uploads": len(counts)}

@@ -98,6 +98,7 @@ class NomadClient:
         self.session = session or requests.Session()
         self.session.headers.setdefault("User-Agent", "materials-mlip-nomad/0.1")
         self._last = 0.0
+        self._upload_last = 0.0   # separate pacing for the /uploads/{id}/raw throttle (below)
 
     def _throttle(self) -> None:
         wait = self.min_interval - (time.monotonic() - self._last)
@@ -239,91 +240,58 @@ class NomadClient:
             tmp.unlink(missing_ok=True)
             raise
 
-    # -- bulk raw access (fixes #1 + #2: collapse per-entry requests) -------
+    # -- pre-packed upload zip access (THE fast fetch path) -----------------
+    #
+    # ``GET /uploads/{id}/raw`` streams the upload's ALREADY-PACKED ``raw-public.plain.zip``
+    # straight off disk (no server-side zip assembly) and honours HTTP Range + multi-range, so
+    # we read a zip's central directory and pull individual members out by byte offset
+    # (:mod:`nomad_harvest.upload_zip`) at ~15-30 MB/s — vs ~0.3 MB/s for ``entries/raw/query``,
+    # which re-parses the whole upload zip's central directory ~4x PER FILE. This is the entire
+    # NOMAD fetch redesign (docs/NOMAD_HARVEST.md §3).
+    #
+    # BUT the endpoint is rate-limited PER IP to **one in-flight connection, a new one only
+    # every ~5 s** (explicit 429: "Only one in-flight connection is allowed, and new
+    # connections allowed every 5 seconds"). It is a SEPARATE bucket from the
+    # ``entries/*`` endpoints (verified), so the per-entry fallback does not compete with it.
+    # Requests here are therefore serialised + paced; concurrency cannot help (a 2nd
+    # connection just 429s). Retries on 429 simply wait the window out.
+    UPLOAD_MIN_INTERVAL = 5.0
 
-    # rawdir/query is genuinely fragile: measured live 2026-08-16, an ``entry_id:any`` rawdir
-    # query 500s (server-side timeout assembling the listings) once the id list is large — n=300
-    # reliably fails, n≈50 is borderline under load. So the bulk listing is fetched in SMALL
-    # sub-requests (``RAWDIR_CHUNK``), decoupled from the (robust) download batch size, which the
-    # ``raw/query`` DOWNLOAD endpoint handles fine at 300. Small chunks stay under the server's
-    # cost limit, and each is independently retried by ``_post`` on a transient 5xx.
-    RAWDIR_CHUNK = 25
+    def _pace_upload(self) -> None:
+        wait = self.UPLOAD_MIN_INTERVAL - (time.monotonic() - self._upload_last)
+        if wait > 0:
+            time.sleep(wait)
 
-    def bulk_rawdir(self, entry_ids: list[str],
-                    chunk_size: int | None = None) -> dict[str, dict[str, Any]]:
-        """Raw-file listings for many entries via ``POST /entries/rawdir/query`` (**fix #2**),
-        split into ``chunk_size`` (default :data:`RAWDIR_CHUNK`) sub-requests so a big batch
-        never trips the endpoint's size-500.
+    def upload_raw_get(self, upload_id: str, range_header: str,
+                       stream: bool = False) -> requests.Response:
+        """GET a byte range of an upload's pre-packed raw zip, paced + retried for the
+        1-in-flight / 5-seconds throttle.
 
-        Returns ``{entry_id: {"mainfile", "upload_id", "files": [{"path","size"}, …]}}``. Still
-        far cheaper than a per-entry ``rawdir`` each (~1 request per ``chunk_size`` entries),
-        while avoiding the hard 500 a whole-batch (~300) query hits. A sub-request that still
-        fails after the client's retries raises — the caller treats the listing as best-effort
-        and recovers per-entry.
+        Returns the streamed ``requests.Response`` (a 200/206); the caller reads ``.content``
+        or iterates ``.iter_content`` and closes it (use as a context manager). A persistent
+        429 or a non-retryable 4xx (e.g. the upload is not published) raises after the retry
+        budget — the caller turns that into a per-entry fallback, so coverage is never lost.
         """
-        cs = max(1, chunk_size if chunk_size is not None else self.RAWDIR_CHUNK)
-        out: dict[str, dict[str, Any]] = {}
-        n_failed = 0
-        for i in range(0, len(entry_ids), cs):
-            chunk = entry_ids[i:i + cs]
-            body = {"owner": "public", "query": {"entry_id:any": list(chunk)},
-                    "pagination": {"page_size": len(chunk)}}
-            try:
-                d = self._post("/entries/rawdir/query", body)
-            except Exception:  # noqa: BLE001 - one bad sub-request must not lose the good ones;
-                n_failed += 1   # those entries are simply absent from `out` -> caller recovers per-entry.
-                continue
-            for row in d.get("data", []):
-                if row.get("entry_id"):
-                    out[row["entry_id"]] = row
-        if n_failed:
-            logger.warning("bulk_rawdir: %d/%d rawdir sub-request(s) failed; those entries' "
-                           "availability recovers per-entry", n_failed,
-                           (len(entry_ids) + cs - 1) // cs)
-        return out
-
-    def bulk_raw_zip(self, entry_ids: list[str], files: dict[str, Any], dest: Path,
-                     on_chunk: "Callable[[int], None] | None" = None) -> int:
-        """Download ONE zip of many entries' raw files selected by ``files`` (**fix #1**).
-
-        ``POST /entries/raw/query`` with ``{"entry_id:any": ids}`` + a ``files`` directive
-        (``{"include_files": [<full mainfile paths>]}`` for an EXACT, waste-free pull —
-        verified live to return exactly those files — or ``{"glob_pattern": "*vasprun*.xml*"}``)
-        streams a single ``application/zip`` of the matching files across those entries
-        (members named ``<upload_id>/<path-in-upload>``, verified live). This collapses the
-        per-entry download into ~1 request per batch — the change that turns a latency-bound,
-        ~months-long fetch into a bandwidth-bound, ~days one. Streams to ``dest`` via a
-        ``.part`` then renames; ``on_chunk`` may meter/limit the bytes. Returns bytes written.
-        """
-        body: dict[str, Any] = {"owner": "public", "query": {"entry_id:any": list(entry_ids)},
-                                "files": files}
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.with_suffix(dest.suffix + ".part")
+        url = f"{self.base}/uploads/{quote(upload_id, safe='')}/raw"
         for attempt in range(self.max_retries):
-            self._throttle()
+            self._pace_upload()
             try:
-                with self.session.post(f"{self.base}/entries/raw/query", json=body,
-                                       stream=True, timeout=self.timeout) as r:
-                    if r.status_code in _RETRY_STATUS and attempt < self.max_retries - 1:
-                        r.close()
-                        time.sleep(_backoff_seconds(attempt, r.headers.get("Retry-After")))
-                        continue
-                    r.raise_for_status()
-                    n = 0
-                    with tmp.open("wb") as fh:
-                        for chunk in r.iter_content(1 << 20):
-                            if on_chunk is not None:
-                                on_chunk(len(chunk))
-                            fh.write(chunk)
-                            n += len(chunk)
-                tmp.replace(dest)
-                self._last = time.monotonic()
-                return n
+                r = self.session.get(url, headers={"Range": range_header},
+                                     stream=stream, timeout=self.timeout)
             except requests.RequestException:
-                self._last = time.monotonic()
+                self._upload_last = time.monotonic()
                 if attempt >= self.max_retries - 1:
-                    tmp.unlink(missing_ok=True)
                     raise
                 time.sleep(_backoff_seconds(attempt, None))
-        tmp.unlink(missing_ok=True)
-        raise RuntimeError("bulk_raw_zip: exhausted retries")
+                continue
+            self._upload_last = time.monotonic()
+            if r.status_code in _RETRY_STATUS and attempt < self.max_retries - 1:
+                r.close()
+                # A 429 here is the 5-second window; wait it out (a hair over the interval).
+                wait = (self.UPLOAD_MIN_INTERVAL + 0.5 if r.status_code == 429
+                        else _backoff_seconds(attempt, r.headers.get("Retry-After")))
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r
+        raise RuntimeError(f"upload_raw_get {upload_id}: exhausted retries")
