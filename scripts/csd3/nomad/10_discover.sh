@@ -38,9 +38,9 @@ cd "${SLURM_SUBMIT_DIR:-.}"      # repo root
 # docs/NOMAD_HARVEST.md). MAX_ENTRIES caps the keep-list: a keyset scan is ordered by the
 # entry_id hash, so a cap is a DIVERSE spread across uploads, not the first upload only.
 # Raise it (or set to a huge number) to widen the sample; combine with ELEMENTS to focus.
-# The full run is Zenodo-scale (bandwidth-bound bulk fetch), so a cap is OPTIONAL — an early
-# checkpoint, not a requirement.
-MAX_ENTRIES="${MAX_ENTRIES:-200000}"
+# The full run is ~1.5-3 days (targeted pre-packed-zip fetch, docs/NOMAD_HARVEST.md §3), so a
+# cap is OPTIONAL — an early checkpoint, not a requirement.
+MAX_ENTRIES="${MAX_ENTRIES:-200000}"   # cap the keep-list; set EMPTY or 0 for the FULL 7.1M run
 ELEMENTS="${ELEMENTS:-}"               # e.g. "Ti O" -> only materials containing ALL of these
 # --------------------------------------------------------------------------------
 
@@ -48,8 +48,11 @@ mkdir -p logs_nomad "$NOMAD_HARVEST_DATA/manifests"
 MAN="$NOMAD_HARVEST_DATA/manifests"
 ELEM_ARG=()
 [[ -n "$ELEMENTS" ]] && ELEM_ARG=(--elements $ELEMENTS)
+# MAX_ENTRIES empty/0 -> omit the flag entirely (unbounded: the whole ~7.1M direct-upload set).
+CAP_ARG=()
+[[ -n "$MAX_ENTRIES" && "$MAX_ENTRIES" != "0" ]] && CAP_ARG=(--max-entries "$MAX_ENTRIES")
 
-echo "=== nomad discover $(date -Is) on $(hostname): max_entries=$MAX_ENTRIES elements='${ELEMENTS:-any}' ==="
+echo "=== nomad discover $(date -Is) on $(hostname): max_entries='${MAX_ENTRIES:-ALL}' elements='${ELEMENTS:-any}' ==="
 echo "    NOMAD tree: $NOMAD_HARVEST_DATA   (dedup against $ZENODO_HARVEST_DATA/dataset/metadata.jsonl)"
 # discover applies the license gate (keep only redistributable CC-BY/CC0/…) and dedups
 # against the Zenodo dataset's metadata.jsonl inline; every drop is logged to
@@ -57,7 +60,7 @@ echo "    NOMAD tree: $NOMAD_HARVEST_DATA   (dedup against $ZENODO_HARVEST_DATA/
 # keep-list are skipped, so a re-run continues where an interrupted scan stopped.
 python -m nomad_harvest.cli -v discover \
     --out "$MAN/nomad_keep.jsonl" \
-    --max-entries "$MAX_ENTRIES" \
+    "${CAP_ARG[@]}" \
     "${ELEM_ARG[@]}" \
     --zenodo-metadata "$ZENODO_HARVEST_DATA/dataset/metadata.jsonl"
 

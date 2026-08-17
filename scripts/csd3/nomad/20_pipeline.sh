@@ -25,9 +25,10 @@
 # combined one later with `zenodo_harvest.cli merge-datasets`. The ONLY Zenodo path this job
 # reads is the dataset/metadata.jsonl used for cross-source dedup at discover time (read-only).
 #
-# The full 7.1M direct-upload set is Zenodo-scale: the bulk fetch is bandwidth-bound, not
-# fetch-rate-bound (~47k requests total — see docs/NOMAD_HARVEST.md), so at Zenodo-like
-# throughput this is a ~1-2 week single self-resubmitting campaign, NOT a multi-job one.
+# The full 7.1M direct-upload set is fetched by TARGETED RANGE-EXTRACTION from each upload's
+# PRE-PACKED zip (GET /uploads/{id}/raw; ~30k requests total — see docs/NOMAD_HARVEST.md §3),
+# at ~15-30 MB/s. The endpoint is rate-limited to one connection per IP every ~5 s, so the
+# fetch is intrinsically SERIAL (no --workers). It is a ~1.5-3 day single self-resubmitting run.
 # Scoping with 10_discover.sh's MAX_ENTRIES is optional (an early checkpoint), not required.
 # Everything is resumable, so re-submit by hand OR set RESUBMIT=1 to self-chain across
 # wallclock kills:  RESUBMIT=1 sbatch scripts/csd3/nomad/20_pipeline.sh
@@ -45,34 +46,38 @@ export NOMAD_HARVEST_DATA="${NOMAD_HARVEST_DATA:-/rds/user/$USER/hpc-work/nomad}
 # Activate the harvest env BEFORE `sbatch` (captured via --export=ALL, carried through the
 # RESUBMIT chain). Keep it OUT of this script (a failed `module load` would abort under set -e):
 #   module load python/3.11.0-icl && source ~/materials-mlip/.venv/bin/activate
-# Parse copies each OUTCAR into $TMPDIR before ASE reads it, and the bulk fetch writes transient
-# batch zips there. Point TMPDIR at fast node-local scratch (/local, auto-removed at job end) so
-# neither eats the RAM budget nor the /rds quota (the disk valve does not track $TMPDIR). Fall
-# back to NOMAD-root scratch (NOT the Zenodo tree) so a fallback still stays out of Zenodo.
+# Parse copies each OUTCAR into $TMPDIR before ASE reads it. Point TMPDIR at fast node-local
+# scratch (/local, auto-removed at job end) so it neither eats the RAM budget nor the /rds quota.
+# (The targeted fetch reads Range responses in memory / streams big members straight to raw/, so
+# it needs no scratch.) Fall back to NOMAD-root scratch (NOT the Zenodo tree) if /local is absent.
 if [[ -d /local && -w /local ]]; then export TMPDIR="/local"; else export TMPDIR="$NOMAD_HARVEST_DATA/tmp"; fi
 mkdir -p "$TMPDIR"
 cd "${SLURM_SUBMIT_DIR:-.}"
 # --------------------------------------------------------------------------------
 
 # ---- HARVEST PARAMETERS ---------------------------------------------------------
-PARTS="${PARTS:-40}"                   # batches; more parts = smaller peak staging
-WORKERS="${WORKERS:-4}"                # concurrent downloads (NOMAD allows ~10 concurrent)
+PARTS="${PARTS:-40}"                   # batches; each part holds WHOLE uploads (split_by_upload),
+                                       # fetched serially. Default 40 suits a scoped run; for the
+                                       # FULL 7.1M set use PARTS>=80 so each part fits the inode
+                                       # budget in one window (else it's parsed+purged in instalments
+                                       # — still correct, just less fetch/parse overlap).
 # DISK/INODE PARTITION (fixed-slice design). The valve bounds only THIS job's raw staging
-# ($NOMAD_HARVEST_DATA/raw); it cannot see the Zenodo tree or another job's staging. The 1 TB /
-# 1M-inode hpc-work quota is SHARED across everything you run, so give each job a fixed slice
-# that SUMS under quota after reserving the fixed/growing consumers. Worked budget (co-running
-# NOMAD + ONE small Zenodo recovery), quota ~1000 GB / 1.0M inodes:
-#     reserve  existing Zenodo raw+dataset ~100 GB / ~100k   (measured)
+# ($NOMAD_HARVEST_DATA/raw); it cannot see the Zenodo tree or another job's staging. NOMAD raw
+# staging is **INODE-bound, not byte-bound**: each entry stages 4 inodes (<entry_id>/extracted/
+# calc/vasprun.xml) but only ~0.26 MB, so the INODE valve is what caps peak staging and the byte
+# valve is a loose safety net. Peak bytes ~= (MAX_DISK_FILES/4) x 0.26 MB (~26 GB at 400k inodes;
+# 200 GB leaves generous margin for the OUTCAR-mainfile / AIMD tail). The 1 TB / 1M-inode hpc-work
+# quota is SHARED, so partition INODES first. Worked budget (co-running NOMAD + a Zenodo recovery):
+#     reserve  existing Zenodo raw+dataset  ~100 GB / ~100k
 #     reserve  NOMAD final dataset+manifests ~40-60 GB / ~few-k (grows during the run)
-#     NOMAD raw valve            600 GB / 600k   (this job, below)
-#     Zenodo-recovery raw valve  150 GB / 150k   (override MAX_DISK_* on scripts/csd3/46_*.sh)
-#     headroom                  ~100 GB / ~50k
-# Running NOMAD SOLO? You may raise these to ~800 GB / 800k. The valve charges every byte as
-# written + every inode as created and refunds on delete, so `staged <= limit` holds exactly.
-MAX_DISK_BYTES="${MAX_DISK_BYTES:-600000000000}"
-# hpc-work is ALSO capped at 1M inodes and this binds FIRST: each NOMAD entry stages ~3-4 inodes
-# (<entry_id>/extracted/calc/vasprun.xml), so ~150-200k entries fill 600k before bytes.
-MAX_DISK_FILES="${MAX_DISK_FILES:-600000}"
+#     NOMAD raw valve             200 GB / 400k   (this job, below — inode-bound)
+#     Zenodo-recovery raw valve   300 GB / 300k   (override MAX_DISK_* on scripts/csd3/46_*.sh; was 150k)
+#     headroom                   ~150 GB / ~150k
+#   -> inodes 100k+400k+300k+150k = 950k < 1M; bytes well under 1 TB.
+# Running NOMAD SOLO? Raise to ~400 GB / 800k (and PARTS>=48). The valve charges every byte + inode
+# as created and refunds on delete, so `staged <= limit` holds exactly.
+MAX_DISK_BYTES="${MAX_DISK_BYTES:-200000000000}"
+MAX_DISK_FILES="${MAX_DISK_FILES:-400000}"
 # RAM guard: refuse to ATTEMPT a primary bigger than this (0 = attempt everything). pymatgen
 # peak RSS is ~10x the vasprun size; an over-budget parse is a cgroup SIGKILL, not a catchable
 # error. icelake-himem = 6760 MiB/core, so --cpus-per-task=4 gives ~26 GiB -> ~0.85x/10 ~= 2 GB.
@@ -141,7 +146,7 @@ trap 'submit_successor' USR1
 rc=0
 python -m nomad_harvest.cli -v pipeline \
     --in "$MAN/nomad_keep.jsonl" \
-    --parts "$PARTS" --workers "$WORKERS" \
+    --parts "$PARTS" \
     --max-disk-bytes "$MAX_DISK_BYTES" \
     --max-disk-files "$MAX_DISK_FILES" \
     --max-primary-bytes "$MAX_PRIMARY_BYTES" \

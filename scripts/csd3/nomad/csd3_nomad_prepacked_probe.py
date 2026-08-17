@@ -94,13 +94,13 @@ def _parse_cd(cd: bytes) -> list[dict]:
                 hid, hsz = struct.unpack("<HH", extra[j:j + 4])
                 body = extra[j + 4:j + 4 + hsz]
                 if hid == 0x0001:
-                    k = 0
+                    vals = iter(struct.unpack_from(f"<{len(body) // 8}Q", body))
                     if uncomp == 0xFFFFFFFF:
-                        uncomp = struct.unpack("<Q", body[k:k + 8])[0]; k += 8
+                        uncomp = next(vals)
                     if comp == 0xFFFFFFFF:
-                        comp = struct.unpack("<Q", body[k:k + 8])[0]; k += 8
+                        comp = next(vals)
                     if off == 0xFFFFFFFF:
-                        off = struct.unpack("<Q", body[k:k + 8])[0]; k += 8
+                        off = next(vals)
                 j += 4 + hsz
         out.append(dict(name=name, method=method, comp=comp, uncomp=uncomp, off=off))
         i += 46 + nlen + elen + clen

@@ -97,8 +97,9 @@ curl -sS -X POST 'https://nomad-lab.eu/prod/v1/api/v1/entries/query' \
 - **Anonymous read works** (every query in this doc ran token-free). Pass `owner="public"` for published + non-embargoed scope. **A token does NOT raise the read rate limit** (the ~30 req/s / ≤10-concurrent floor is enforced **per IP**, not per user — a token changes *who* you are, not *how fast* a given IP may pull), so for this public harvest a token buys nothing. Tokens exist only for private/own uploads or writes. If you ever want one anyway: register a free account at https://nomad-lab.eu, then either `POST /auth/token` (username+password grant, ~short-lived) or `GET /auth/app_token` (a long-lived "app token"); send it as `Authorization: Bearer <token>`. The genuine lever for more throughput is a **rate-limit exemption** requested from `support@nomad-lab.eu` (§7) — an IP-level allowance, not a token. ⚠
 - Documented limits are installation-dependent, floor **"as low as 30 requests per second or 10 concurrent"**, enforced **per IP** (shared across a NAT), per the API how-to
   (https://docs.nomad-lab.eu/1.4.3/howto/manage/program/api.html). **HTTP 503 = rate-limited** → back off. There are **no `RateLimit-*`/`Retry-After` headers**, so self-throttle.
+- **The raw-DOWNLOAD endpoint `GET /uploads/{id}/raw` has a STRICTER, separate limit (live-verified 2026-08-17):** *"one in-flight connection is allowed, and new connections allowed every 5 seconds"* per IP (HTTP 429). This is what the fetch (§5/§7) is paced around — it is intrinsically serial and cannot be parallelised from one IP. The `entries/*` endpoints keep the looser ~30 req/s / 10 concurrent floor.
 - **Contacting NOMAD is NOT a documented prerequisite for a large harvest** (checked 2026-08-14 across the API how-to, download how-to, FAQ, Terms, and Support pages — none require or request it). The *only* contact text is **reactive**: the 503 FAQ
-  (https://nomad-lab.eu/nomad-lab/faqs.html) says to lower your request rate and, if the limit is genuinely too low for a legitimate use, to "contact us … if you want to get exempted from the rate-limit." So emailing **support@nomad-lab.eu** is an **optional courtesy** — worth doing only to *request a rate-limit exemption* that could shorten a multi-TB pull, not a gate to clear before starting. NOMAD's own **endorsed bulk mechanism is the streaming-zip query endpoint** `POST /entries/raw/query` (docs: https://docs.nomad-lab.eu/1.4.3/howto/manage/program/download.html) — exactly what our bulk fetch uses. There is **no public data dump**; NOMAD Oasis is a local-install of the software, not a mirror of the public archive.
+  (https://nomad-lab.eu/nomad-lab/faqs.html) says to lower your request rate and, if the limit is genuinely too low for a legitimate use, to "contact us … if you want to get exempted from the rate-limit." So emailing **support@nomad-lab.eu** is an **optional courtesy** — worth doing only to *request a rate-limit exemption* (lifting the per-IP concurrent-connection cap on `/uploads/{id}/raw` so the targeted fetch can run several streams → hours instead of ~1.5–3 days), not a gate to clear before starting. NOMAD serves published uploads as **pre-packed zips** `GET /uploads/{id}/raw` (streamed off disk, Range-capable — §7); there is **no public data dump**; NOMAD Oasis is a local-install of the software, not a mirror of the public archive.
 
 ---
 
@@ -111,7 +112,9 @@ NOMAD uniquely offers **both**. They lead to very different amounts of new code.
 Download the original `vasprun.xml`/`OUTCAR` and feed them straight into the
 **existing pymatgen parser**. Verified: a sample AFLOW entry's raw files are
 `vasprun.xml.relax1` (1.16 MB) + `vasprun.xml.relax2` (0.55 MB) — modest, no
-CHGCAR/WAVECAR bloat; `POST /entries/raw/query` returns them as a zip.
+CHGCAR/WAVECAR bloat. **The download mechanism is targeted Range-extraction from each
+upload's pre-packed zip** (`GET /uploads/{id}/raw`, §5/§7) — NOT the `entries/raw/query`
+server-assembled zip, which is ~100× slower (server-CPU-bound).
 
 - **Pros:** reuses *everything* already built and mentor-approved — per-ionic-step
   `e_0_energy` (σ→0) with pymatgen's `final_energy` bugfix, `E_free`/`entropy_TS`,
@@ -252,20 +255,32 @@ Unit economics for scoping a subset: **per 100k entries** ≈ 0.5M frames, ~90 G
 download, ~1 GB `extxyz.gz`. Re-measure on your own sample with
 `python -m nomad_harvest.smoke -n 200 --keep` (it prints this calibration live).
 
-### ⚠ Measured CSD3 throughput (2026-08-17) — the real blocker
+### Throughput & the fetch mechanism (root-caused + solved 2026-08-17)
 
-Live-measured on CSD3 icelake nodes (`scripts/csd3/nomad/csd3_nomad_speed.py`, batch_size=50):
-the corpus is **~262 KB/entry** (→ **~1.9 TB** total transient, less than the 6.5 TB estimated above),
-but the **bulk download is throttled to ~0.5–1.7 MB/s aggregate, highly variable and NOMAD-load-gated**.
-The governor is **~2 s/file of server-side zip assembly** on `POST /entries/raw/query`, enforced
-**per IP** (CSD3 shares a NAT, so more nodes hit the same cap) — it is **file-count-bound (~2.3 files/s)**,
-not bandwidth-bound. Worker scaling is inconsistent: 8 workers hit 1.7 MB/s (5.8×) once and 0.6 (1.8×)
-another time; 10 gave 0.7 — the variance swamps the worker signal. So the **full 7.1M is ~2–6 weeks
-wall-clock** on a mostly-idle himem node, and **more workers/nodes cannot break the per-IP cap**. The
-levers are: a **rate-limit exemption** from `support@nomad-lab.eu` (the only path to a fast full run),
-**scoping down** to a diverse 1–2M slice (`--max-entries`, ~5–10 days), or an **untested per-upload glob
-fetch** (`raw/query` with `upload_id:any` + `glob_pattern`; verify the ~50-entry empty-response ceiling
-is not also on file count). See the `nomad-throughput-bottleneck` memory for the full sweep + decision.
+The corpus is **~262 KB/entry** (→ **~1.9 TB** total transient vasprun). How that 1.9 TB is fetched
+is the whole story, and it was root-caused by reading NOMAD's server source + live-probing the API:
+
+* **The slow way (`POST /entries/raw/query`, the old default) is server-CPU-bound, not bandwidth-bound.**
+  NOMAD stores each upload as ONE zip (`raw-public.plain.zip`), and that endpoint re-opens and re-parses
+  the whole upload zip's central directory **~4× per file, with no caching** — so a *single* stream runs
+  at **~0.8 s/file ≈ 0.3 MB/s** whatever you batch, and grouping a batch into one big upload makes it
+  *worse*. That is why the "bulk" redesign never delivered bandwidth: batching cut HTTP round-trips but
+  not the per-file server work. Full 7.1M this way ≈ 2–6 weeks.
+* **The fast way (`GET /uploads/{id}/raw`) streams the ALREADY-PACKED zip straight off disk** — no
+  per-file work — at **~15–30 MB/s** (CSD3-measured), anonymously, honouring HTTP **Range** *and*
+  **multi-range**. So we read each upload's central directory once and **multi-range-pull just the
+  wanted `mainfile` members by byte offset** (`nomad_harvest.upload_zip`; §3, §7). Members are STORED,
+  so a targeted fetch is exact bytes. This is the implemented default.
+* **The governor is that endpoint's rate limit: per IP, one in-flight connection, a new one only every
+  ~5 s** (explicit 429 — a *different, stricter* limit than the `entries/*` "~30 req/s / 10 concurrent",
+  and a **separate bucket** from it). So the fetch is **serial** — concurrency/extra nodes cannot help
+  (CSD3 shares a NAT). Grouping entries by upload + ~250 members per multi-range request keeps it to
+  **~30k requests → ~1.5–3 days** for the whole 7.1M (throughput varies 3–30 MB/s with NOMAD load).
+* **Levers if 1.5–3 days is too slow:** a **rate-limit exemption** (`support@nomad-lab.eu`) raising the
+  per-IP concurrent-connection cap so the targeted fetch runs several streams in parallel → ~hours
+  (cheap for NOMAD — static byte-range serving, no assembly; optional, not required); or **scope down**
+  to a diverse 1–2M slice (`--max-entries`). A **token does NOT help** (per-IP limit, and the endpoint
+  is anonymous). See the `nomad-throughput-bottleneck` memory for the full investigation.
 
 ---
 
@@ -294,15 +309,17 @@ so both sources produce one schema-identical dataset. Nothing in `zenodo_harvest
 |---|---|---|
 | 0 discover | `discover.py` (keyword search) | `client.iter_entries` keyset-paginates `entries/query` (the direct-upload VASP-DFT query); `harvest.discover_candidates` license-gates + Zenodo-dedups inline and writes a **slimmed** keep-list. ~700 requests total — trivial. |
 | 1 triage | `triage.py` (peek-into-zip) | **folded into discover** — no zip-peek. `is_reusable_license` (reused) + `references`→Zenodo dedup, both audited to a rejection log. |
-| 2 fetch | `fetch.py` (download+extract archives) | `harvest.fetch_candidates` → per entry, `rawdir` then `download_raw_file` the vasprun under a **canonical name** (handles `.bz2`/`.gz` + odd naming); groups via the shared `_find_calc_units`; writes `nomad_fetched.jsonl`. Heavy outputs → availability only, never fetched — with **availability taken PRIMARILY from NOMAD's parsed metadata** (`results.properties.available_properties`: `dos_electronic[_new]`→`dos`, `band_structure_electronic`→`eigenvalues`; `nomad_metadata_availability`), OR'd over the filename scan (fallback for charge-density/wavefunction/…) and, at parse, the shared embedded-vasprun DOS/eigen/projected probe. `available_properties` is kept by `slim_candidate`; the unreliable `trajectory` flag is not mapped. **Now production-paced:** reuses the shared `StagingBudget` (bytes **and** inodes) as the disk/inode valve, `--workers` concurrent downloads, resume by manifest; returns `stopped_disk_budget` so the pipeline can reclaim + resume. |
+| 2 fetch | `fetch.py` (download+extract archives) | `harvest.fetch_candidates` → groups the keep-list **by upload**, reads each upload's pre-packed-zip central directory once (`upload_zip.read_central_directory`), then **multi-range-pulls the wanted `mainfile` members** out of `GET /uploads/{id}/raw` (`upload_zip.fetch_members`, CRC-verified), staging each under a **canonical name**; groups via the shared `_find_calc_units`; writes `nomad_fetched.jsonl`. Heavy outputs → availability only, never fetched — availability from the **central directory's own file list** (per calc) OR'd with NOMAD's parsed metadata (`available_properties`: `dos_electronic[_new]`→`dos`, `band_structure_electronic`→`eigenvalues`) and, at parse, the shared embedded-vasprun DOS/eigen/projected probe. The unreliable `trajectory` flag is not mapped. Disk/inode-paced by the shared `StagingBudget` (reserving each entry's EXACT footprint from the CD), resume by manifest; **serial** (the endpoint allows one connection per IP every ~5 s); an upload/member the pre-packed path can't deliver falls back to per-entry `entries/{id}/raw` (a separate throttle bucket). |
 | pipeline 2-4 | `pipeline.py` | **reused** — `nomad_harvest.cli pipeline` splits the keep-list into parts and drives the shared `run_pipeline` (fetch batch *i+1* ∥ parse+purge batch *i*), disk-paced. One command for a long CSD3 job (`scripts/csd3/nomad/20_pipeline.sh`). |
 | 3 parse | `parse.py` | **reused unmodified**: `python -m zenodo_harvest.cli parse --in nomad_fetched.jsonl --dataset-dir data/dataset/nomad`. |
 | 4 store | `store.py` | **reused** — `REF_energy/forces/stress` + `metadata.jsonl`. |
 | join/verify | `dataset_ops.py` | **reused** — `verify` gates it; `merge-datasets` folds the NOMAD dataset into the Zenodo one. |
 
 What the Zenodo pipeline needs that NOMAD does **not**: keyword-recall discover + date-bisection,
-zip-peek triage, archive download/selective-extract, nested-archive recursion, zip-stream — all
-gone. NOMAD's indexed metadata + per-file raw API replace them.
+zip-peek triage, archive download/selective-extract, nested-archive recursion — all gone. NOMAD's
+indexed metadata (discover) + the pre-packed upload zip's central directory over HTTP Range (fetch)
+replace them. (The Range-into-a-remote-zip idea is the same one `zenodo_harvest/zipstream.py` uses
+for Zenodo; `upload_zip.py` is the NOMAD analog, extended to ZIP64 for the >4 GB upload zips.)
 
 **The one shared-core change — DONE (2026-08-11).** The shared parser previously hard-coded
 `calc_id = "zenodo:<recid>:…"` and tagged frames `source="zenodo"`. It now derives the source
@@ -314,47 +331,51 @@ manifests), so NOMAD frames are tagged `source="nomad"` and calc_ids namespace a
 needs **no CLI flag** (the authoritative provenance field drives it). `purge-raw`, which
 re-derives calc_ids via the same `_calc_id`, follows automatically.
 
-### Rate-limiting process — and the fetch redesign (built 2026-08-11)
+### The fetch mechanism — targeted Range-extraction from the pre-packed upload zip
 
-Measured live: the naive **per-entry** fetch is **latency-bound** — ~**1 s/entry** (2 requests
-each: `rawdir` + download; a 0.15 MB file takes ~0.8 s, almost all overhead), and per-entry
-**concurrency makes it *worse*** (a 503 storm). That extrapolates to **~89 days** for 7.1M — the
-constraint is **NOMAD's request rate**, not CSD3, disk, bandwidth, or parse (parse is ~**86 ms/calc**
-→ ~**2 h on one 76-core node**; storage is ~25–40 GB, a non-issue).
+Root-caused + implemented 2026-08-17 (from NOMAD's server source + live probing; supersedes the
+earlier per-entry and "bulk `entries/raw/query`" designs, both of which were **server-CPU-bound**,
+not request- or bandwidth-bound — see §5).
 
-**So the fix is to collapse the request count** — implemented as the default
-`fetch_candidates_bulk` (fixes #1 + #2, all API behaviour verified live):
-- **#1** `POST /entries/raw/query` with `{"entry_id:any": [batch]}` + `files.include_files=[<exact
-  mainfiles>]` streams **ONE zip of exactly the wanted files** (verified: no over-fetch); members
-  are `<upload_id>/<mainfile>`, mapped back exactly. ~1 download request per **300-entry batch**.
-- **#2** `POST /entries/rawdir/query` gets availability for a whole batch in one request (not one `rawdir` each).
-- Net: ~**2 requests per ~300 entries** (~47k total) vs **14.2M**. Fetch becomes **bandwidth-bound**
-  (~1–6.5 TB), and a few concurrent long-lived batch streams (`--workers`) multiply bandwidth
-  *without* tripping the req/s limiter (safe, unlike per-entry concurrency) → **~days, not months**;
-  feasible inside two weeks. NOMAD's server-side throughput is now the remaining governor (heavy and
-  variable during testing, ~1.5 MB/s/stream), NOT the request rate. This is the one place emailing
-  `support@nomad-lab.eu` helps — not as a required step, but to *request a rate-limit exemption* (the
-  documented purpose of contacting them; §2) if the throttle makes two weeks tight.
-- **Coverage/quality unchanged — ALL ~7.1M direct uploads are covered.** Every VASP entry's
-  mainfile is either a `vasprun.xml` or an `OUTCAR` (measured live 2026-08-14 on a 1000-entry
-  keyspace-spread sample: **92.5% vasprun-mainfile, 7.5% OUTCAR-mainfile, 0% neither**), and we
-  fetch **exactly that mainfile** — so the ~7.5% OUTCAR-only entries (no vasprun in the upload)
-  are kept via their OUTCAR, and the ~92.5% vasprun entries pull only the vasprun (not the OUTCAR
-  beside it, if any — that is the transfer-size saving). The FULL vasprun/OUTCAR is fetched, so the
-  enhanced parser recovers full `calc_parameters` (run_type, INCAR, resolved `parameters`, k-points,
-  POTCAR — confirmed on live NOMAD vaspruns; the OUTCAR path recovers the same from the header). Any
-  entry a zip can't deliver **falls back to the per-entry path**, and availability is recovered
-  per-entry if a batch `rawdir/query` fails — so no coverage or metadata is lost. The per-entry
-  `fetch_candidates` remains as `--per-entry`. Parse is overlapped with fetch in `pipeline`; peak
-  *staging* disk stays bounded by the valve.
-  **One consequence of vasprun-only (mentor-agreed):** per-atom DFT **charges/spins**
-  (`dft_charge`/`dft_magmom`) come only from an OUTCAR, so they are recorded only for the ~7.5%
-  OUTCAR-mainfile entries (or any run with `--want-outcar`). For the ~92.5% vasprun entries they are
-  absent — but this is the "if available" clause of the storage spec, and the **availability** of
-  DOS/eigenvalues (from NOMAD's parsed `available_properties`, the authoritative primary source)
-  and of magnetization/charge-density/spin-density (from the rawdir file listing + ISPIN, plus the
-  shared parser's embedded-vasprun probe for DOS/eigen/projected) is still recorded for every entry.
-  Wholesale OUTCAR is ~170 TB (§5), which is why it is excluded by default.
+**How NOMAD stores the data is the key.** Every published upload is one zip on disk
+(`raw-public.plain.zip`); the ~7.1M entries live in only **~3,792 uploads**. A zip carries a
+*central directory* at its tail listing every member's byte offset/size/CRC. And
+`GET /uploads/{id}/raw` streams that pre-packed zip **verbatim off disk** (no assembly), honouring
+HTTP **Range** and **multi-range**. So `harvest.fetch_candidates`:
+
+1. **Groups the keep-list by `upload_id`** (`split_by_upload` keeps each upload whole in one
+   pipeline part, so its central directory is read exactly once — a round-robin split would read it
+   once per part).
+2. Per upload, **one suffix-Range read of the zip tail → the central directory**
+   (`upload_zip.read_central_directory`, ZIP64-aware — the big uploads are >4 GB).
+3. Matches each kept entry's `mainfile` to a member (**verified 800/800 exact matches**, incl.
+   `.bz2`), then **multi-range-fetches those members** (~250 per request, capped by the ~8 KB Range
+   header) straight out of the zip (`upload_zip.fetch_members`), each **CRC-verified** against the
+   central directory. Members are STORED, so this is exact bytes — zero server-side work.
+
+**Request count & time:** ~7.1M/250 member-batches + ~3,792 central-directory reads ≈ **~30k
+requests**. The endpoint is rate-limited **per IP to one in-flight connection, a new one every
+~5 s** (a *separate, stricter* bucket than the `entries/*` endpoints), so the fetch is **serial** —
+there is no `--workers`, and CSD3's shared NAT means extra nodes cannot parallelise it. At ~15–30
+MB/s the whole 1.9 TB is **~1.5–3 days** (a request ≥5 s is transfer-bound; a shorter one waits out
+the 5 s). A **rate-limit exemption** (`support@nomad-lab.eu`) lifting the concurrency cap would drop
+that to hours — optional. A **token does not help** (per-IP limit; the endpoint is anonymous).
+
+**Availability is now free + reliable:** the central directory *is* the per-calc file list, so
+CHGCAR/DOSCAR/WAVECAR/… flags come from it directly (OR'd with `available_properties` for DOS/eigen
+and the parse-time embedded-vasprun probe). This **removes the old fragile `rawdir/query`** step.
+
+**Coverage/quality unchanged — ALL ~7.1M covered.** Every entry's mainfile is a `vasprun.xml` or an
+`OUTCAR` (measured 2026-08-14: **92.5% vasprun, 7.5% OUTCAR, 0% neither**); we fetch **exactly that
+mainfile** (`_role_of`), so OUTCAR-mainfile entries are kept via their OUTCAR and vasprun entries
+pull only the vasprun (`--want-outcar` also grabs a sibling OUTCAR from the same calc dir). The FULL
+file is fetched, so the enhanced parser recovers full `calc_parameters`. **Anything the pre-packed
+path can't deliver** — a non-published upload, or a member missing/CRC-failing — **falls back to the
+per-entry `entries/{id}/raw` path** (a separate throttle bucket), so no coverage is lost.
+**Consequence of vasprun-only (mentor-agreed):** per-atom `dft_charge`/`dft_magmom` come only from an
+OUTCAR, so they exist for the ~7.5% OUTCAR-mainfile entries (or under `--want-outcar`); for vasprun
+entries they are absent (the "if available" clause), while DOS/eigen/magnetization/charge-density
+*availability* is still recorded for every entry. Wholesale OUTCAR is ~170 TB (§5), hence excluded.
 
 **Complementary path — OPTIMADE.** NOMAD implements OPTIMADE at
 `https://nomad-lab.eu/prod/v1/optimade/v1` (18.8M structures). Standardized
@@ -372,9 +393,9 @@ forces/energies, so it's a discovery/dedup aid only, never a label source.
 4. **`raw/{path}` is relative to the mainfile's DIRECTORY**, not the upload root — the full path 404s, the mainfile-dir-relative path 200s (`raw_path_rel`). *(caught by the smoke test — every fetch failed until fixed)*
 5. **No multi-step / forces search flag** — the `trajectory` property tags only ~0.1% of direct uploads (median 1, mean ~4.6 steps); **don't pre-filter on it** — recover steps + confirm forces at parse time.
 6. **Compression + naming** — NOMAD stores files `.bz2`/`.gz` under varied names (`GEO3_vasprun.xml.bz2`, `vasprun.xml.relax1`); stage under a **canonical name** (`vasprun.xml[.bz2]`) so `_find_calc_units` + pymatgen `zopen` read them unchanged. Do **not** rely on the server-side `decompress` param — it doesn't handle `.bz2`. *(smoke verifies compressed-kept == locally-decompressed)*
-7. **Self-throttle + 5xx backoff** — ~30 req/s, ≤10 concurrent (per IP), no `Retry-After`; **502/503/504 all appear under load** (seen repeatedly in the smoke). The client backs off exponentially. Contacting support is **not** a documented prerequisite (§2) — do it only to request a rate-limit *exemption* if throughput is the bottleneck.
-15. **`raw/query` (the DOWNLOAD) returns an EMPTY 200 above ~50 entries/batch.** Live-measured 2026-08-16: a bulk `POST /entries/raw/query` streams a real zip for batches of 10/25/50 but returns a **0-byte 200** (not a 5xx — so retries don't help) for 100/200/300. A 0-byte "zip" makes `zipfile` raise `BadZipFile`. Fixes: `_BULK_MAX_BATCH`/`--batch-size` default is **50** (not 300), and `_bulk_stage_batch` treats an unreadable/empty zip as "batch not delivered" → per-entry fallback (never a crash). Server-side zip assembly is ~0.7 s/file *regardless* of batch, so a bigger batch would not transfer faster anyway — 50 is a hard ceiling, not a throughput knob. (`csd3_nomad_speed.py` also defaults `--batch-size 50`; raising it makes sections [1]/[2] "FAIL" with the empty response.)
-14. **`rawdir/query` (the availability listing) is fragile AND slow — this is the availability step, NOT the download.** Live-verified 2026-08-16: a bulk `POST /entries/rawdir/query` with a big `entry_id:any` list **500s** (server-side timeout) — n≈300 reliably fails, n≈50 is borderline under load; the **`raw/query` DOWNLOAD endpoint handles 300 fine**. So `client.bulk_rawdir` splits the listing into small `RAWDIR_CHUNK` (=25) sub-requests, decoupled from the download batch size, and is **resilient** (a failed sub-request doesn't discard the good ones — those entries recover via a per-entry `GET /rawdir`). Measured ~**0.2 s/entry** for the listing, so at 7.1M it can **rival the download in wall-clock** and may govern the run (workers parallelise it; it overlaps parse). It supplies only the **charge_density** (→ spin_density) availability flag — DOS/eigenvalues come from `available_properties`, magnetization from ISPIN, none needing rawdir — so if it proves the bottleneck, **`--no-rawdir` skips the listing entirely** (availability = `available_properties` DOS/eigenvalues + the parse-time embedded probe + ISPIN magnetization; you lose only the charge_density/spin_density/wavefunction/LOCPOT/ELF flags), or raise `RAWDIR_CHUNK`/`--workers`. Measure it on CSD3 with `csd3_nomad_speed.py` section [3] before deciding.
+7. **The download endpoint's throttle is `1 in-flight / 5 s` per IP** (`GET /uploads/{id}/raw`, explicit 429: *"Only one in-flight connection is allowed, and new connections allowed every 5 seconds"*) — a **separate, stricter** bucket than the `entries/*` "~30 req/s / ≤10 concurrent". Keep-alive does not help (the server sends `Connection: close`). So the fetch is serial; `client.upload_raw_get` paces itself + waits out 429s. The `entries/*` endpoints (discover, the per-entry fallback) keep the looser limit + exponential 5xx backoff.
+15. **The pre-packed zip is ZIP64 + STORED, and `mainfile` == the member name exactly.** NOMAD's big upload zips are >4 GB (ZIP64: `upload_zip` parses the zip64 EOCD + per-member zip64 extra); members are STORED (compression method 0), so a targeted Range fetch returns exact bytes (CRC-verified). An entry's `mainfile` string is the exact central-directory member name (verified 800/800, incl. `.bz2`), which is how a member is located without any extra request.
+14. **Multi-range is header-limited + coalesces.** `GET /uploads/{id}/raw` honours `Range: a-b,c-d,…` (→ `multipart/byteranges`) but the proxy caps the **Range header at ~8 KB** (~300 compact ranges), so members are batched ≤~250/request (`MAX_RANGES_PER_REQUEST`). The server **coalesces adjacent/overlapping requested ranges** into fewer parts (all bytes present), so extraction maps each member by **file offset** (from the central directory), never by scanning the body for zip signatures. Suffix ranges (`bytes=-N`) work, giving the tail + total size in one request.
 8. **Archive label caveats (only if you ever use the normalized archive)** — `energy.free`=F, `energy.total`=E, `energy.total_t0` anomalous (no drop-in σ→0), stress sign undocumented, `calculation.step`=None. This is *why* we re-parse raw vasprun instead.
 9. **Raw files can be missing/partial** — `rawdir` first; skip+log an entry with no vasprun/OUTCAR primary.
 10. **Read the per-entry `license`** — keep only CC-BY, log the rest.

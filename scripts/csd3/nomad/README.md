@@ -9,7 +9,7 @@ the 1 TB / 1M-inode `/rds` quota, node internet) these are built around.
 ```
 scripts/csd3/nomad/10_discover.sh       # stage 0-1: keyset scan -> license-gated, deduped keep-list (1 core, minutes)
 scripts/csd3/nomad/20_pipeline.sh       # stage 2-4 overlapped (fetch || parse+purge) + verify, disk-paced, self-resubmitting
-scripts/csd3/nomad/csd3_nomad_speed.py  # measure BULK fetch MB/s from a compute node (run before sizing WORKERS)
+scripts/csd3/nomad/csd3_nomad_prepacked_probe.py  # confirm the pre-packed fetch (MB/s + throttle) from a compute node
 ```
 
 ## Separate NOMAD tree (never mixed with Zenodo)
@@ -69,62 +69,63 @@ python -m zenodo_harvest.cli verify --dataset-dir $ZENODO_HARVEST_DATA/dataset
 ## Disk / inode budget when co-running with Zenodo jobs
 
 The 1 TB / 1M-inode `/rds` quota is **shared across everything you run**, but each job's valve
-only bounds *its own* raw dir — it cannot see the other job's staging or the datasets. So give
-each job a **fixed slice** whose limits sum under quota after reserving the fixed/growing bits.
-Worked partition (NOMAD + one small Zenodo recovery), quota ~1000 GB / 1.0M inodes:
+only bounds *its own* raw dir. NOMAD raw staging is **INODE-bound, not byte-bound**: each entry is
+4 inodes (`<entry_id>/extracted/calc/vasprun.xml`) but only ~0.26 MB, so the inode valve caps peak
+staging and the byte valve is a loose safety net — **peak bytes ≈ (inode-limit ÷ 4) × 0.26 MB**
+(~26 GB at 400k inodes). So partition **inodes** first, then give bytes a generous margin (for the
+OUTCAR-mainfile / AIMD tail). Worked partition (NOMAD + a Zenodo recovery), quota ~1000 GB / 1.0M:
 
 | consumer | bytes | inodes | how |
 |---|---|---|---|
 | existing Zenodo raw + dataset | ~100 GB | ~0.1M | already on disk |
 | NOMAD dataset + manifests (grows) | ~40–60 GB | ~few-k | not valve-tracked |
-| **NOMAD raw valve** | **600 GB** | **600k** | `20_pipeline.sh` defaults |
-| Zenodo-recovery raw valve | 150 GB | 150k | `MAX_DISK_BYTES=150000000000 MAX_DISK_FILES=150000 sbatch scripts/csd3/46_availability_recover.sh` |
-| headroom | ~100 GB | ~50k | Lustre + in-flight overshoot |
+| **NOMAD raw valve** | **200 GB** | **400k** | `20_pipeline.sh` defaults (peak raw ~26 GB) |
+| Zenodo-recovery raw valve | 300 GB | 300k | `MAX_DISK_BYTES=300000000000 MAX_DISK_FILES=300000 sbatch scripts/csd3/46_availability_recover.sh` |
+| headroom | ~150 GB | ~150k | Lustre + in-flight overshoot |
 
-Running NOMAD **solo**? Raise `MAX_DISK_BYTES=800000000000 MAX_DISK_FILES=800000`. The valve
-charges every byte as written + every inode as created and refunds on delete, so `staged <= limit`
-holds exactly, and the pipeline paces itself (fetch → parse → purge → resume) rather than sizing
-the whole scope onto disk at once — **inodes bind first** (~3–4 per entry).
+Inodes sum to ~950k < 1M; bytes well under 1 TB. This frees ~400 GB + ~250k inodes vs the old
+600 GB/600k NOMAD slice — the Zenodo recovery gets 300k inodes (was 150k → fewer resume cycles).
+Running NOMAD **solo**? Raise to `MAX_DISK_BYTES=400000000000 MAX_DISK_FILES=800000` (and
+`PARTS=48+`). The valve charges every byte + inode as created and refunds on delete, so
+`staged <= limit` holds exactly, and the pipeline paces itself (fetch → parse → purge → resume).
 
 ## Monitoring & sizing
 
 * **Progress (NOMAD-aware, read-only, safe while the job writes):**
   ```bash
-  python -m nomad_harvest.cli status --max-disk-bytes 600000000000 --max-disk-files 600000
+  python -m nomad_harvest.cli status --max-disk-bytes 200000000000 --max-disk-files 400000
   ```
   It defaults to the NOMAD tree and knows NOMAD's manifest names (`nomad_keep.jsonl`,
   `nomad_fetched.jsonl`, the two rejection logs). Pass the same limits you gave the pipeline so
   STAGING reads as a % of quota; add `--no-staging-walk` to skip the slow Lustre inode walk and
   read `/rds` usage from `lfs quota -u $USER $NOMAD_HARVEST_DATA` instead; `--json` for scripting.
-* **Bandwidth (run BEFORE choosing WORKERS):** `srun … python scripts/csd3/nomad/csd3_nomad_speed.py
-  --workers 4` measures the real BULK-zip MB/s from a compute node and extrapolates the full-harvest
-  transfer time. Sweep `--workers 2/4/8` to find where NOMAD's server-side throughput saturates.
+* **Confirm the fetch path (run before a big campaign):** `srun … python
+  scripts/csd3/nomad/csd3_nomad_prepacked_probe.py` measures the pre-packed `GET /uploads/{id}/raw`
+  MB/s from a compute node, confirms the 1-conn/5s throttle on CSD3's IP, does an end-to-end
+  targeted zip64 extraction, and extrapolates the full-harvest time. There is no `--workers` to
+  sweep — the fetch is serial by design (below).
 * **SLURM / RAM:** `sacct -j <jobid> --format=JobID,State,Elapsed,MaxRSS,ExitCode`;
   `tail -f logs_nomad/nomad-pipeline-<jobid>.out`.
 
 ## Rate limits & etiquette
 
-Fetch is the rate-limiting stage, but after the **bulk redesign it is bandwidth-bound, not
-request-bound** for the DOWNLOAD (~1 `raw/query` zip per ~300-entry batch, ~47k total). NOMAD's
-floor is ~30 req/s / ≤10 concurrent per IP with 5xx under load (the client self-throttles + backs
-off; CSD3 parallelism cannot raise a server-side cap). Use `WORKERS=4-8` (long-lived batch streams
-multiply bandwidth without spiking the request rate).
+Fetch pulls each entry's `mainfile` out of its upload's **pre-packed zip** via `GET
+/uploads/{id}/raw` + HTTP Range/multi-range (see `docs/NOMAD_HARVEST.md` §3). That endpoint is
+rate-limited **per IP to one in-flight connection, a new one only every ~5 s** (explicit 429), so
+the fetch is **intrinsically serial** — there is no `--workers` (a 2nd connection just 429s), and
+CSD3's shared NAT means extra nodes cannot parallelise it either. Grouping entries by upload (so
+each upload's central directory is read once) and packing ~250 members per multi-range request is
+what keeps the run to ~30k requests / ~1.5-3 days for the whole 7.1M. The client paces itself and
+waits out any 429; discovery (`10_discover.sh`) is single-stream by design too.
 
-**Two measured NOMAD limits the code works around (don't override blindly):**
-* **`raw/query` DOWNLOAD caps at ~50 entries/batch** — above that it returns an empty 200, so
-  `--batch-size` defaults to **50** (a bigger batch does not transfer faster: server-side zip
-  assembly is ~0.7 s/file regardless). An unreadable/empty zip falls back per-entry, never crashes.
-* **`rawdir/query` availability listing is slow + fragile** — it 500s on a big id list (so it's
-  split into 25-entry sub-requests) and costs ~0.2 s/entry, which at 7.1M can rival the download in
-  wall-clock. `HTTP 500 /entries/rawdir/query … backoff` log lines are this endpoint under load;
-  they retry then fall back per-entry, so the harvest keeps going (no data lost). If section [3] of
-  `csd3_nomad_speed.py` shows it governs the run, add **`--no-rawdir`** to the pipeline/fetch: it
-  skips the listing (availability = `available_properties` DOS/eigenvalues + parse-time embedded
-  probe + ISPIN magnetization; you lose only charge-density/wavefunction/LOCPOT/ELF/spin-density
-  flags — the heavy files we never fetch anyway). **Emailing NOMAD is NOT a documented prerequisite** for
-a large harvest — it is only worth doing *reactively*, to request a rate-limit **exemption**
-(`support@nomad-lab.eu`, the documented purpose) if the speed script shows sustained throughput far
-below ~50 MB/s. Discovery (`10_discover.sh`) is single-stream by design — do not parallelise it.
+* **Availability is free now** — it is read from each upload's central directory (the zip's own
+  file list) + NOMAD's `available_properties`, so the old fragile `rawdir/query` step is gone. No
+  `--batch-size` / `--no-rawdir` knobs any more.
+* **The fast path is anonymous** — no token helps (the limit is per-IP at the proxy). **Emailing
+  `support@nomad-lab.eu` is optional**: the one lever that would beat ~1.5-3 days is a rate-limit
+  **exemption** raising the per-IP concurrent-connection cap, which would let the targeted fetch run
+  several streams in parallel (→ hours). Cheap for NOMAD (static byte-range serving, no assembly);
+  worth requesting for the full run, not required.
 
 ## Optional: many-core array parse
 

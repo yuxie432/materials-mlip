@@ -346,42 +346,54 @@ tail is ~170 TB).
   unmodified**; only stages 0-2 are NOMAD-specific:
   - `client.py` — throttled, retrying NOMAD v1 REST client (anonymous reads; **keyset
     pagination only** — offset caps at 10k; self-throttle + exponential backoff on
-    502/503/504, which appear under load with no `Retry-After`). `download_raw_file` takes a
-    generic `on_chunk` hook (no budget coupling).
-  - `harvest.py` — stage 0 discover (keyset-scan the direct-upload VASP-DFT query →
-    license-gate + Zenodo-`references`-dedup → slimmed keep-list) and stage 2 fetch. **The
-    fetch is production-paced:** it reuses the shared `StagingBudget` (bytes **and** inodes) as
-    the disk/inode valve, `--workers` concurrent downloads, and manifest-level resume, and it
-    returns `stopped_disk_budget` so the pipeline reclaims + resumes. NOMAD stages files
-    verbatim (no archive expansion), so the rawdir-declared `size` is the exact on-disk size —
-    the valve reserves it up front. Heavy outputs → availability only, never fetched.
-    **Availability uses NOMAD's parsed metadata as the PRIMARY source** (`build_fetched_entry`
-    maps `results.properties.available_properties`: `dos_electronic[_new]`→`dos` (~91% of the
-    corpus), `band_structure_electronic`→`eigenvalues`), OR'd over the filename scan of the
-    rawdir listing (the fallback for charge-density/wavefunction/local-potential/ELF/projections,
-    which NOMAD does not index) and the shared parser's embedded-vasprun probe. A NOMAD entry is
-    one calc (one mainfile→one entry), so this is already per-calc. `available_properties` is
-    preserved by `slim_candidate`; the unreliable `trajectory` property is deliberately not mapped.
-  - `cli.py` — `python -m nomad_harvest.cli {discover,fetch,pipeline,smoke}`. `pipeline` splits
-    the keep-list and drives the **shared** `run_pipeline` (fetch batch *i+1* ∥ parse+purge
-    batch *i*), disk-paced, into its own `data/dataset/nomad` dir; `merge-datasets` folds it in.
+    502/503/504). Discover/per-entry-fallback use `entries/*`. **`upload_raw_get`** does a
+    paced, 429-retrying **Range GET of `GET /uploads/{id}/raw`** (the pre-packed upload zip) —
+    that endpoint's limit is **1 in-flight connection per IP, a new one every ~5 s** (a separate,
+    stricter bucket than `entries/*`), so it is serialised. No bulk `entries/raw/query` methods.
+  - `upload_zip.py` — **targeted extraction from an upload's PRE-PACKED zip over HTTP Range.**
+    NOMAD stores each published upload as one `raw-public.plain.zip`; `read_central_directory`
+    reads the zip tail (suffix Range) and parses its **ZIP64-aware** central directory (the big
+    uploads are >4 GB), and `fetch_members` **multi-range-pulls the wanted members by byte
+    offset** (~250/request, ~8 KB Range-header cap), CRC-verified, mapping each by file offset
+    (robust to the server coalescing adjacent ranges). Members are STORED → exact bytes, zero
+    server assembly. The NOMAD analog of `zenodo_harvest/zipstream.py`, extended for ZIP64.
+  - `harvest.py` — stage 0 discover (keyset-scan → license-gate + Zenodo-`references`-dedup →
+    slimmed keep-list) and stage 2 fetch. **`fetch_candidates` groups the keep-list by
+    `upload_id`** (`split_by_upload` keeps each upload whole in one pipeline part → its central
+    directory is read once), then per upload reads the CD and multi-range-fetches each entry's
+    `mainfile` member (vasprun, or OUTCAR for OUTCAR-mainfile entries; `--want-outcar` also grabs
+    a sibling OUTCAR). Disk/inode-paced by the shared `StagingBudget` (reserving each entry's
+    EXACT footprint from the CD), manifest resume, `stopped_disk_budget` for the pipeline. It is
+    **serial** (the endpoint's 1-conn/5s limit); an upload/member the pre-packed path can't
+    deliver **falls back to the per-entry `entries/{id}/raw` path** (a separate throttle bucket)
+    → no coverage loss. **Availability is derived from the upload's central directory** (the zip's
+    own per-calc file list) OR'd with NOMAD's parsed `available_properties` (`dos_electronic[_new]`
+    →`dos`, `band_structure_electronic`→`eigenvalues`) + the parse-time embedded-vasprun probe —
+    so the old fragile `rawdir/query` step is gone. `available_properties` is kept by
+    `slim_candidate`; the unreliable `trajectory` property is not mapped.
+  - `cli.py` — `python -m nomad_harvest.cli {discover,fetch,pipeline,status,smoke}`. `pipeline`
+    splits the keep-list **by upload** (`split_by_upload`) and drives the **shared** `run_pipeline`
+    (fetch batch *i+1* ∥ parse+purge batch *i*), disk-paced, into its own `data/dataset/nomad`
+    dir; `merge-datasets` folds it in. No `--workers`/`--batch-size` (the fetch is serial).
   - `smoke.py` — live end-to-end Phase-0 validation in an isolated temp dir.
 - **The shared parser namespaces by source.** `parse._calc_id`/`_frame` derive the source from
   `provenance.source` (`_source_of`, default `"zenodo"`), so NOMAD frames are tagged
   `source="nomad"` and calc_ids are `nomad:<entry_id>:…` — byte-identical for Zenodo, no
   cross-source id collision at `verify`/`merge-datasets`. No CLI flag; the provenance field
   drives it.
-- CSD3 batch templates: `scripts/csd3/nomad/{10_discover,20_pipeline}.sh` (mirror the Zenodo
-  templates: single-stream discover, then the overlapped disk-paced pipeline, self-resubmitting).
-  Full harvest of 7.1M direct uploads is **Zenodo-scale**: the bulk fetch collapses the request
-  count (~47k, not 14.2M) so it is **bandwidth-bound, not fetch-rate-bound** — a single
-  self-resubmitting campaign of ~1–2 weeks wall-clock IF NOMAD sustains Zenodo-like throughput
-  (~50 MB/s). Slicing with `--max-entries` is OPTIONAL (an early quality/dedup checkpoint), not
-  required. Contacting `support@nomad-lab.eu` is NOT required — only to request a rate-limit
-  exemption if NOMAD's throughput is the bottleneck (measure it on a ~10k-entry batch first).
+- CSD3 batch templates: `scripts/csd3/nomad/{10_discover,20_pipeline}.sh` (single-stream discover,
+  then the overlapped disk-paced pipeline, self-resubmitting) + `csd3_nomad_prepacked_probe.py`
+  (confirm the pre-packed fetch MB/s + throttle from a compute node). Full harvest of 7.1M is
+  **targeted Range-extraction from ~3,792 upload zips** (~30k requests at ~15–30 MB/s) →
+  **~1.5–3 days**, one self-resubmitting campaign. It is **serial** (the `/uploads/{id}/raw`
+  1-conn/5s limit — no `--workers`, and CSD3's shared NAT can't parallelise it). Slicing with
+  `--max-entries` is OPTIONAL. A **token does NOT help** (per-IP limit; the endpoint is anonymous);
+  the one accelerator is a rate-limit **exemption** from `support@nomad-lab.eu` (lifting the per-IP
+  concurrency cap → hours), optional not required.
 - Offline tests: `tests/test_nomad.py` (network-free — query builder, keyset paging, backoff,
-  dedup, staging-name/primary logic, and the fetch valve/workers/resume against an in-memory
-  client). Live path: `python -m nomad_harvest.cli smoke -n 12`.
+  dedup, staging-name logic, ZIP64 central-directory parse + multi-range extraction + CRC against
+  an in-memory pre-packed zip, the disk-valve/resume/fallback of `fetch_candidates`, and
+  `split_by_upload`). Live path: `python -m nomad_harvest.cli smoke -n 12`.
 
 ## Scope and starting point
 
