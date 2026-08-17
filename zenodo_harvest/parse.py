@@ -30,13 +30,14 @@ a calc that drops some frames logs one ``frames_no_energy`` audit line.
 
 What lands where (docs/DESIGN.md §3):
 * extxyz frame  : positions, symbols, cell, energy (``REF_energy``) + forces
-                  (``REF_forces``) + stress (``REF_stress``) (+ per-site DFT
-                  charges/magmoms as ``dft_charge``/``dft_magmom`` on the final frame
-                  if an OUTCAR provides them), the force-consistent free energy
-                  ``E_free`` and (vasprun path) the electronic-entropy term
-                  ``entropy_TS``, small quality tags.
+                  (``REF_forces``) + stress (``REF_stress``), the calc's net magnetic
+                  moment ``total_magnetization`` (μ_B) + net charge ``total_charge`` (e)
+                  broadcast onto every frame, the force-consistent free energy ``E_free``
+                  and (vasprun path) the electronic-entropy term ``entropy_TS``, small
+                  quality tags. (Per-atom charges/magmoms are NOT stored — only the totals.)
 * metadata JSONL: provenance, citation, calc parameters (incl. ``potcar_set_hash``),
-                  convergence, availability.
+                  convergence, availability, and the ``electronic`` block mirroring the
+                  net moment/charge (see :mod:`electronic`).
 
 Energy-reference bookkeeping: the label is the σ→0 energy E0 (``REF_energy``), but
 VASP's forces/stress are consistent with the FREE energy F, so every frame also stores
@@ -66,6 +67,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import multiprocessing as mp
+import re
 import threading
 import warnings
 from datetime import datetime, timezone
@@ -78,8 +80,9 @@ from ase import Atoms
 from ase.stress import full_3x3_to_voigt_6_stress
 
 from . import config
+from .electronic import electronic_from_object, electronic_from_outcar, empty_block, is_magnetic
 from .manifest import RejectionLogger, read_jsonl
-from .outcar_params import parse_outcar_header
+from .outcar_params import build_calc_parameters, read_header_lines
 from .vasprun_params import resolved_parameters
 from .store import (
     DatasetLock,
@@ -476,41 +479,88 @@ def _merge_embedded_availability(base_avail: dict, vasprun: str | None,
     return avail
 
 
-def _site_props_from_outcar(outcar_path: str, natoms: int) -> dict:
-    """Per-atom total charge / magnetic moment from an OUTCAR (end-of-run only)."""
-    out: dict = {"magmoms": None, "charges": None}
+# --- spin-flag pre-scan (decides parse_eigen without a full parse) --------------------
+# The vasprun-only net-moment path (electronic.net_magnetization_from_object) needs the
+# eigenvalue occupancies, i.e. Vasprun(parse_eigen=True) — which is more expensive than the
+# default parse. But it is only needed for a *collinear spin-polarised* calc with no OUTCAR
+# beside it (ISPIN=1 has zero moment; non-collinear needs the projected magnetization we do
+# not parse; an OUTCAR gives the moment directly). So we cheaply pre-scan ISPIN /
+# LNONCOLLINEAR / LSORBIT from the vasprun.xml prefix (they live in <parameters>, before the
+# trajectory) and enable parse_eigen ONLY when it will actually be used. The ISPIN=1 majority
+# — and every OUTCAR-accompanied calc — parses exactly as before.
+_SPIN_FLAG_RES: dict[str, Any] = {
+    "ispin": re.compile(rb'name="ISPIN">\s*(\d+)'),
+    "lnoncollinear": re.compile(rb'name="LNONCOLLINEAR">\s*([TF])'),
+    "lsorbit": re.compile(rb'name="LSORBIT">\s*([TF])'),
+}
+
+
+def _scan_vasprun_spin_flags(path: str) -> dict:
+    """Cheap streaming read of ``ispin`` (int|None) + ``noncollinear`` (bool) from a vasprun.xml.
+
+    Reads only the prefix up to the first ``<calculation>`` (all three tags sit in the
+    ``<parameters>`` block that precedes the trajectory), in 256 KiB chunks with a small tail
+    overlap so a tag split across a boundary is still matched. Best-effort — any read error
+    yields ``{"ispin": None, "noncollinear": False}`` (the caller then parses without eigen,
+    exactly the old behaviour). Peak memory is one chunk regardless of file size.
+    """
+    import bz2
+    import gzip
+    import lzma
+
+    flags: dict[str, Any] = {"ispin": None, "noncollinear": False}
+    openers: dict[str, Any] = {".gz": gzip.open, ".bz2": bz2.open,
+                               ".xz": lzma.open, ".lzma": lzma.open}
+    opener = next((fn for suf, fn in openers.items() if path.lower().endswith(suf)), open)
     try:
-        from pymatgen.io.vasp.outputs import Outcar
-        oc = Outcar(outcar_path)
-        if oc.magnetization and len(oc.magnetization) == natoms:
-            out["magmoms"] = [m.get("tot") for m in oc.magnetization]
-        if oc.charge and len(oc.charge) == natoms:
-            out["charges"] = [c.get("tot") for c in oc.charge]
-    except Exception as exc:  # OUTCAR parsing is fragile; availability still recorded
-        logger.debug("OUTCAR site-props failed for %s: %s", outcar_path, exc)
-    return out
+        with opener(path, "rb") as fh:
+            tail = b""
+            while True:
+                chunk = fh.read(1 << 18)
+                if not chunk:
+                    break
+                buf = tail + chunk
+                if flags["ispin"] is None:
+                    m = _SPIN_FLAG_RES["ispin"].search(buf)
+                    if m:
+                        flags["ispin"] = int(m.group(1))
+                for key in ("lnoncollinear", "lsorbit"):
+                    mm = _SPIN_FLAG_RES[key].search(buf)
+                    if mm and mm.group(1).upper() == b"T":
+                        flags["noncollinear"] = True
+                if b"<calculation" in buf:  # trajectory started -> parameters block is behind us
+                    break
+                tail = buf[-64:]  # > longest tag, to catch a boundary-split match
+    except OSError as exc:
+        logger.debug("vasprun spin-flag scan failed for %s: %s", path, exc)
+    return flags
+
+
 
 
 def _frame(structure: Any, energy: float | None, forces: Any, *, calc_id: str,
            frame_id: str, ionic_step: int, electronic_converged: bool | None,
            scf_dE: float | None, source: str = "zenodo",
-           magmoms: list | None = None, charges: list | None = None) -> Atoms:
+           total_magnetization: float | None = None,
+           total_charge: float | None = None) -> Atoms:
     from pymatgen.io.ase import AseAtomsAdaptor
     atoms = AseAtomsAdaptor.get_atoms(structure)
     # Write labels under MACE's default REF_* keys, straight into info/arrays. A
     # SinglePointCalculator would emit the reserved `energy`/`forces` keys, which
     # ASE re-absorbs into a calculator on read-back (removing them from info/arrays);
-    # the REF_* keys survive the round-trip and stay queryable. Per-atom DFT outputs
-    # go under explicit output names (dft_charge/dft_magmom) rather than ASE's
-    # `initial_*` input fields, which would mislabel computed outputs as inputs.
+    # the REF_* keys survive the round-trip and stay queryable.
     if energy is not None:
         atoms.info["REF_energy"] = float(energy)
     if forces is not None:
         atoms.arrays["REF_forces"] = np.asarray(forces, dtype=float)
-    if magmoms is not None:
-        atoms.arrays["dft_magmom"] = np.asarray(magmoms, dtype=float)
-    if charges is not None:
-        atoms.arrays["dft_charge"] = np.asarray(charges, dtype=float)
+    # Per-calc net scalars broadcast onto every frame (net charge is frame-invariant; net
+    # magnetization is the calc's converged value). Written ONLY when known — a None put into
+    # atoms.info would serialise as a bare extxyz key ASE reads back as True (same trap as
+    # electronic_converged/scf_dE below); omitting it -> read-back absent ("unavailable").
+    if total_magnetization is not None:
+        atoms.info["total_magnetization"] = float(total_magnetization)
+    if total_charge is not None:
+        atoms.info["total_charge"] = float(total_charge)
     atoms.info.update({
         "source": source,
         "calc_id": calc_id,
@@ -533,23 +583,33 @@ def _frame(structure: Any, energy: float | None, forces: Any, *, calc_id: str,
 
 
 def _frames_and_meta(v: Any, calc_id: str, outcar_path: str | None,
-                     parser: str, source: str = "zenodo") -> tuple[list[Atoms], dict]:
+                     parser: str, source: str = "zenodo", *,
+                     eigen_parsed: bool = False,
+                     atominfo_path: str | None = None) -> tuple[list[Atoms], dict]:
     """Build frames + metadata from a parsed pymatgen object.
 
     Shared by :func:`parse_vasprun` and :func:`parse_vaspout`: ``Vaspout``
     subclasses ``Vasprun`` and exposes the same API, so only the constructor and
     the recorded ``parser`` tag differ. ``source`` (``zenodo``/``nomad``/…) is the
     provenance tag written into each frame's ``info["source"]`` (see :func:`_frame`).
+
+    ``eigen_parsed`` says whether ``v`` was parsed with ``parse_eigen=True`` (so the net
+    moment can use the occupancy method); ``atominfo_path`` is the vasprun.xml path (for the
+    net-charge valence read — None for vaspout.h5, which has no atominfo XML). The net
+    magnetization + net charge (:mod:`electronic`) are computed once per calc and broadcast
+    onto every frame (``total_magnetization`` / ``total_charge``) + mirrored into ``meta``.
     """
     conv = _scf_convergence(v)  # calc-level final-step verdict (keys/semantics unchanged)
     steps = v.ionic_steps
     natoms = len(v.final_structure)
     nelm = _nelm(v)
 
-    # Per-atom charges/spins (final geometry only) if an OUTCAR is alongside.
-    site = {"magmoms": None, "charges": None}
-    if outcar_path:
-        site = _site_props_from_outcar(outcar_path, natoms)
+    # Net magnetic moment + net charge (per-calc scalars; see electronic.py). Magnetization
+    # from the OUTCAR line when present, else the occupancy method (needs eigen_parsed).
+    electronic = electronic_from_object(v, atominfo_path=atominfo_path,
+                                        outcar_path=outcar_path, eigen_parsed=eigen_parsed)
+    net_mag = electronic["net_magnetization"]
+    net_charge = electronic["net_charge"]
 
     # Drop steps with no recoverable energy (keep original indices); count them.
     kept_steps, n_dropped = _select_frame_steps(steps)
@@ -561,7 +621,6 @@ def _frames_and_meta(v: Any, calc_id: str, outcar_path: str | None,
     max_ts_gap = 0.0  # max |E_free - E0| per atom across frames (label<->force consistency)
     for pos, (i, energy) in enumerate(kept_steps):
         st = steps[i]
-        last = pos == len(kept_steps) - 1  # site props attach to the last KEPT frame
         scf_dE, econv = _step_scf(st, nelm)  # this step's OWN convergence
         if econv is False:
             n_unconverged += 1
@@ -570,8 +629,7 @@ def _frames_and_meta(v: Any, calc_id: str, outcar_path: str | None,
             st["structure"], energy, forces,
             calc_id=calc_id, frame_id=f"{calc_id}#{i}", ionic_step=i,
             electronic_converged=econv, scf_dE=scf_dE, source=source,
-            magmoms=site["magmoms"] if last else None,
-            charges=site["charges"] if last else None,
+            total_magnetization=net_mag, total_charge=net_charge,
         )
         if forces is not None:
             n_with_forces += 1
@@ -615,20 +673,33 @@ def _frames_and_meta(v: Any, calc_id: str, outcar_path: str | None,
                     "max_abs_free_minus_e0_per_atom": max_ts_gap},
         "parser": parser,
         "stress_units": "eV/A^3 (ASE Voigt [xx,yy,zz,yz,xz,xy], REF_stress label)",
-        "site_charges_present": site["charges"] is not None,
-        "site_magmoms_present": site["magmoms"] is not None,
+        # Net magnetic moment (mu_B) + net charge (e) for this calc — same values written to
+        # each frame's info; kept here for querying without opening shards. See electronic.py.
+        "electronic": electronic,
     }
     return frames, meta
 
 
 def parse_vasprun(vasprun_path: str, calc_id: str, outcar_path: str | None,
                   source: str = "zenodo") -> tuple[list[Atoms], dict]:
-    """Parse one vasprun.xml into (frames, calc_metadata)."""
+    """Parse one vasprun.xml into (frames, calc_metadata).
+
+    ``parse_eigen`` is enabled ONLY when the net moment needs the occupancy method — a
+    collinear spin-polarised calc (ISPIN=2, cheap pre-scan) with no OUTCAR beside it. With an
+    OUTCAR the moment comes from its magnetization line; ISPIN=1 has none; non-collinear needs
+    the projected magnetization we do not parse. So the ISPIN=1 majority and every
+    OUTCAR-accompanied calc parse exactly as before (no eigen cost).
+    """
     from pymatgen.io.vasp.outputs import Vasprun
-    v = Vasprun(vasprun_path, parse_dos=False, parse_eigen=False,
+    parse_eigen = False
+    if outcar_path is None:
+        flags = _scan_vasprun_spin_flags(vasprun_path)
+        parse_eigen = flags.get("ispin") == 2  # occupancy method: collinear spin-polarised only
+    v = Vasprun(vasprun_path, parse_dos=False, parse_eigen=parse_eigen,
                 parse_projected_eigen=False, parse_potcar_file=False,
                 exception_on_bad_xml=False)
-    return _frames_and_meta(v, calc_id, outcar_path, "pymatgen.Vasprun", source)
+    return _frames_and_meta(v, calc_id, outcar_path, "pymatgen.Vasprun", source,
+                            eigen_parsed=parse_eigen, atominfo_path=vasprun_path)
 
 
 def parse_vaspout(vaspout_path: str, calc_id: str, outcar_path: str | None,
@@ -638,11 +709,64 @@ def parse_vaspout(vaspout_path: str, calc_id: str, outcar_path: str | None,
     Uses pymatgen's ``Vaspout`` (a ``Vasprun`` subclass). DOS/eigenvalues and
     POTCAR *contents* are skipped for speed and for storage parity with the
     vasprun.xml path (POTCAR titels/spec are still recorded via _calc_parameters).
+    ``parse_eigen`` is enabled when there is no OUTCAR (so a spin-polarised vaspout's net
+    moment can use the occupancy method); vaspout is a tiny fraction of the corpus, so the
+    cost is negligible and the non-spin gate lives in ``electronic``.
     """
     from pymatgen.io.vasp.outputs import Vaspout
-    v = Vaspout(vaspout_path, parse_dos=False, parse_eigen=False,
+    parse_eigen = outcar_path is None
+    v = Vaspout(vaspout_path, parse_dos=False, parse_eigen=parse_eigen,
                 parse_projected_eigen=False, store_potcar=False)
-    return _frames_and_meta(v, calc_id, outcar_path, "pymatgen.Vaspout", source)
+    return _frames_and_meta(v, calc_id, outcar_path, "pymatgen.Vaspout", source,
+                            eigen_parsed=parse_eigen, atominfo_path=None)
+
+
+def electronic_block_for_unit(unit: dict) -> dict:
+    """The ``electronic`` block (net moment + net charge) for a calc unit — WITHOUT its frames.
+
+    The net-properties recovery (:mod:`net_properties_recover`) needs each calc's net
+    moment/charge but not its trajectory, so this computes just the block, using the SAME
+    primary precedence (vasprun > vaspout > outcar) and ``parse_eigen`` gating as
+    :func:`parse_vasprun`/:func:`parse_vaspout` — so a recovered value is identical to what a
+    fresh parse writes. ``unit`` maps roles to absolute paths. Falls back to a co-located OUTCAR
+    if the vasprun/vaspout parse fails (mirroring :func:`parse_calc_unit`), and to
+    :func:`empty_block` if nothing is parseable.
+    """
+    vasprun, vaspout, outcar = unit.get("vasprun"), unit.get("vaspout"), unit.get("outcar")
+    try:
+        from pymatgen.io.vasp.outputs import Vasprun, Vaspout
+        if vasprun:
+            try:
+                parse_eigen = (outcar is None
+                               and _scan_vasprun_spin_flags(vasprun).get("ispin") == 2)
+                v = Vasprun(vasprun, parse_dos=False, parse_eigen=parse_eigen,
+                            parse_projected_eigen=False, parse_potcar_file=False,
+                            exception_on_bad_xml=False)
+                return electronic_from_object(v, atominfo_path=vasprun, outcar_path=outcar,
+                                              eigen_parsed=parse_eigen)
+            except Exception:
+                if not outcar:
+                    raise            # no fallback -> report as empty below
+        elif vaspout:
+            try:
+                parse_eigen = outcar is None
+                v = Vaspout(vaspout, parse_dos=False, parse_eigen=parse_eigen,
+                            parse_projected_eigen=False, store_potcar=False)
+                return electronic_from_object(v, atominfo_path=None, outcar_path=outcar,
+                                              eigen_parsed=parse_eigen)
+            except Exception:
+                if not outcar:
+                    raise
+        if outcar:
+            try:
+                lines = read_header_lines(outcar)
+            except OSError:
+                lines = []
+            cp = build_calc_parameters(lines) if lines else None
+            return electronic_from_outcar(cp, lines, outcar)
+    except Exception as exc:  # noqa: BLE001 - a bad primary must not abort the recovery
+        logger.warning("electronic block failed for unit %s: %s", unit.get("dir"), exc)
+    return empty_block()
 
 
 def _resolve(raw_dir: Path, stored: str) -> Path:
@@ -852,7 +976,10 @@ def parse_calc_unit(unit: dict, base_meta: dict, availability: dict,
     # no longer under-counted. The same helper backs availability_recover (no drift).
     avail = _merge_embedded_availability(availability, probe_vasprun, probe_vaspout)
     avail["spin_density"] = avail.get("charge_density", False) and meta["calc_parameters"].get("spin_polarized", False)
-    avail["magnetization"] = meta.get("site_magmoms_present", False) or meta["calc_parameters"].get("spin_polarized", False)
+    # magnetization availability = the calc carries magnetization data (spin-polarised OR
+    # non-collinear). Per-atom magmoms are no longer stored, so this replaces the old
+    # `site_magmoms_present OR spin_polarized`; is_magnetic also catches non-collinear runs.
+    avail["magnetization"] = is_magnetic(meta["calc_parameters"])
     meta["availability"] = avail
 
     # provenance.parser dropped: top-level meta["parser"] is the single source.
@@ -876,10 +1003,12 @@ def _parse_outcar_ase(outcar_path: str, calc_id: str,
 
     ASE recovers only the *trajectory* (positions/energy/forces/stress); the calc
     *parameters* (functional/run_type/INCAR/effective values/k-points/POTCAR) come from a
-    separate read of the OUTCAR **header** via :func:`outcar_params.parse_outcar_header`, so
-    the ``calc_parameters`` block matches the vasprun path rather than being near-empty. This
-    is what closes the historical OUTCAR metadata gap (functional was ``null`` on 25.6% of
-    frames — see the metadata-gaps memory / docs/EVALUATION.md).
+    separate read of the OUTCAR **header** (:func:`outcar_params.read_header_lines` +
+    :func:`outcar_params.build_calc_parameters`), so the ``calc_parameters`` block matches the
+    vasprun path rather than being near-empty. This closes the historical OUTCAR metadata gap
+    (functional was ``null`` on 25.6% of frames — see the metadata-gaps memory /
+    docs/EVALUATION.md). The same header lines feed :func:`electronic.electronic_from_outcar`
+    (net moment from the OUTCAR magnetization line; net charge from ZVAL x ions per type).
     """
     import bz2
     import gzip
@@ -901,6 +1030,29 @@ def _parse_outcar_ase(outcar_path: str, calc_id: str,
         traj = read(lone, format="vasp-out", index=":")
     if not isinstance(traj, list):
         traj = [traj]
+    # Recover the full calc parameters from the OUTCAR HEADER (functional/run_type/INCAR/
+    # effective parameters/k-points/POTCAR) — parity with the vasprun path, so an OUTCAR-only
+    # calc is no longer a metadata black hole (the 25.6%-unknown-functional gap). Read the
+    # header lines ONCE and reuse them for the net magnetization/charge scan (electronic.py).
+    # Fall back to a minimal dict only if the header is unreadable (frames were already
+    # recovered by ASE, so we still keep the calc).
+    try:
+        header_lines = read_header_lines(outcar_path)
+    except OSError:
+        header_lines = []
+    if header_lines:
+        calc_parameters = build_calc_parameters(header_lines)
+        electronic = electronic_from_outcar(calc_parameters, header_lines, outcar_path)
+    else:
+        calc_parameters = {
+            "code": "vasp", "run_type": None, "functional": None,
+            "potcar_symbols": None, "potcar_set_hash": None,
+            "parsed_from": "outcar_header_unreadable",
+        }
+        electronic = empty_block()
+    net_mag = electronic["net_magnetization"]
+    net_charge = electronic["net_charge"]
+
     frames = []
     n_dropped = 0
     n_with_forces = 0
@@ -931,21 +1083,17 @@ def _parse_outcar_ase(outcar_path: str, calc_id: str,
             n_with_stress += 1
         atoms.info.update({"source": source, "calc_id": calc_id,
                            "frame_id": f"{calc_id}#{i}", "ionic_step": i})
+        # Per-calc net moment + net charge broadcast onto every frame (guarded against None,
+        # which would serialise as a bare extxyz key read back as True — see _frame).
+        if net_mag is not None:
+            atoms.info["total_magnetization"] = float(net_mag)
+        if net_charge is not None:
+            atoms.info["total_charge"] = float(net_charge)
         # electronic_converged is intentionally NOT written on the OUTCAR path: it is
         # unknown here (OUTCAR exposes no per-SCF trace). Writing None would serialise as a
         # bare extxyz key that reads back as True (see _frame); omitting it -> read-back
         # None ("unknown"), consistent with this calc's quality.electronic_converged = None.
         frames.append(atoms)
-    # Recover the full calc parameters from the OUTCAR HEADER (functional/run_type/INCAR/
-    # effective parameters/k-points/POTCAR) — parity with the vasprun path, so an OUTCAR-only
-    # calc is no longer a metadata black hole (the 25.6%-unknown-functional gap). Read from the
-    # ORIGINAL path (compression-aware); fall back to a minimal dict only if the header is
-    # unreadable (frames were already recovered by ASE, so we still keep the calc).
-    calc_parameters = parse_outcar_header(outcar_path) or {
-        "code": "vasp", "run_type": None, "functional": None,
-        "potcar_symbols": None, "potcar_set_hash": None,
-        "parsed_from": "outcar_header_unreadable",
-    }
     meta = {
         "calc_id": calc_id,
         "calc_parameters": calc_parameters,
@@ -964,7 +1112,9 @@ def _parse_outcar_ase(outcar_path: str, calc_id: str,
                     "max_abs_free_minus_e0_per_atom": max_ts_gap},
         "parser": "ase.OUTCAR",
         "stress_units": "eV/A^3 (ASE Voigt [xx,yy,zz,yz,xz,xy], REF_stress label)",
-        "site_charges_present": False, "site_magmoms_present": False,
+        # Net magnetic moment (from the OUTCAR magnetization line) + net charge (header
+        # ZVAL x ions per type); same values written to each frame's info. See electronic.py.
+        "electronic": electronic,
     }
     return frames, meta
 

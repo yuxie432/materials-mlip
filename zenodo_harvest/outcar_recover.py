@@ -145,16 +145,18 @@ def _recompute_spin_availability(record: dict, spin_polarized: Any) -> None:
 
     Mirrors :func:`parse.parse_calc_unit`'s derivation exactly so a refreshed OUTCAR record's
     ``availability`` matches how a vasprun record's is computed: ``spin_density`` = charge
-    density present AND spin-polarised; ``magnetization`` = per-site magmoms present OR
-    spin-polarised. The OUTCAR path historically had ``spin_polarized`` unknown, so these were
-    understated; now ``spin_polarized`` is real (ISPIN==2), so we recompute them.
+    density present AND spin-polarised; ``magnetization`` = the calc carries magnetization data
+    (spin-polarised OR non-collinear — :func:`electronic.is_magnetic`). Per-atom magmoms are no
+    longer stored, so this no longer keys off ``site_magmoms_present``.
     """
+    from .electronic import is_magnetic
+
     sp = bool(spin_polarized)
     avail = record.get("availability")
     if not isinstance(avail, dict):
         return
     avail["spin_density"] = bool(avail.get("charge_density")) and sp
-    avail["magnetization"] = bool(record.get("site_magmoms_present")) or sp
+    avail["magnetization"] = is_magnetic(record.get("calc_parameters") or {})
 
 
 def refresh_outcar_metadata(dataset_dir: str | Path, fetched: str | Path,
@@ -225,7 +227,6 @@ def refresh_outcar_metadata(dataset_dir: str | Path, fetched: str | Path,
         if cid in update and record.get("parser") == OUTCAR_PARSER:
             cp = update[cid]
             record["calc_parameters"] = cp
-            record["site_magmoms_present"] = record.get("site_magmoms_present", False)
             _recompute_spin_availability(record, cp.get("spin_polarized"))
             n_refreshed += 1
         return record
