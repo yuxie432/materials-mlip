@@ -96,6 +96,12 @@ before ingesting).
   the existing dataset.)*
 - **Per-frame quality:** `electronic_converged` + `scf_dE` (that step's own SCF verdict),
   and calc-level `quality` (frame counts, `max_abs_free_minus_e0_per_atom`).
+  *(Superseded 2026-08-18: `electronic_converged`/`scf_dE` are now filled on the **OUTCAR** path
+  too — read from the OUTCAR SCF trace, free-energy basis, `scf_dE_key="free_energy"`; the original
+  OUTCAR-parsed calcs left them `null`. Calc-level `ionic_converged` also reaches OUTCAR parity
+  (was `null`; reimplemented from NSW/IBRION/EDIFFG). The ionic-convergence *magnitude* (last-two-
+  frames ΔE) is intentionally NOT stored — not a per-frame training-label signal. The SAME script-47
+  campaign retrofits all of this alongside the net moment/charge — see `zenodo_harvest/convergence.py`.)*
 - **Provenance/filtering:** source DOI, `resource_type`, `license`, full INCAR/k-points/
   POTCAR, and `potcar_set_hash` (pseudopotential-set fingerprint — absolute energies are
   only comparable within an identical POTCAR set + functional + settings).

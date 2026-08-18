@@ -118,10 +118,13 @@ server-assembled zip, which is ~100× slower (server-CPU-bound).
 
 - **Pros:** reuses *everything* already built and mentor-approved — per-ionic-step
   `e_0_energy` (σ→0) with pymatgen's `final_energy` bugfix, `E_free`/`entropy_TS`,
-  `REF_stress` in ASE convention, per-frame `scf_dE`, per-structure `total_magnetization`
-  (net moment) + `total_charge` (`electronic.py`; a NOMAD spin vasprun without an OUTCAR uses
-  the occupancy method), POTCAR `titel`, `run_type`, availability flags. The NOMAD dataset comes
-  out **schema-identical** to the Zenodo one → `merge-datasets` + `verify` just work.
+  `REF_stress` in ASE convention, per-frame `scf_dE`/`electronic_converged` (the vasprun majority
+  from pymatgen's σ→0 SCF steps; the 7.5% **OUTCAR-mainfile** entries from the OUTCAR SCF trace via
+  the shared `convergence.py`, free-energy basis — so both NOMAD parser paths reach the same
+  convergence tagging as Zenodo), per-structure `total_magnetization` (net moment) + `total_charge`
+  (`electronic.py`; a NOMAD spin vasprun without an OUTCAR uses the occupancy method), POTCAR
+  `titel`, `run_type`, availability flags. The NOMAD dataset comes out **schema-identical** to the
+  Zenodo one → `merge-datasets` + `verify` just work.
 - **Cons:** must re-download + re-parse; must handle NOMAD's mainfile **naming**
   (`vasprun.xml.relax1`, not bare `vasprun.xml`) — point pymatgen at the exact file.
 - **Effort:** small. New = a NOMAD client + discover/fetch adapter; parse/store/merge unchanged.

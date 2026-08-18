@@ -112,7 +112,11 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   - `parse.py` — stage 3: pymatgen `Vasprun` (primary) → per-ionic-step ASE frames; tags each
     frame with *its own* step's electronic convergence bool + magnitude (`scf_dE`), drops steps
     with no recoverable energy, records `run_type`, full INCAR/k-points/POTCAR, availability
-    flags. Every frame also carries the calc's **net magnetic moment** `total_magnetization` +
+    flags. **`scf_dE`/`electronic_converged` are now filled on ALL parser paths** (`convergence.py`):
+    the vasprun path uses pymatgen's per-electronic-step σ→0 energies (`_step_scf`); the OUTCAR
+    path scans the OUTCAR SCF trace (`Iteration X(Y)` + `total energy-change (2. order)` lines →
+    free-energy `scf_dE`, `n_esteps<NELM` verdict — `scf_dE_key="free_energy"`); a `vaspout` calc
+    (whose HDF5 carries no per-SCF data) is filled from a co-located OUTCAR, else stays null. Every frame also carries the calc's **net magnetic moment** `total_magnetization` +
     **net charge** `total_charge` (broadcast; `electronic.py`), mirrored into a metadata
     `electronic` block. `parse_vasprun` enables `parse_eigen` (for the occupancy method) ONLY
     for a collinear spin-polarised vasprun **without** an OUTCAR — a cheap streaming ISPIN
@@ -213,6 +217,23 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
     skipped — presence of the source file IS the resume state. CSD3 campaign:
     `scripts/csd3/46_availability_recover.sh` (mirrors 45; batched fetch→refresh→purge, dedicated
     `raw_availability` dir, explicit pre-job metadata backup, verify-only finalize — no enrich).
+  - `convergence.py` — per-ionic-step **electronic (SCF) convergence from an OUTCAR body**, so an
+    OUTCAR-parsed calc (and a `vaspout` calc with a co-located OUTCAR) reaches vasprun-level per-frame
+    tagging. `scan_outcar_scf` streams the `Iteration X(Y)` markers + `total energy-change (2. order)`
+    lines: the last such value in ionic step X is `|ΔF|` = that step's `scf_dE` (free-energy basis —
+    the OUTCAR prints σ→0 only per ionic step, not per SCF step, so `scf_dE_key="free_energy"` vs the
+    vasprun path's `"e_0_energy"`; the two differ only by the near-converged inter-step entropy change,
+    and ΔF is VASP's own EDIFF metric). `outcar_scf_convergence` adds the `n_esteps<NELM` verdict
+    (`outcar_nelm` reads NELM from the header) — same rule as `parse._step_scf`. vaspout.h5 has NO
+    per-SCF data (pymatgen hard-codes `electronic_steps=[]`), so vaspout-**without**-OUTCAR stays null.
+    Also `converged_ionic_from_params` — a pymatgen-`Vasprun.converged_ionic`-faithful reimplementation
+    (from NSW/IBRION/EDIFFG + the ionic-step count) so the **OUTCAR** path reaches calc-level
+    `quality.ionic_converged` parity with the vasprun/vaspout paths (which get it from pymatgen). The
+    ionic-convergence *magnitude* (last-two-frames ΔE) is deliberately NOT stored — it is not a
+    per-frame label-quality signal for training (off-equilibrium frames are valid data) and is
+    derivable from the stored `REF_energy`/`REF_forces`. `cparam` reads a VASP tag from a stored
+    `calc_parameters` dict (shared by the OUTCAR parse + recovery). Pure stdlib (reuses
+    `outcar_params._open_text` for gz/bz2/xz); offline-tested.
   - `electronic.py` — per-calc **net magnetic moment** (μ_B, = N_up−N_down = 2·S) + **net charge**
     (e, = Z_neutral−NELECT; + = electron-deficient), the values stored on every frame
     (`total_magnetization`/`total_charge`) and mirrored into the metadata `electronic` block. Net
@@ -225,20 +246,27 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
     titel→ZVAL table (vaspout fallback). Unknowns stay `None` (never a fabricated 0). Also
     `is_magnetic` (spin-polarised OR non-collinear) — the single source of the
     `availability["magnetization"]` flag now that per-atom magmoms are gone. Pure-ish + offline-tested.
-  - `net_properties_recover.py` — retrofit net moment/charge onto an **already-built** dataset;
-    UNLIKE the other recoveries this **REWRITES SHARDS** (the values live on the frames). A shard
-    mixes calcs, so **two phases**: `compute_net_properties` (Phase 1, disk-paced) re-fetches every
-    record and computes each calc's net moment/charge (`parse.electronic_block_for_unit`, the same
-    code a fresh parse uses) into a `net_properties.jsonl` map (resumable by map membership, no shard
-    touched); `apply_net_properties` (Phase 2, local, ONCE after Phase 1 completes) drives the map in
-    via a **text-level** shard edit — append the two totals to each frame's comment line + strip the
-    `dft_magmom`/`dft_charge` columns, leaving every untouched value **byte-identical** (no ASE
-    re-serialise → no float drift) — then an atomic metadata rewrite (add `electronic`, drop
-    `site_*_present`). Idempotent + resumable (`.net_properties_applied` marker); `verify` still
-    passes (frame_ids/shards/calc_id untouched). CLI `net-properties-keeplist`/`compute-net-properties`/
-    `apply-net-properties`; CSD3 campaign `scripts/csd3/47_net_properties_recover.sh` (Phase-1 batched
-    loop, then Phase-2 apply+verify once). Structured so a later per-frame field (e.g. an OUTCAR
-    ionic-convergence ΔE) is another Phase-1 field + the same Phase-2 edit.
+  - `net_properties_recover.py` — retrofit net moment/charge **+ OUTCAR SCF convergence** onto an
+    **already-built** dataset in ONE shard pass; UNLIKE the other recoveries this **REWRITES SHARDS**
+    (the values live on the frames). A shard mixes calcs, so **two phases**: `compute_net_properties`
+    (Phase 1, disk-paced) re-fetches every record and computes each calc's net moment/charge
+    (`parse.electronic_block_for_unit`) — and, for **`ase.OUTCAR`** calcs, its per-frame
+    `scf_dE`/`electronic_converged` (`parse.convergence_block_for_unit`; vasprun calcs already have
+    σ→0 `scf_dE` from the live parse) — into a `net_properties.jsonl` map (`{electronic, convergence?}`
+    per calc; resumable by map membership, no shard touched); `apply_net_properties` (Phase 2, local,
+    ONCE after Phase 1 completes) drives the map in via a **text-level** shard edit — append the two
+    totals (+ OUTCAR frames' `scf_dE`/`electronic_converged` for that frame's `ionic_step`) to each
+    frame's comment line + strip the `dft_magmom`/`dft_charge` columns, leaving every untouched value
+    **byte-identical** (no ASE re-serialise → no float drift) — then an atomic metadata rewrite (add
+    `electronic`, drop `site_*_present`, overwrite OUTCAR calcs' `quality` convergence fields, and
+    **backfill calc-level `ionic_converged` for OUTCAR calcs** from each record's OWN
+    `calc_parameters` + `n_ionic_steps` via `converged_ionic_from_params` — metadata-only, no re-fetch,
+    covers every OUTCAR record). Idempotent + resumable (`.net_properties_applied` marker); `verify`
+    still passes (frame_ids/shards/calc_id untouched). CLI `net-properties-keeplist`/`compute-net-properties`
+    (needs `--dataset-dir` for the parser lookup)/`apply-net-properties`; CSD3 campaign
+    `scripts/csd3/47_net_properties_recover.sh` (Phase-1 batched loop, then Phase-2 apply+verify once).
+    Structured so a later per-frame field (e.g. an OUTCAR **ionic**-convergence ΔE — distinct from
+    this electronic `scf_dE`) is another Phase-1 field + the same Phase-2 edit.
   - `store.py` — stage 4: `ShardedExtxyzWriter` (rotating `shard-NNNNN.extxyz.gz`) +
     `MetadataWriter` (one JSONL record per calc), joined by `calc_id`/`frame_id`.
   - `status.py` — read-only progress snapshot: line-counts the append-only manifests +
@@ -338,10 +366,13 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   ```
   (no `enrich-metadata` step — availability does not feed the resolver. The refresh must run
   BEFORE `purge-raw` each batch: the embedded DOS/eigen probe reads the STAGED vasprun.)
-  **Net moment/charge recovery** (add `total_magnetization`/`total_charge` to every frame + the
-  metadata `electronic` block, and strip per-atom `dft_*`, on a dataset built before this — this
-  one **REWRITES SHARDS**; CSD3 template `scripts/csd3/47_net_properties_recover.sh` runs the whole
-  two-phase campaign). Phase 1 is a batched fetch→compute→purge loop building the map; Phase 2
+  **Net moment/charge + OUTCAR-convergence recovery** (add `total_magnetization`/`total_charge` to
+  every frame + the metadata `electronic` block, strip per-atom `dft_*`, AND add
+  `scf_dE`/`electronic_converged` to every OUTCAR-parsed calc's frames + its `quality`, on a dataset
+  built before this — this one **REWRITES SHARDS**; CSD3 template
+  `scripts/csd3/47_net_properties_recover.sh` runs the whole two-phase campaign in one shard pass).
+  Phase 1 is a batched fetch→compute→purge loop building the map (`compute-net-properties` needs
+  `--dataset-dir` to read each calc's parser — only `ase.OUTCAR` calcs get the SCF-trace scan); Phase 2
   applies it ONCE (verify still passes; frame_ids/shards/calc_id untouched):
   ```
   python -m zenodo_harvest.cli net-properties-keeplist --dataset-dir data/dataset \
@@ -354,10 +385,11 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
       --net-properties data/manifests/net_properties.jsonl   # REWRITES SHARDS (adds totals, strips dft_*)
   python -m zenodo_harvest.cli verify --dataset-dir data/dataset            # bijection still holds
   ```
-  (`compute-net-properties` re-uses the SAME `electronic.py` code a fresh parse uses, so a
-  recovered value is identical to a freshly-parsed one. `apply` is idempotent + resumable via a
-  `.net_properties_applied` marker; run Phase 2 only after Phase 1 is complete — a shard mixes
-  calcs, so a partial map would leave some frames' totals unset.)
+  (`compute-net-properties` re-uses the SAME `electronic.py` + `convergence.py` code a fresh parse
+  uses — validated live: a recovered OUTCAR `scf_dE`/`electronic_converged` is byte-identical to a
+  freshly-parsed one. `apply` is idempotent + resumable via a `.net_properties_applied` marker; run
+  Phase 2 only after Phase 1 is complete — a shard mixes calcs, so a partial map would leave some
+  frames unset.)
 - `ZENODO_TOKEN` lives in `.env` (gitignored, loaded by `config.load_dotenv`). Stage 0–1 depend
   only on `requests`; stages 2–4 need `pymatgen` + `ase` (`pip install -e .[parse]`).
 - **Frame properties**: per-ionic-step energy (`e_0_energy`, σ→0, with pymatgen's `final_energy`
@@ -367,9 +399,12 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   read-back, removing them from `info`/`arrays`). A step with no recoverable energy (e.g.
   GW/response) is **dropped** (energy-only steps, no forces, are kept); kept frames keep their
   original ionic-step index in `frame_id`/`ionic_step`. Each frame's `electronic_converged`/`scf_dE`
-  are **that step's own** SCF verdict/magnitude (calc-level `quality` keeps the final-step verdict
+  are **that step's own** SCF verdict/magnitude on **every parser path** (`convergence.py`): the
+  vasprun path from pymatgen's per-electronic-step σ→0 energies, the OUTCAR path from the OUTCAR SCF
+  trace (free-energy `scf_dE`, `scf_dE_key="free_energy"`), a `vaspout` calc from a co-located OUTCAR
+  (null without one — the HDF5 has no SCF trace). Calc-level `quality` keeps the final-step verdict
   plus counts: `n_frames`, `n_frames_scf_unconverged`, `n_frames_with_forces`,
-  `n_frames_dropped_no_energy`). **Stress is a training label** (mentor 2026-07-20): per-frame
+  `n_frames_dropped_no_energy`. **Stress is a training label** (mentor 2026-07-20): per-frame
   stress is written under MACE's **`REF_stress`** key in **ASE's convention** — a Voigt-6 vector
   `[xx,yy,zz,yz,xz,xy]` in eV/Å³ with ASE's sign. The vasprun/vaspout path converts VASP's raw
   kBar tensor (`× −0.1 × ase.units.GPa` + Voigt reorder, exactly ASE's own vasprun.xml reader);
@@ -474,7 +509,20 @@ tail is ~170 TB).
   Unconverged calculations are noisier and must be tagged, not silently included. This is now tagged
   **per frame** (each ionic step's own SCF verdict/magnitude, mirroring pymatgen's
   `len(electronic_steps) < NELM`), with the calc-level `converged_electronic` (final step) retained
-  in `quality`.
+  in `quality`. **The OUTCAR path reaches parity** (`convergence.py`): it scans the OUTCAR's own SCF
+  trace (`Iteration X(Y)` + `total energy-change (2. order)` lines) for the same per-frame
+  `scf_dE`/`electronic_converged`, with `scf_dE` on a **free-energy basis** (`scf_dE_key="free_energy"`)
+  since the OUTCAR prints σ→0 only per ionic step, not per SCF step — a negligible difference at
+  convergence, and exactly VASP's own EDIFF metric. A `vaspout` calc (no per-SCF data in the HDF5) is
+  filled from a co-located OUTCAR, else `null`.
+- **Ionic convergence** (calc-level — did the geometry relaxation finish; distinct from the per-frame
+  electronic SCF convergence above): `quality.ionic_converged` is tracked on ALL paths — vasprun/vaspout
+  from pymatgen's `converged_ionic`, and the OUTCAR path now at parity via a faithful reimplementation
+  (`convergence.converged_ionic_from_params`, from NSW/IBRION/EDIFFG + the ionic-step count). Its
+  **magnitude** (the last-two-frames ΔE) is deliberately NOT stored: unlike the electronic `scf_dE` it is
+  not a per-frame label-quality signal for MLIP training — off-equilibrium (high-force) frames are valid,
+  desirable training data, not noise — and it is anyway derivable from the per-frame
+  `REF_energy`/`REF_forces` already stored.
 - **Run-type classification**: pymatgen's `Vasprun.run_type` classifies DFT flavour and Hubbard U / vdW
   corrections — useful metadata but too coarse alone to guarantee dataset consistency (foundation-model
   papers, e.g. the NequIP foundation potentials draft, discuss why "one-size-fits-all" settings/datasets

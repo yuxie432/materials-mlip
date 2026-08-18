@@ -257,14 +257,27 @@ Proposed metadata record (one per calculation; frames reference it):
 ```
 
 **Convergence** (mentor's emphasis): store both the boolean and the *magnitude*.
-This is now tagged **per frame** — vasprun.xml exposes `electronic_steps` for every
-ionic step, so each frame's `electronic_converged`/`scf_dE` carry *that step's own*
-verdict and ΔE (`|E[-1]-E[-2]|` of its last two SCF steps; `converged` mirrors
-pymatgen's `len(electronic_steps) < NELM`). Calc-level `quality` keeps the
-FINAL-step verdict under the same keys (pymatgen `converged_electronic`, unchanged)
-plus `n_frames_scf_unconverged` (count of frames whose own SCF didn't converge).
-Unconverged frames are kept but **tagged**, never silently mixed in. (vaspout.h5 and
-the OUTCAR-only path expose no SCF trace, so their per-frame verdicts stay `null`.)
+This is tagged **per frame** on **every parser path** — each frame's
+`electronic_converged`/`scf_dE` carry *that step's own* verdict and ΔE
+(`|E[-1]-E[-2]|` of its last two SCF steps; `converged` mirrors pymatgen's
+`len(electronic_steps) < NELM`). The vasprun path uses pymatgen's per-electronic-step
+σ→0 energies; the **OUTCAR path** scans the OUTCAR SCF trace itself
+(`convergence.py`: the `Iteration X(Y)` markers + `total energy-change (2. order)`
+lines) — `scf_dE` there is the free-energy ΔF (the OUTCAR prints σ→0 only per ionic
+step, not per SCF step; the two differ only by the near-converged inter-step entropy
+change, and ΔF is VASP's own EDIFF metric), recorded as `scf_dE_key="free_energy"`. A
+`vaspout` calc, whose HDF5 output carries no per-SCF data, is filled from a co-located
+OUTCAR — **`null` only when a vaspout has no OUTCAR beside it**. Calc-level `quality`
+keeps the FINAL-step verdict under the same keys plus `n_frames_scf_unconverged`.
+Unconverged frames are kept but **tagged**, never silently mixed in. **Calc-level
+`ionic_converged`** (a genuinely calc-level property — did the geometry relaxation
+finish) is tracked on all paths: vasprun/vaspout from pymatgen's `converged_ionic`,
+and the OUTCAR path now reaches parity by reimplementing that rule from
+NSW/IBRION/EDIFFG + the ionic-step count (`convergence.converged_ionic_from_params`).
+Its *magnitude* — the last-two-ionic-frames ΔE — is **deliberately not stored**: unlike
+the per-frame electronic `scf_dE` it is not a label-quality signal for MLIP training
+(off-equilibrium frames are valid, desirable data), and it is derivable from the
+per-frame `REF_energy`/`REF_forces` already on every frame.
 
 ### 3c. The manifest ties it together
 
