@@ -8,11 +8,13 @@ trace). This module brings an existing dataset to the new schema in ONE shard pa
 * every frame gains ``total_magnetization`` / ``total_charge`` (:mod:`electronic`), the per-atom
   arrays are stripped, and each metadata record gains the ``electronic`` block (``site_*_present``
   removed);
-* every frame of an **OUTCAR-parsed** calc (``parser == "ase.OUTCAR"``) additionally gains that
-  ionic step's own ``scf_dE`` (free-energy basis) + ``electronic_converged`` from the OUTCAR trace
-  (:mod:`convergence`), and its metadata ``quality`` gets the final-step verdict +
-  ``n_frames_scf_unconverged`` — vasprun-level parity. vasprun calcs already have σ→0 ``scf_dE``
-  from the live parse, so they are left untouched here.
+* every frame of a calc whose SCF trace lives in an OUTCAR — the OUTCAR reader
+  (``parser == "ase.OUTCAR"``) **and** a ``pymatgen.Vaspout`` calc with a co-located OUTCAR
+  (vaspout.h5 carries no per-SCF data, so a fresh ``parse_vaspout`` fills it from the OUTCAR too) —
+  additionally gains that ionic step's own ``scf_dE`` (free-energy basis) + ``electronic_converged``
+  from the OUTCAR trace (:mod:`convergence`), and its metadata ``quality`` gets the final-step
+  verdict + ``n_frames_scf_unconverged`` — vasprun-level parity. vasprun calcs already have σ→0
+  ``scf_dE`` from the live parse, so they are left untouched here.
 
 Unlike the OUTCAR / vasprun / availability recoveries (metadata-only, shards untouched), this one
 **rewrites shards** — the values live on the frames — so it is deliberately a separate,
@@ -24,7 +26,8 @@ calcs' net values is known. Hence **two phases**:
 1. :func:`compute_net_properties` (Phase 1, disk-paced) — re-fetch the records (the ordinary
    ``fetch`` on :func:`build_net_properties_keeplist`'s keep-list) and, for each re-fetched
    calc, compute its net moment/charge (:func:`parse.electronic_block_for_unit`, the SAME code
-   a fresh parse uses) and — for OUTCAR-parsed calcs — its per-frame SCF convergence
+   a fresh parse uses) and — for calcs whose SCF trace lives in an OUTCAR (``ase.OUTCAR`` and
+   ``pymatgen.Vaspout``-with-OUTCAR) — its per-frame SCF convergence
    (:func:`parse.convergence_block_for_unit`) into a ``net_properties.jsonl`` map
    (``calc_id`` → ``{electronic, convergence?}``). Resumable: calcs already in the map are
    skipped, so the fetch→compute→purge loop can pace against the disk quota exactly like the
@@ -150,8 +153,10 @@ def compute_net_properties(fetched: str | Path, raw_dir: str | Path,
     if not fetched.is_file():
         return {"ok": False, "error": f"no fetched manifest at {fetched}"}
 
-    # Convergence recovery is scoped to OUTCAR-parsed calcs (vasprun already has σ→0 scf_dE), so
-    # load each dataset calc's parser to decide. Both maps come from the one metadata read.
+    # Convergence recovery is scoped to calcs whose SCF trace lives in an OUTCAR — the OUTCAR
+    # reader (ase.OUTCAR) AND vaspout (whose HDF5 carries no per-SCF data, so a fresh parse_vaspout
+    # fills it from a co-located OUTCAR). A vasprun already has σ→0 scf_dE from the live parse, so
+    # it is skipped. Load each dataset calc's parser to decide; both maps come from one metadata read.
     dataset_calc_ids: set[str] | None = None
     parser_by_calc_id: dict[str, str] = {}
     if dataset_dir is not None:
@@ -185,9 +190,13 @@ def compute_net_properties(fetched: str | Path, raw_dir: str | Path,
                     continue
                 entry: dict[str, Any] = {"calc_id": calc_id,
                                          "electronic": electronic_block_for_unit(unit_abs)}
-                # OUTCAR-parsed calcs also get per-frame SCF convergence from the OUTCAR trace
-                # (vasprun calcs already carry σ→0 scf_dE from the live parse, so skip them).
-                if parser_by_calc_id.get(calc_id) == "ase.OUTCAR":
+                # OUTCAR-parsed calcs — and vaspout calcs with a co-located OUTCAR — also get
+                # per-frame SCF convergence from the OUTCAR trace (a fresh parse_vaspout fills it
+                # from the OUTCAR too, since vaspout.h5 has no per-SCF data). vasprun calcs already
+                # carry σ→0 scf_dE from the live parse, so they are skipped (no convergence entry).
+                # convergence_block_for_unit returns None when the unit has no staged OUTCAR (e.g.
+                # a vaspout-only calc), leaving those frames' convergence null — matching a fresh parse.
+                if parser_by_calc_id.get(calc_id) in ("ase.OUTCAR", "pymatgen.Vaspout"):
                     conv = convergence_block_for_unit(unit_abs)
                     if conv is not None:
                         entry["convergence"] = conv

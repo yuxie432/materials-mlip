@@ -241,3 +241,42 @@ def test_compute_net_properties_resumes(tmp_path, monkeypatch):
     # resume: already-computed calc is skipped, nothing recomputed
     r2 = NP.compute_net_properties(fetched, raw, out)
     assert r2["computed_this_pass"] == 0 and r2["skipped_already_computed"] == 1
+
+
+def test_compute_includes_vaspout_with_outcar_convergence(tmp_path, monkeypatch):
+    # A vaspout calc WITH a co-located OUTCAR must get a convergence block in the map — parity
+    # with a fresh parse_vaspout, which fills scf_dE/electronic_converged from that OUTCAR
+    # (vaspout.h5 has no per-SCF data). Before the fix the map only carried convergence for
+    # ase.OUTCAR calcs, leaving existing vaspout+OUTCAR calcs' per-frame convergence null.
+    raw = tmp_path / "raw"
+    calc = raw / "9" / "extracted" / "calc"
+    calc.mkdir(parents=True)
+    (calc / "vaspout.h5").write_bytes(b"\x89HDF\r\n\x1a\n")   # presence only; electronic is stubbed
+    # a minimal 1-ionic-step OUTCAR SCF trace: NELM=4, converges in 2 electronic steps (2 < 4).
+    (calc / "OUTCAR").write_text(
+        "   NELM   =      4;   NELMIN=  2\n"
+        "----- Iteration    1(   1)  -----\n"
+        " total energy-change (2. order) : 0.5000000E+02  (-0.1000000E+03)\n"
+        "----- Iteration    1(   2)  -----\n"
+        " total energy-change (2. order) :-0.3000000E-04  (-0.2000000E-04)\n")
+    fetched = tmp_path / "fetched.jsonl"
+    fetched.write_text(json.dumps({
+        "provenance": {"record_id": "9", "source": "zenodo"}, "local_dir": "9",
+        "calc_units": [{"dir": "9/extracted/calc", "vaspout": "9/extracted/calc/vaspout.h5",
+                        "outcar": "9/extracted/calc/OUTCAR"}]}) + "\n")
+    cid = "zenodo:9:calc/vaspout.h5"                          # primary precedence: vaspout > outcar
+    ds = tmp_path / "dataset"
+    ds.mkdir()
+    (ds / "metadata.jsonl").write_text(
+        json.dumps({"calc_id": cid, "parser": "pymatgen.Vaspout"}) + "\n")
+
+    import zenodo_harvest.parse as P
+    monkeypatch.setattr(P, "electronic_block_for_unit",
+                        lambda unit: {"net_magnetization": 0.0, "net_charge": 0.0})
+    out = tmp_path / "net_properties.jsonl"
+    NP.compute_net_properties(fetched, raw, out, dataset_dir=ds)
+    rec = json.loads(out.read_text().splitlines()[0])
+    assert rec["calc_id"] == cid
+    assert "convergence" in rec                               # <-- the fix: vaspout+OUTCAR gets it
+    assert rec["convergence"]["per_step"]["0"] == [pytest.approx(3.0e-05), True]  # 2 e-steps < NELM 4
+    assert rec["convergence"]["quality"]["scf_dE_key"] == "free_energy"

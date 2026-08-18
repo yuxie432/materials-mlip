@@ -72,6 +72,12 @@ MAX_DISK_FILES="${MAX_DISK_FILES:-800000}"             # inode quota binds first
 MAX_MEMBER_BYTES="${MAX_MEMBER_BYTES:-30000000000}"    # bomb guard on the whole-download fallback
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-8}"
 ATTEMPT="${ATTEMPT:-1}"
+# SAFETY GATE: Phase 2 (the irreversible shard rewrite) refuses to run unless the Phase-1 map
+# covers EVERY dataset calc. Applying a partial map would strip a missing calc's dft_* columns
+# without adding its totals (a half-migrated frame) and the marker would then block re-processing
+# its shards. Set ALLOW_INCOMPLETE=1 ONLY to override after confirming the shortfall is genuinely
+# unrecoverable (records gone from Zenodo, etc.) and you accept those few calcs staying half-migrated.
+ALLOW_INCOMPLETE="${ALLOW_INCOMPLETE:-0}"
 # --------------------------------------------------------------------------------
 
 mkdir -p logs
@@ -157,14 +163,32 @@ set -e
 echo "=== Phase 1 (compute) exit=$rc $(date -Is) ==="
 
 if [[ "$rc" -eq 0 ]]; then
-    # Phase 1 complete (map stable) => run Phase 2 ONCE. Back up metadata first (shards are NOT
-    # backed up; rely on the offline tests + byte-identical idempotency).
+    # Phase 1 complete (map stable). BEFORE the irreversible Phase 2, GATE on map completeness:
+    # the map must carry an entry for EVERY dataset calc (one metadata.jsonl line == one calc; the
+    # map appends one line per computed calc, no dupes). If it does not — a record could not be
+    # re-fetched, or a re-fetch reproduced a different calc_id — applying anyway would leave the
+    # missing calcs half-migrated (dft_* stripped, no totals) and the .net_properties_applied
+    # marker would then block re-processing their shards. So STOP LOUDLY unless ALLOW_INCOMPLETE=1.
     fetched_now=$([[ -f "$NP_FETCHED" ]] && wc -l < "$NP_FETCHED" || echo 0)
-    if [[ "$fetched_now" -lt "$TOTAL" ]]; then
-        echo "WARNING: only $fetched_now/$TOTAL records re-fetched — the rest are unrecoverable"
-        echo "  (recid missing from keep.jsonl / unsupported-or-oversized archive / corrupt archive)."
-        echo "  Those calcs' frames get dft_* stripped but no totals. Inspect $MAN/net_properties_rejections.jsonl."
+    DATASET_CALCS=$(wc -l < "$DS/metadata.jsonl")
+    MAP_CALCS=$([[ -f "$NP_MAP" ]] && wc -l < "$NP_MAP" || echo 0)
+    echo "Phase-1 coverage: records ${fetched_now}/${TOTAL}, map ${MAP_CALCS}/${DATASET_CALCS} calcs"
+    if [[ "$MAP_CALCS" -lt "$DATASET_CALCS" ]]; then
+        echo "WARNING: net-properties map is INCOMPLETE — ${MAP_CALCS}/${DATASET_CALCS} dataset calcs."
+        echo "  Likely causes: a record could not be re-fetched (recid gone from Zenodo / unsupported"
+        echo "  or oversized archive / corrupt archive) or a re-fetch reproduced a different layout."
+        echo "  Inspect $MAN/net_properties_rejections.jsonl."
+        if [[ "$ALLOW_INCOMPLETE" == "0" ]]; then
+            echo "ERROR: refusing to run Phase 2 (irreversible shard rewrite) against a partial map."
+            echo "  The ${MAP_CALCS}-of-${DATASET_CALCS} shortfall would leave the missing calcs' frames"
+            echo "  with dft_* stripped but no totals, and the marker would block fixing them later."
+            echo "  FIX: investigate the rejections and re-submit to fetch the stragglers, OR — if the"
+            echo "  shortfall is genuinely unrecoverable and acceptable — re-submit with ALLOW_INCOMPLETE=1."
+            exit 3
+        fi
+        echo "  ALLOW_INCOMPLETE=1 set — proceeding with the partial map (missing calcs stay half-migrated)."
     fi
+    # Back up metadata first (shards are NOT backed up; rely on the offline tests + idempotency).
     if [[ ! -e "$JOB_BACKUP" ]]; then
         cp -p "$DS/metadata.jsonl" "$JOB_BACKUP"
         echo "backed up current metadata -> $JOB_BACKUP ($(wc -l < "$JOB_BACKUP") records)"

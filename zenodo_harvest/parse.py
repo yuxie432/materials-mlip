@@ -825,11 +825,16 @@ def electronic_block_for_unit(unit: dict) -> dict:
 
 
 def convergence_block_for_unit(unit: dict) -> dict | None:
-    """Per-frame SCF convergence for a calc unit whose stored parser is the OUTCAR reader.
+    """Per-frame SCF convergence for a calc unit whose SCF trace lives in an OUTCAR.
 
-    The net-properties recovery calls this ONLY for calcs parsed by :func:`_parse_outcar_ase`
-    (``parser == "ase.OUTCAR"``) — those never got ``scf_dE``/``electronic_converged`` (the
-    original OUTCAR path stored neither). Returns:
+    The net-properties recovery calls this for calcs whose stored parser is the OUTCAR reader
+    (``parser == "ase.OUTCAR"``) or ``pymatgen.Vaspout`` **with a co-located OUTCAR** — neither
+    got ``scf_dE``/``electronic_converged`` from the original harvest (the old OUTCAR path stored
+    neither, and vaspout.h5 has no per-SCF data, so a fresh ``parse_vaspout`` fills it from the
+    OUTCAR — this brings existing vaspout+OUTCAR calcs to that same parity). A vasprun-parsed calc
+    is never passed here (it already carries per-frame σ→0 ``scf_dE`` from the live parse), and a
+    vaspout calc with no OUTCAR returns ``None`` (its convergence is genuinely unavailable).
+    Returns:
 
     * ``per_step`` — ``{str(ionic_step): [scf_dE, electronic_converged]}`` keyed by file-order
       ionic index, matching the stored ``frame_id``/``ionic_step`` so Phase 2 attaches each
@@ -838,8 +843,7 @@ def convergence_block_for_unit(unit: dict) -> dict | None:
       calc's ``quality`` (which held ``electronic_converged=None`` before this recovery).
 
     ``None`` when the unit has no staged OUTCAR or no SCF trace could be parsed (leaving those
-    frames' convergence untouched — i.e. still ``None``). A vasprun-parsed calc is never passed
-    here: it already carries per-frame σ→0 ``scf_dE`` from the live parse.
+    frames' convergence untouched — i.e. still ``None``).
     """
     outcar = unit.get("outcar")
     if not outcar or not Path(outcar).exists():
