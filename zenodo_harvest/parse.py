@@ -80,6 +80,8 @@ from ase import Atoms
 from ase.stress import full_3x3_to_voigt_6_stress
 
 from . import config
+from .convergence import (converged_ionic_from_params, cparam, outcar_nelm,
+                          outcar_scf_convergence)
 from .electronic import electronic_from_object, electronic_from_outcar, empty_block, is_magnetic
 from .manifest import RejectionLogger, read_jsonl
 from .outcar_params import build_calc_parameters, read_header_lines
@@ -244,14 +246,22 @@ def _step_scf(step: dict, nelm: int | None) -> tuple[float | None, bool | None]:
 
 def _nelm(v: Any) -> int:
     """Max SCF steps NELM. pymatgen reads ``parameters["NELM"]``; 60 is VASP's default."""
+    val = _vparam(v, "NELM")
+    return int(val) if val is not None else 60
+
+
+def _vparam(v: Any, key: str) -> Any:
+    """A VASP tag from a pymatgen Vasprun/Vaspout object: resolved ``parameters`` first (what
+    pymatgen's ``converged_ionic`` reads), then the user ``incar``. None if set in neither.
+    (The stored-dict analogue is :func:`convergence.cparam`.)"""
     for src in ("parameters", "incar"):
         try:
-            nelm = getattr(v, src).get("NELM")
+            val = getattr(v, src).get(key)
         except (AttributeError, TypeError):
-            nelm = None
-        if nelm is not None:
-            return int(nelm)
-    return 60
+            val = None
+        if val is not None:
+            return val
+    return None
 
 
 def _select_frame_steps(steps: list) -> tuple[list[tuple[int, float]], int]:
@@ -585,7 +595,9 @@ def _frame(structure: Any, energy: float | None, forces: Any, *, calc_id: str,
 def _frames_and_meta(v: Any, calc_id: str, outcar_path: str | None,
                      parser: str, source: str = "zenodo", *,
                      eigen_parsed: bool = False,
-                     atominfo_path: str | None = None) -> tuple[list[Atoms], dict]:
+                     atominfo_path: str | None = None,
+                     outcar_scf: list[tuple[float | None, bool | None]] | None = None
+                     ) -> tuple[list[Atoms], dict]:
     """Build frames + metadata from a parsed pymatgen object.
 
     Shared by :func:`parse_vasprun` and :func:`parse_vaspout`: ``Vaspout``
@@ -598,11 +610,26 @@ def _frames_and_meta(v: Any, calc_id: str, outcar_path: str | None,
     net-charge valence read — None for vaspout.h5, which has no atominfo XML). The net
     magnetization + net charge (:mod:`electronic`) are computed once per calc and broadcast
     onto every frame (``total_magnetization`` / ``total_charge``) + mirrored into ``meta``.
+
+    ``outcar_scf`` (per ionic step, file order, ``(scf_dE, electronic_converged)`` from
+    :func:`convergence.outcar_scf_convergence`) supplies the SCF convergence for a ``vaspout``
+    calc with a co-located OUTCAR: ``vaspout.h5`` has no per-electronic-step data, so pymatgen
+    leaves ``electronic_steps`` empty and :func:`_step_scf` returns ``(None, None)``; the OUTCAR
+    fills that gap (basis ``free_energy``, see :mod:`convergence`). It is only consulted for a
+    step the object itself could not tag, so a vasprun (native σ→0 ``scf_dE``) is unaffected.
     """
     conv = _scf_convergence(v)  # calc-level final-step verdict (keys/semantics unchanged)
     steps = v.ionic_steps
     natoms = len(v.final_structure)
     nelm = _nelm(v)
+    # vaspout+OUTCAR: the object exposes no SCF trace, so lift the calc-level final-step verdict
+    # from the OUTCAR too (mirrors the per-frame enrichment below). A vasprun already has it.
+    if conv.get("electronic_converged") is None and outcar_scf:
+        f_dE, f_conv = outcar_scf[-1]
+        conv["electronic_converged"] = f_conv
+        conv["scf_dE"] = f_dE
+        conv["scf_dE_key"] = "free_energy"
+        conv.pop("scf_note", None)
 
     # Net magnetic moment + net charge (per-calc scalars; see electronic.py). Magnetization
     # from the OUTCAR line when present, else the occupancy method (needs eigen_parsed).
@@ -622,6 +649,8 @@ def _frames_and_meta(v: Any, calc_id: str, outcar_path: str | None,
     for pos, (i, energy) in enumerate(kept_steps):
         st = steps[i]
         scf_dE, econv = _step_scf(st, nelm)  # this step's OWN convergence
+        if scf_dE is None and econv is None and outcar_scf and i < len(outcar_scf):
+            scf_dE, econv = outcar_scf[i]    # vaspout+OUTCAR: fill from the OUTCAR SCF trace
         if econv is False:
             n_unconverged += 1
         forces = st.get("forces")
@@ -680,6 +709,26 @@ def _frames_and_meta(v: Any, calc_id: str, outcar_path: str | None,
     return frames, meta
 
 
+def _outcar_scf_for(outcar_path: str | None
+                    ) -> list[tuple[float | None, bool | None]] | None:
+    """Per-ionic-step ``(scf_dE, electronic_converged)`` from an OUTCAR, or None.
+
+    Reads the header once for NELM and streams the body for the SCF trace
+    (:func:`convergence.outcar_scf_convergence`). Returns None when there is no OUTCAR or its
+    header/body cannot be read — a best-effort enrichment that never raises. Shared by the
+    ``vaspout`` parse path and the net-properties recovery so both derive identical values.
+    """
+    if not outcar_path:
+        return None
+    try:
+        header = read_header_lines(outcar_path)
+        conv = outcar_scf_convergence(outcar_path, outcar_nelm(header))
+    except OSError as exc:
+        logger.debug("OUTCAR SCF scan failed for %s: %s", outcar_path, exc)
+        return None
+    return conv or None
+
+
 def parse_vasprun(vasprun_path: str, calc_id: str, outcar_path: str | None,
                   source: str = "zenodo") -> tuple[list[Atoms], dict]:
     """Parse one vasprun.xml into (frames, calc_metadata).
@@ -712,13 +761,19 @@ def parse_vaspout(vaspout_path: str, calc_id: str, outcar_path: str | None,
     ``parse_eigen`` is enabled when there is no OUTCAR (so a spin-polarised vaspout's net
     moment can use the occupancy method); vaspout is a tiny fraction of the corpus, so the
     cost is negligible and the non-spin gate lives in ``electronic``.
+
+    SCF convergence: ``vaspout.h5`` carries no per-electronic-step data (pymatgen leaves
+    ``electronic_steps`` empty), so a co-located OUTCAR is scanned for the per-frame
+    ``scf_dE``/``electronic_converged`` (:mod:`convergence`); without one they stay ``None``
+    (genuinely unavailable — VASP does not write the SCF trace into the HDF5 output).
     """
     from pymatgen.io.vasp.outputs import Vaspout
     parse_eigen = outcar_path is None
     v = Vaspout(vaspout_path, parse_dos=False, parse_eigen=parse_eigen,
                 parse_projected_eigen=False, store_potcar=False)
+    outcar_scf = _outcar_scf_for(outcar_path)
     return _frames_and_meta(v, calc_id, outcar_path, "pymatgen.Vaspout", source,
-                            eigen_parsed=parse_eigen, atominfo_path=None)
+                            eigen_parsed=parse_eigen, atominfo_path=None, outcar_scf=outcar_scf)
 
 
 def electronic_block_for_unit(unit: dict) -> dict:
@@ -767,6 +822,43 @@ def electronic_block_for_unit(unit: dict) -> dict:
     except Exception as exc:  # noqa: BLE001 - a bad primary must not abort the recovery
         logger.warning("electronic block failed for unit %s: %s", unit.get("dir"), exc)
     return empty_block()
+
+
+def convergence_block_for_unit(unit: dict) -> dict | None:
+    """Per-frame SCF convergence for a calc unit whose stored parser is the OUTCAR reader.
+
+    The net-properties recovery calls this ONLY for calcs parsed by :func:`_parse_outcar_ase`
+    (``parser == "ase.OUTCAR"``) — those never got ``scf_dE``/``electronic_converged`` (the
+    original OUTCAR path stored neither). Returns:
+
+    * ``per_step`` — ``{str(ionic_step): [scf_dE, electronic_converged]}`` keyed by file-order
+      ionic index, matching the stored ``frame_id``/``ionic_step`` so Phase 2 attaches each
+      frame its own step's verdict (see :mod:`convergence` for the free-energy basis).
+    * ``quality`` — the final-ionic-step verdict + ``n_frames_scf_unconverged`` to overwrite the
+      calc's ``quality`` (which held ``electronic_converged=None`` before this recovery).
+
+    ``None`` when the unit has no staged OUTCAR or no SCF trace could be parsed (leaving those
+    frames' convergence untouched — i.e. still ``None``). A vasprun-parsed calc is never passed
+    here: it already carries per-frame σ→0 ``scf_dE`` from the live parse.
+    """
+    outcar = unit.get("outcar")
+    if not outcar or not Path(outcar).exists():
+        return None
+    try:
+        header = read_header_lines(outcar)
+    except OSError:
+        header = []
+    conv = outcar_scf_convergence(outcar, outcar_nelm(header))
+    if not conv:
+        return None
+    per_step = {str(i): [dE, cv] for i, (dE, cv) in enumerate(conv)}
+    final_dE, final_cv = conv[-1]
+    n_unconv = sum(1 for _dE, cv in conv if cv is False)
+    return {
+        "per_step": per_step,
+        "quality": {"electronic_converged": final_cv, "scf_dE": final_dE,
+                    "scf_dE_key": "free_energy", "n_frames_scf_unconverged": n_unconv},
+    }
 
 
 def _resolve(raw_dir: Path, stored: str) -> Path:
@@ -1053,8 +1145,16 @@ def _parse_outcar_ase(outcar_path: str, calc_id: str,
     net_mag = electronic["net_magnetization"]
     net_charge = electronic["net_charge"]
 
+    # Per-ionic-step SCF convergence from the OUTCAR body — vasprun parity (scf_dE +
+    # electronic_converged per frame). ASE surfaces none of the SCF trace, so scan the OUTCAR
+    # directly (:mod:`convergence`); scf_conv[i] is the (scf_dE, converged) of ionic step i in
+    # file order, aligned with the trajectory index i below. Basis is the free energy F (the
+    # OUTCAR prints σ→0 only per ionic step, not per SCF step) — recorded as scf_dE_key.
+    scf_conv = outcar_scf_convergence(outcar_path, outcar_nelm(header_lines))
+
     frames = []
     n_dropped = 0
+    n_unconverged = 0
     n_with_forces = 0
     n_with_stress = 0
     max_ts_gap = 0.0
@@ -1089,23 +1189,42 @@ def _parse_outcar_ase(outcar_path: str, calc_id: str,
             atoms.info["total_magnetization"] = float(net_mag)
         if net_charge is not None:
             atoms.info["total_charge"] = float(net_charge)
-        # electronic_converged is intentionally NOT written on the OUTCAR path: it is
-        # unknown here (OUTCAR exposes no per-SCF trace). Writing None would serialise as a
-        # bare extxyz key that reads back as True (see _frame); omitting it -> read-back
-        # None ("unknown"), consistent with this calc's quality.electronic_converged = None.
+        # This ionic step's OWN SCF verdict + magnitude, from the OUTCAR trace (keyed by the
+        # trajectory index i = file-order ionic step). Both written ONLY when known — a None put
+        # into atoms.info serialises as a bare extxyz key that reads back as True (see _frame);
+        # omitting it makes read-back None ("unknown"), matching metadata.jsonl's null.
+        if i < len(scf_conv):
+            scf_dE_i, econv_i = scf_conv[i]
+            if econv_i is not None:
+                atoms.info["electronic_converged"] = econv_i
+                if econv_i is False:
+                    n_unconverged += 1
+            if scf_dE_i is not None:
+                atoms.info["scf_dE"] = scf_dE_i
         frames.append(atoms)
+    # Calc-level (final-ionic-step) SCF verdict from the OUTCAR trace — mirrors the vasprun
+    # path's _scf_convergence, but the magnitude is free-energy-based (scf_dE_key). None when
+    # the trace could not be parsed.
+    final_scf_dE, final_econv = scf_conv[-1] if scf_conv else (None, None)
+    # Calc-level ionic convergence — parity with the vasprun/vaspout paths, which get it from
+    # pymatgen's converged_ionic. ASE's vasp-out reader exposes no ionic flag, so reimplement
+    # pymatgen's rule from NSW/IBRION/EDIFFG (in the OUTCAR header calc_parameters) + the ionic-
+    # step count. (Its *magnitude* — the last-two-frames ΔE — is deliberately not stored: it is
+    # not a per-frame label-quality signal for training, unlike the electronic scf_dE.)
+    ionic_converged = converged_ionic_from_params(
+        cparam(calc_parameters, "NSW"), cparam(calc_parameters, "IBRION"),
+        cparam(calc_parameters, "EDIFFG"), len(traj))
     meta = {
         "calc_id": calc_id,
         "calc_parameters": calc_parameters,
-        # No SCF trace from OUTCAR here, so per-frame convergence stays None (never
-        # False) -> n_frames_scf_unconverged is 0. n_ionic_steps counts all steps
-        # read; n_frames counts those actually stored (after the no-energy drop).
-        # max_abs_free_minus_e0_per_atom uses ASE's free_energy (F) vs energy (E0);
-        # entropy_TS itself is unavailable here (ASE exposes no e_wo_entrp).
-        "quality": {"electronic_converged": None, "scf_dE": None,
-                    "ionic_converged": None, "n_ionic_steps": len(traj),
+        # n_ionic_steps counts all steps read; n_frames counts those actually stored (after the
+        # no-energy drop). max_abs_free_minus_e0_per_atom uses ASE's free_energy (F) vs energy
+        # (E0); entropy_TS itself is unavailable here (ASE exposes no e_wo_entrp).
+        "quality": {"electronic_converged": final_econv, "scf_dE": final_scf_dE,
+                    "scf_dE_key": "free_energy",
+                    "ionic_converged": ionic_converged, "n_ionic_steps": len(traj),
                     "n_atoms": len(frames[0]) if frames else 0, "n_frames": len(frames),
-                    "n_frames_scf_unconverged": 0,
+                    "n_frames_scf_unconverged": n_unconverged,
                     "n_frames_with_forces": n_with_forces,
                     "n_frames_with_stress": n_with_stress,
                     "n_frames_dropped_no_energy": n_dropped,

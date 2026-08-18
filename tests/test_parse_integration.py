@@ -137,11 +137,12 @@ def test_outcar_only_calc_gets_no_false_embedded_flags(tmp_path):
 # OUTCAR path: the electronic_converged round-trip regression (#1)            #
 # --------------------------------------------------------------------------- #
 
-def test_outcar_unknown_convergence_reads_back_as_none_not_true(tmp_path):
-    # The ASE OUTCAR path cannot know SCF convergence, so it must be recorded "unknown".
-    # Regression: it was written as None -> serialised as a bare extxyz key -> read back as
-    # True (an unknown-convergence frame silently relabelled converged). It must now be
-    # OMITTED, so a round-trip through the real shard writer yields None/absent.
+def test_outcar_scf_convergence_recovered_from_trace(tmp_path):
+    # The ASE OUTCAR path now reads SCF convergence straight from the OUTCAR trace (the
+    # Iteration/total-energy-change lines), reaching vasprun parity. OUTCAR_example_1 converged
+    # in 63 < NELM(120) electronic steps, so electronic_converged=True and scf_dE is the last
+    # SCF free-energy step. (The None-omission round-trip invariant — a None must not serialise
+    # as a bare key read back as True — is covered by test_store + the vasprun test below.)
     unit, base_meta = _stage(tmp_path, "oc1", "run", "OUTCAR_example_1", "outcar")
     rej = RejectionLogger(tmp_path / "rej.jsonl")
     result = parse_calc_unit(unit, base_meta, {}, rej)
@@ -149,11 +150,18 @@ def test_outcar_unknown_convergence_reads_back_as_none_not_true(tmp_path):
     assert result is not None
     frames, meta = result
     assert meta["parser"] == "ase.OUTCAR"
-    assert meta["quality"]["electronic_converged"] is None      # unknown in metadata too
-    # in-memory: the key must be absent (not present-with-None)
-    assert "electronic_converged" not in frames[0].info
+    assert meta["quality"]["electronic_converged"] is True
+    assert meta["quality"]["scf_dE_key"] == "free_energy"       # free-energy basis (see convergence.py)
+    assert meta["quality"]["scf_dE"] == pytest.approx(5.969621e-06)
+    assert meta["quality"]["n_frames_scf_unconverged"] == 0
+    # calc-level ionic_converged parity with the vasprun path (was None on the OUTCAR path before):
+    # this fixture is NSW=0 (single-point) -> pymatgen's nsw<=1 rule -> True.
+    assert meta["quality"]["ionic_converged"] is True
+    # per-frame: the (single) frame carries its own step's verdict as a REAL bool + magnitude
+    assert frames[0].info["electronic_converged"] is True
+    assert frames[0].info["scf_dE"] == pytest.approx(5.969621e-06)
 
-    # round-trip through the real gzipped-shard writer + ASE reader
+    # round-trip through the real gzipped-shard writer + ASE reader -> stays a bool True
     ds = tmp_path / "ds"
     with ShardedExtxyzWriter(ds) as xyz:
         for fr in frames:
@@ -162,8 +170,8 @@ def test_outcar_unknown_convergence_reads_back_as_none_not_true(tmp_path):
     shard = next(ds.glob("shard-*.extxyz.gz"))
     back = ase_read(shard, index=":", format="extxyz")
     for a in back:
-        # get() must return None ("unknown") — never True, which would mean "converged".
-        assert a.info.get("electronic_converged") is None, a.info.get("electronic_converged")
+        assert a.info.get("electronic_converged") is True
+        assert isinstance(a.info.get("electronic_converged"), bool)
     assert "REF_energy" in back[0].info and "REF_forces" in back[0].arrays
 
 
@@ -225,9 +233,10 @@ def test_parse_then_verify_end_to_end(tmp_path):
     assert out["stats"]["frames_by_parser"].keys() >= {"pymatgen.Vasprun", "ase.OUTCAR"}
     assert out["stats"]["total_n_frames_with_stress"] >= 2
     assert set(out["stats"]["frames_by_license"]) == {"cc-by-4.0", "mit"}
-    # convergence split recorded honestly: the vasprun calc known, the OUTCAR calc unknown
+    # convergence now recorded for BOTH parsers — the OUTCAR path reads it from the SCF trace,
+    # so neither calc is "unknown" (this fixture's OUTCAR + vasprun both converged).
     conv = out["stats"]["calcs_by_electronic_converged"]
-    assert conv["null"] == 1 and (conv["true"] + conv["false"]) == 1
+    assert conv.get("null", 0) == 0 and (conv.get("true", 0) + conv.get("false", 0)) == 2
 
     # metadata carries the mandatory provenance + full calc parameters
     recs = {r["calc_id"]: r for r in read_jsonl(ds / "metadata.jsonl")}
