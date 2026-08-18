@@ -6,7 +6,11 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1              # keyset scan is single-stream + self-throttled: one core
-#SBATCH --time=02:00:00                # the whole 7.1M keyset is ~700 requests (minutes); a cap is less
+#SBATCH --time=12:00:00                # FULL 7.1M scan is TRANSFER-bound (~24 KB/entry pulled over one
+                                       # non-parallelizable stream ~5 MB/s => ~170 GB) => ~8-10 h, NOT
+                                       # minutes. Run in ONE long window: SL3/icelake max is 12 h; if the
+                                       # scan needs longer, request the -long QoS or scope with MAX_ENTRIES.
+                                       # Do NOT chunk it — resume re-scans from the start (see below).
 #SBATCH -o logs_nomad/nomad-discover-%j.out
 #SBATCH -e logs_nomad/nomad-discover-%j.err
 #SBATCH --mail-type=END,FAIL           # email on job END/FAIL; SBATCH_MAIL_USER overrides the address
@@ -56,10 +60,14 @@ echo "=== nomad discover $(date -Is) on $(hostname): max_entries='${MAX_ENTRIES:
 echo "    NOMAD tree: $NOMAD_HARVEST_DATA   (dedup against $ZENODO_HARVEST_DATA/dataset/metadata.jsonl)"
 # discover applies the license gate (keep only redistributable CC-BY/CC0/…) and dedups
 # against the Zenodo dataset's metadata.jsonl inline; every drop is logged to
-# manifests/nomad_rejections.jsonl (auditable recall). Resumable: entries already in the
-# keep-list are skipped, so a re-run continues where an interrupted scan stopped.
+# manifests/nomad_rejections.jsonl (auditable recall). Resume caveat: a re-run skips re-WRITING
+# entries already in the keep-list, but the keyset cursor is NOT persisted, so it re-transfers the
+# earlier pages from the start before making new progress. So run this in ONE long window rather
+# than short chunks (a 12 h window comfortably covers the ~10 h scan). --page-size 10000 (the max)
+# cuts the request count ~10x (~711 vs ~7111), trimming round-trip + 5xx-backoff overhead.
 python -m nomad_harvest.cli -v discover \
     --out "$MAN/nomad_keep.jsonl" \
+    --page-size 10000 \
     "${CAP_ARG[@]}" \
     "${ELEM_ARG[@]}" \
     --zenodo-metadata "$ZENODO_HARVEST_DATA/dataset/metadata.jsonl"
