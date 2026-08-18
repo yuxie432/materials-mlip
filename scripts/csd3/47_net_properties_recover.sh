@@ -67,8 +67,13 @@ cd "${SLURM_SUBMIT_DIR:-.}"
 # ---- PARAMETERS -----------------------------------------------------------------
 WORKERS="${WORKERS:-4}"                                # concurrent downloads (Zenodo 100 req/min)
 BATCH="${BATCH:-20}"                                   # records per fetch->compute->purge cycle
-MAX_DISK_BYTES="${MAX_DISK_BYTES:-800000000000}"       # ~0.8 x 1 TB hpc-work quota
-MAX_DISK_FILES="${MAX_DISK_FILES:-800000}"             # inode quota binds first on Lustre
+# Defaults sized to CO-RUN with the NOMAD harvest: the two raw valves sum to 800 GB / 800k of the
+# shared 1 TB / 1M hpc-work quota (NOMAD 200 GB / 500k, this recovery 600 GB / 300k). The recovery is
+# BYTE-heavy (it whole-downloads tar records, up to ~40 GB each) so it takes the larger byte share;
+# 300k inodes is 3-7x its peak (one BATCH of records + the nested 8005679 re-fetch). Running this
+# recovery SOLO? Raise to ~800 GB / 800k. The valve charges every byte + inode and refunds on delete.
+MAX_DISK_BYTES="${MAX_DISK_BYTES:-600000000000}"       # byte-heavy job -> larger byte share
+MAX_DISK_FILES="${MAX_DISK_FILES:-300000}"             # inode quota binds first on Lustre
 MAX_MEMBER_BYTES="${MAX_MEMBER_BYTES:-30000000000}"    # bomb guard on the whole-download fallback
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-8}"
 ATTEMPT="${ATTEMPT:-1}"

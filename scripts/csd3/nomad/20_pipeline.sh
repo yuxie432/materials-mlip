@@ -64,20 +64,23 @@ PARTS="${PARTS:-40}"                   # batches; each part holds WHOLE uploads 
 # DISK/INODE PARTITION (fixed-slice design). The valve bounds only THIS job's raw staging
 # ($NOMAD_HARVEST_DATA/raw); it cannot see the Zenodo tree or another job's staging. NOMAD raw
 # staging is **INODE-bound, not byte-bound**: each entry stages 4 inodes (<entry_id>/extracted/
-# calc/vasprun.xml) but only ~0.26 MB, so the INODE valve is what caps peak staging and the byte
-# valve is a loose safety net. Peak bytes ~= (MAX_DISK_FILES/4) x 0.26 MB (~26 GB at 400k inodes;
-# 200 GB leaves generous margin for the OUTCAR-mainfile / AIMD tail). The 1 TB / 1M-inode hpc-work
-# quota is SHARED, so partition INODES first. Worked budget (co-running NOMAD + a Zenodo recovery):
-#     reserve  existing Zenodo raw+dataset  ~100 GB / ~100k
-#     reserve  NOMAD final dataset+manifests ~40-60 GB / ~few-k (grows during the run)
-#     NOMAD raw valve             200 GB / 400k   (this job, below — inode-bound)
-#     Zenodo-recovery raw valve   300 GB / 300k   (override MAX_DISK_* on scripts/csd3/46_*.sh; was 150k)
-#     headroom                   ~150 GB / ~150k
-#   -> inodes 100k+400k+300k+150k = 950k < 1M; bytes well under 1 TB.
-# Running NOMAD SOLO? Raise to ~400 GB / 800k (and PARTS>=48). The valve charges every byte + inode
-# as created and refunds on delete, so `staged <= limit` holds exactly.
+# calc/vasprun.xml) but only ~0.26 MB, so the INODE valve caps peak staging and the byte valve is a
+# loose safety net. Peak bytes ~= (MAX_DISK_FILES/4) x 0.26 MB (~33 GB at 500k inodes; 200 GB leaves
+# generous margin for the OUTCAR-mainfile / AIMD tail). Raising NOMAD's BYTE ceiling does nothing
+# (inodes bind first); raising its INODE ceiling lets more of a part stage before the valve trips ->
+# better fetch/parse overlap. So NOMAD takes the larger INODE share and a Zenodo recovery (byte-heavy:
+# it whole-downloads tars) takes the larger BYTE share. The 1 TB / 1M-inode hpc-work quota is SHARED.
+# Worked budget (co-running NOMAD + the script-47 net-properties recovery), the two raw valves = 800 GB / 800k:
+#     NOMAD raw valve             200 GB / 500k   (this job, below — inode-bound; the big inode share)
+#     Zenodo-recovery raw valve   600 GB / 300k   (scripts/csd3/47_net_properties_recover.sh default)
+#   -> 800 GB / 800k leaves ~200 GB / ~200k of the quota for the existing Zenodo dataset (~40 GB / ~1k),
+#      the growing NOMAD dataset (~40-60 GB / ~few-k), the Phase-2 temp files, + headroom. Well under 1 TB / 1M.
+# For the FULL 7.1M run set PARTS>=80 so a part's ~355k inodes fits under the 500k valve in one window
+# (a bigger part still works — it just parses+purges in instalments, less overlap). Running NOMAD SOLO?
+# Raise to ~600 GB / 800k. The valve charges every byte + inode as created and refunds on delete, so
+# `staged <= limit` holds exactly.
 MAX_DISK_BYTES="${MAX_DISK_BYTES:-200000000000}"
-MAX_DISK_FILES="${MAX_DISK_FILES:-400000}"
+MAX_DISK_FILES="${MAX_DISK_FILES:-500000}"
 # RAM guard: refuse to ATTEMPT a primary bigger than this (0 = attempt everything). pymatgen
 # peak RSS is ~10x the vasprun size; an over-budget parse is a cgroup SIGKILL, not a catchable
 # error. icelake-himem = 6760 MiB/core, so --cpus-per-task=4 gives ~26 GiB -> ~0.85x/10 ~= 2 GB.
