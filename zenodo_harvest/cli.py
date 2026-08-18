@@ -362,25 +362,29 @@ def _add_net_properties_keeplist(sub: argparse._SubParsersAction) -> None:
 
 def _add_compute_net_properties(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("compute-net-properties",
-                       help="stage 1 of net-moment/net-charge recovery: compute each re-fetched "
-                            "calc's net magnetization + net charge into a net_properties.jsonl map "
-                            "(no shard access; disk-paced+resumable via the map)")
+                       help="stage 1 of net-moment/net-charge + OUTCAR-convergence recovery: compute "
+                            "each re-fetched calc's net magnetization + net charge (and, for OUTCAR "
+                            "calcs, per-frame scf_dE/electronic_converged) into a net_properties.jsonl "
+                            "map (no shard access; disk-paced+resumable via the map)")
     p.add_argument("--fetched", required=True,
                    help="fetched manifest from re-fetching the net-properties keep-list")
     p.add_argument("--raw-dir", default=str(config.RAW_DIR),
                    help="where the re-fetch staged the files; manifest paths resolve against it")
     p.add_argument("--out", required=True, help="net_properties.jsonl map to append to (resumable)")
     p.add_argument("--dataset-dir", default=None,
-                   help="optional: restrict to calc_ids present in this dataset's metadata.jsonl")
+                   help="restrict to calc_ids present in this dataset's metadata.jsonl; also supplies "
+                        "each calc's parser so only ase.OUTCAR calcs get the SCF-convergence scan")
     p.add_argument("--json", action="store_true", help="machine-readable output")
 
 
 def _add_apply_net_properties(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("apply-net-properties",
-                       help="stage 2 of net-moment/net-charge recovery: drive the net_properties "
-                            "map into the dataset — REWRITES SHARDS (adds total_magnetization/"
-                            "total_charge per frame, strips per-atom dft_magmom/dft_charge) + "
-                            "rewrites metadata (adds `electronic`, drops site_*_present)")
+                       help="stage 2 of net-moment/net-charge + OUTCAR-convergence recovery: drive the "
+                            "net_properties map into the dataset — REWRITES SHARDS (adds "
+                            "total_magnetization/total_charge per frame, strips per-atom "
+                            "dft_magmom/dft_charge, and adds scf_dE/electronic_converged to OUTCAR "
+                            "frames) + rewrites metadata (adds `electronic`, drops site_*_present, "
+                            "overwrites OUTCAR calcs' quality convergence fields)")
     p.add_argument("--dataset-dir", default=str(config.DATASET_DIR))
     p.add_argument("--net-properties", required=True,
                    help="the net_properties.jsonl map from compute-net-properties")

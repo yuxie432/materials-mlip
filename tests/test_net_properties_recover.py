@@ -57,16 +57,28 @@ def _build_dataset(tmp_path):
         {"calc_id": cid_b, "parser": "ase.OUTCAR",
          "frame_ids": [f"{cid_b}#0"], "shards": sorted(set(shard_names.values())),
          "site_magmoms_present": False, "site_charges_present": False,
+         # pre-recovery OUTCAR quality: convergence was unknown (the old OUTCAR path stored None).
+         # calc_parameters + n_ionic_steps let the recovery backfill ionic_converged (3 < NSW 5
+         # for an IBRION=2 relaxation -> converged True), no re-fetch needed.
+         "calc_parameters": {"parameters": {"NSW": 5, "IBRION": 2, "EDIFFG": -0.02}},
+         "quality": {"electronic_converged": None, "scf_dE": None, "n_frames_scf_unconverged": 0,
+                     "ionic_converged": None, "n_ionic_steps": 3},
          "provenance": {"record_id": "2", "source": "zenodo"},
          "availability": {"magnetization": False}},
     ]
     (ds / "metadata.jsonl").write_text("".join(json.dumps(m) + "\n" for m in meta))
     npmap = tmp_path / "net_properties.jsonl"
+    # cid_a (vasprun) carries electronic only; cid_b (OUTCAR) also carries a per-frame convergence
+    # block — its single frame is ionic_step 0.
     npmap.write_text(
         json.dumps({"calc_id": cid_a, "electronic": {"net_magnetization": 2.0, "net_charge": 0.0,
                                                      "magnetization_source": "occupancies"}}) + "\n"
         + json.dumps({"calc_id": cid_b, "electronic": {"net_magnetization": 1.5, "net_charge": -1.0,
-                                                      "magnetization_source": "outcar"}}) + "\n")
+                                                      "magnetization_source": "outcar"},
+                      "convergence": {"per_step": {"0": [3.0e-05, True]},
+                                      "quality": {"electronic_converged": True, "scf_dE": 3.0e-05,
+                                                  "scf_dE_key": "free_energy",
+                                                  "n_frames_scf_unconverged": 0}}}) + "\n")
     return ds, npmap, (cid_a, cid_b)
 
 
@@ -110,6 +122,70 @@ def test_apply_updates_metadata_and_verify_passes(tmp_path):
     assert (ds / "metadata.jsonl.bak.pre_net_properties").is_file()
     # the metadata<->shard frame_id bijection still holds
     assert verify(ds)["ok"]
+
+
+def test_apply_adds_outcar_convergence(tmp_path):
+    ds, npmap, (cid_a, cid_b) = _build_dataset(tmp_path)
+    NP.apply_net_properties(ds, npmap)
+
+    from zenodo_harvest.store import existing_shard_paths
+    frames, _ = read_shard_frames_lenient(existing_shard_paths(ds)[0])
+    by_id = {f.info["frame_id"]: f for f in frames}
+
+    # the OUTCAR calc's frame gained its own step's SCF verdict + magnitude
+    fb = by_id[f"{cid_b}#0"]
+    assert fb.info["electronic_converged"] is True
+    assert fb.info["scf_dE"] == pytest.approx(3.0e-05)
+    # the vasprun calc (no convergence entry) is untouched — no keys injected
+    for fid in (f"{cid_a}#0", f"{cid_a}#1"):
+        assert "electronic_converged" not in by_id[fid].info
+        assert "scf_dE" not in by_id[fid].info
+
+    # metadata quality for the OUTCAR calc is overwritten (was electronic_converged=None)
+    recs = {r["calc_id"]: r for r in
+            (json.loads(line) for line in (ds / "metadata.jsonl").read_text().splitlines())}
+    q = recs[cid_b]["quality"]
+    assert q["electronic_converged"] is True and q["scf_dE_key"] == "free_energy"
+    assert q["scf_dE"] == pytest.approx(3.0e-05)
+    assert pytest.importorskip("zenodo_harvest.dataset_ops").verify_dataset(ds)["ok"]
+
+
+def test_apply_backfills_ionic_converged_for_outcar(tmp_path):
+    # calc-level ionic_converged parity: the OUTCAR calc had it None; the recovery computes it
+    # from the record's own calc_parameters (NSW=5, IBRION=2) + quality.n_ionic_steps (3 < 5 =>
+    # converged True) — no re-fetch. The vasprun calc is not an OUTCAR calc, so it is untouched.
+    ds, npmap, (cid_a, cid_b) = _build_dataset(tmp_path)
+    res = NP.apply_net_properties(ds, npmap)
+    assert res["ionic_converged_set"] == 1
+    recs = {r["calc_id"]: r for r in
+            (json.loads(line) for line in (ds / "metadata.jsonl").read_text().splitlines())}
+    assert recs[cid_b]["quality"]["ionic_converged"] is True
+    assert "ionic_converged" not in recs[cid_a].get("quality", {})   # vasprun record left alone
+    # idempotent: a second apply does not flip or re-count it
+    (ds / NP._APPLIED_MARKER).unlink()
+    res2 = NP.apply_net_properties(ds, npmap)
+    assert res2["ionic_converged_set"] == 0
+    recs2 = {r["calc_id"]: r for r in
+             (json.loads(line) for line in (ds / "metadata.jsonl").read_text().splitlines())}
+    assert recs2[cid_b]["quality"]["ionic_converged"] is True
+
+
+def test_append_convergence_helper():
+    base = 'Lattice="..." Properties=species:S:1:pos:R:3 calc_id="c" ionic_step=2'
+    conv = {"per_step": {"2": [1.5e-04, False], "0": [3.0e-05, True]}}
+    out = NP._append_convergence(base, conv)
+    assert "electronic_converged=F" in out and "scf_dE=0.00015" in out
+    # idempotent: strips the old keys then re-appends the same
+    assert NP._append_convergence(out, conv) == out
+    # a step absent from the map -> keys stripped, none added
+    base3 = base.replace("ionic_step=2", "ionic_step=9")
+    assert "electronic_converged" not in NP._append_convergence(base3, conv)
+    # no ionic_step at all -> unchanged (minus any stripped keys)
+    assert "electronic_converged" not in NP._append_convergence(
+        'Properties=species:S:1:pos:R:3 calc_id="c"', conv)
+    # a converged step serialises as T
+    base0 = base.replace("ionic_step=2", "ionic_step=0")
+    assert "electronic_converged=T" in NP._append_convergence(base0, conv)
 
 
 def test_apply_is_idempotent(tmp_path):

@@ -12,25 +12,34 @@
 #SBATCH -e logs/zh-net-properties-recover-%j.err
 #SBATCH --mail-type=END,FAIL
 #
-# Net magnetic moment + net charge recovery (docs: zenodo_harvest/net_properties_recover.py). The
-# first harvest stored neither the net moment nor the net charge, and stored per-atom
-# dft_magmom/dft_charge on the final frame of vasprun+OUTCAR calcs. This retrofits the ALREADY-BUILT
-# dataset to the new schema: every frame gains total_magnetization/total_charge, the per-atom arrays
-# are stripped, and each metadata record gains an `electronic` block (site_*_present dropped).
+# Net moment/charge + OUTCAR SCF-convergence recovery (docs: zenodo_harvest/net_properties_recover.py).
+# The first harvest stored neither the net moment nor the net charge, stored per-atom
+# dft_magmom/dft_charge on the final frame of vasprun+OUTCAR calcs, AND left OUTCAR-parsed calcs
+# without per-frame scf_dE/electronic_converged (the old OUTCAR path could not read the SCF trace).
+# This retrofits the ALREADY-BUILT dataset to the new schema in ONE shard pass: every frame gains
+# total_magnetization/total_charge (per-atom arrays stripped, metadata gains an `electronic` block,
+# site_*_present dropped); AND every frame of an OUTCAR-parsed calc gains that ionic step's own
+# scf_dE (free-energy basis) + electronic_converged from the OUTCAR trace, with the calc's metadata
+# `quality` convergence fields overwritten (vasprun calcs already have σ→0 scf_dE, so untouched).
 #
 # UNLIKE the OUTCAR/vasprun/availability recoveries, this one REWRITES SHARDS (the values live on
 # the frames). A shard interleaves frames from many calcs, so it cannot be rewritten until every one
-# of its calcs' net values is known — hence TWO PHASES:
+# of its calcs' values is known — hence TWO PHASES:
 #   Phase 1 (compute): a BATCHED fetch(BATCH records) -> compute-net-properties -> purge-raw loop,
 #     re-fetching the primaries (targeted ZIP member fetch pulls just the vasprun.xml/OUTCAR out of a
-#     .zip) and computing each calc's net moment/charge into a net_properties.jsonl MAP. No shard is
-#     touched; resumable via the map (computed calc_ids skip). Occupancy-method eigen parse runs only
-#     for collinear spin-polarised vasprun-without-OUTCAR calcs (cheap ISPIN pre-scan gates it).
+#     .zip) and computing each calc's net moment/charge — plus, for OUTCAR calcs, its per-frame SCF
+#     convergence — into a net_properties.jsonl MAP. No shard is touched; resumable via the map
+#     (computed calc_ids skip). Occupancy-method eigen parse runs only for collinear spin-polarised
+#     vasprun-without-OUTCAR calcs (cheap ISPIN pre-scan gates it). compute-net-properties needs
+#     --dataset-dir to know each calc's parser (only ase.OUTCAR calcs get the convergence scan).
 #   Phase 2 (apply): ONCE, after Phase 1 is COMPLETE — apply-net-properties drives the map into the
-#     dataset (text-level shard edit: append the two totals per frame + strip dft_* columns, leaving
-#     every untouched value byte-identical; then an atomic metadata rewrite). Resumable via a
+#     dataset (text-level shard edit: append the two totals + OUTCAR frames' scf_dE/electronic_converged
+#     per frame, strip dft_* columns, leaving every untouched value byte-identical; then an atomic
+#     metadata rewrite that ALSO backfills calc-level ionic_converged for OUTCAR calcs from each
+#     record's own calc_parameters + n_ionic_steps — metadata-only, no re-fetch). Resumable via a
 #     .net_properties_applied marker + idempotent metadata. `verify` still passes (frame_ids/shards/
-#     calc_id untouched).
+#     calc_id untouched). (The ionic-convergence *magnitude*/last-two-frames ΔE is intentionally NOT
+#     stored — not a per-frame MLIP-training label-quality signal; see zenodo_harvest/convergence.py.)
 # Phase 2 runs ONLY when the Phase-1 loop returns cleanly (map complete), so it never rewrites a
 # shard against a partial map. A wallclock kill mid-Phase-1 resumes the loop in the successor; a kill
 # mid-Phase-2 resumes apply from the marker with the now-complete map.
