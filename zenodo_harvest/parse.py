@@ -96,6 +96,13 @@ from .store import (
 
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", module="pymatgen")
+# pymatgen issues UnconvergedVASPWarning with a stacklevel pointing at the CALLER (this module),
+# so the module="pymatgen" filter above never matches it and it floods a large harvest's stderr
+# (one per unconverged run -> millions at NOMAD scale). Match the message text too, which is
+# independent of stacklevel and needs no pymatgen import (keeps parse.py importable offline).
+# Unconverged runs are deliberately KEPT and tagged per-frame (electronic_converged/scf_dE), so
+# the warning is pure noise here.
+warnings.filterwarnings("ignore", message=r".*unconverged VASP run.*")
 
 
 def _jsonable(obj: Any) -> Any:
@@ -1515,8 +1522,14 @@ def parse(
                                     if isinstance(calc_avails, list) and idx < len(calc_avails)
                                     else rec.get("availability", {}))
                     # Name the calc BEFORE parsing so a slow/hung parse is identifiable live
-                    # (`tail -f` the log) and by the last line if the job is killed mid-parse.
-                    logger.info("parsing %s", calc_id)
+                    # (`tail -f` the log at DEBUG) and by the last line if killed mid-parse. This
+                    # is DEBUG, not INFO: at NOMAD scale (millions of tiny calcs) a per-calc INFO
+                    # line floods stderr (~7M lines / >1 GB). A true hang is caught by
+                    # --parse-timeout anyway; the periodic INFO line below shows liveness cheaply.
+                    logger.debug("parsing %s", calc_id)
+                    if stats["calc_units"] % 2000 == 0:
+                        logger.info("parse progress: %d calc_units seen, %d parsed, %d frames",
+                                    stats["calc_units"], stats["calcs_parsed"], stats["frames"])
                     result = _parse_one(unit, base_meta, availability,
                                         rej, max_primary_bytes, parse_timeout_s, calc_id)
                     if not result:
