@@ -5,7 +5,10 @@
 #SBATCH -p icelake-himem               # 6760 MiB/core: parse (pymatgen) needs the RAM
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4              # bought for RAM (~26 GiB), not compute — see MAX_PRIMARY_BYTES
+#SBATCH --cpus-per-task=8              # NOMAD is PARSE-throughput-bound (millions of tiny calcs), so
+                                       # these cores drive --parse-workers (parallel parse). Its
+                                       # vaspruns are tiny (low RAM), so cores are for parse compute,
+                                       # not RAM. Raise this + PARSE_WORKERS for more parse throughput.
 #SBATCH --time=12:00:00                # SL3 max; SL1/SL2 may use up to 36:00:00
 #SBATCH --signal=B:USR1@600            # SIGUSR1 to the batch shell 10 min before wallclock
 #SBATCH -o logs_nomad/nomad-pipeline-%j.out  #   -> lets RESUBMIT=1 queue a resume job before the
@@ -81,13 +84,19 @@ PARTS="${PARTS:-40}"                   # batches; each part holds WHOLE uploads 
 # `staged <= limit` holds exactly.
 MAX_DISK_BYTES="${MAX_DISK_BYTES:-200000000000}"
 MAX_DISK_FILES="${MAX_DISK_FILES:-500000}"
-# RAM guard: refuse to ATTEMPT a primary bigger than this (0 = attempt everything). pymatgen
-# peak RSS is ~10x the vasprun size; an over-budget parse is a cgroup SIGKILL, not a catchable
-# error. icelake-himem = 6760 MiB/core, so --cpus-per-task=4 gives ~26 GiB -> ~0.85x/10 ~= 2 GB.
-# NOMAD vaspruns are small (median 0.36 MB, max ~14 MB), so this rarely bites — but AIMD tails
-# can be larger, and the guard is cheap. An over-cap primary is skipped (primary_too_large,
-# non-terminal) and re-tried on a bigger-RAM run.
-MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-2000000000}"
+# PARSE_WORKERS: parse this many calc units CONCURRENTLY — the lever for NOMAD's parse-bound harvest
+# (~0.26 s/calc single-threaded is ~21 days at 7.1M; N workers cut it ~N-fold). At ~6 workers the
+# parse (~23 calcs/s) outruns the serial fetch (~9 calcs/s at the measured ~4 MB/s), so the pipeline
+# becomes FETCH-bound (~9 days). Beating ~9 days needs a NOMAD per-IP connection EXEMPTION
+# (email support@nomad-lab.eu) + a parallel-fetch build — until then ~9 days is the floor.
+PARSE_WORKERS="${PARSE_WORKERS:-6}"
+# RAM guard: refuse to ATTEMPT a primary bigger than this (0 = attempt everything). pymatgen peak
+# RSS is ~10x the (uncompressed) primary size, and PARSE_WORKERS parse AT ONCE, so RAM ~=
+# PARSE_WORKERS x MAX_PRIMARY_BYTES x 10 must fit the job (8 cores x 6.76 GiB ~= 54 GiB -> ~0.8 GB
+# at 6 workers). NOMAD vaspruns are tiny (median 0.36 MB), so this rarely bites; an over-cap primary
+# is skipped (primary_too_large, non-terminal) and re-tried on a bigger-RAM run. If you raise
+# PARSE_WORKERS or cpus-per-task, keep PARSE_WORKERS x MAX_PRIMARY_BYTES x 10 under the job RAM.
+MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-800000000}"
 # Hard-kill a single calc's parse after this many seconds (0 = off), so one non-terminating
 # pymatgen/ASE parse can't silently freeze the whole overlapped pipeline until wallclock.
 PARSE_TIMEOUT="${PARSE_TIMEOUT:-1200}"
@@ -154,6 +163,7 @@ python -m nomad_harvest.cli -v pipeline \
     --max-disk-files "$MAX_DISK_FILES" \
     --max-primary-bytes "$MAX_PRIMARY_BYTES" \
     --parse-timeout "$PARSE_TIMEOUT" \
+    --parse-workers "$PARSE_WORKERS" \
     --raw-dir "$RAW" \
     --dataset-dir "$DATASET_DIR" \
     > >(tee "$SUMMARY") &

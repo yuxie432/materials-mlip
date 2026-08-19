@@ -137,6 +137,12 @@ def main(argv: list[str] | None = None) -> int:
     pi.add_argument("--parse-timeout", type=int, default=1200,
                     help="hard-kill a single calc's parse after N seconds (0 = off), so one "
                          "non-terminating pymatgen/ASE parse can't freeze the pipeline")
+    pi.add_argument("--parse-workers", type=int, default=1,
+                    help="parse this many calc units concurrently (default 1 = serial). NOMAD is "
+                         "PARSE-throughput-bound (~0.26 s/calc single-threaded -> weeks at 7.1M), "
+                         "and its vaspruns are tiny (low RAM), so set this to the node's core "
+                         "count to cut the parse ~N-fold. Use with --parse-timeout>0 (true "
+                         "process parallelism); size N x per-parse RSS under the job's memory.")
     _add_disk_valve(pi)
 
     st = sub.add_parser("status", help="read-only snapshot of NOMAD harvest progress "
@@ -240,7 +246,7 @@ def _run_pipeline(client: NomadClient, args: argparse.Namespace) -> int:
         fetched = str(_fetched_path(part))
         parse(fetched, dataset_dir=str(ds_dir), rejections_path=parse_rej,
               raw_dir=str(raw_dir), max_primary_bytes=args.max_primary_bytes,
-              parse_timeout_s=args.parse_timeout)
+              parse_timeout_s=args.parse_timeout, parse_workers=args.parse_workers)
         purge_raw(str(raw_dir), str(ds_dir), fetched=fetched)
 
     fetch_error: str | None = None

@@ -61,6 +61,66 @@ def _stage(tmp_path: Path, recid: str, sub: str, fixture: str, role: str) -> tup
     return unit, base_meta
 
 
+def _build_fetched(tmp_path: Path, n_records: int = 6) -> tuple[Path, Path]:
+    """Stage n_records into a raw tree + write the fetched.jsonl the full parse() consumes.
+    Alternates the vasprun and OUTCAR fixtures so both parser paths run in the same batch."""
+    import json
+    raw = tmp_path / "raw"
+    recs = []
+    for i in range(n_records):
+        recid = f"r{i}"
+        calc = raw / recid / "extracted" / "calc"
+        calc.mkdir(parents=True, exist_ok=True)
+        if i % 2 == 0:
+            shutil.copy(FIXTURES / "vasprun_dfpt.xml", calc / "vasprun.xml")
+            unit = {"dir": f"{recid}/extracted/calc", "vasprun": f"{recid}/extracted/calc/vasprun.xml"}
+        else:
+            shutil.copy(FIXTURES / "OUTCAR_example_1", calc / "OUTCAR")
+            unit = {"dir": f"{recid}/extracted/calc", "outcar": f"{recid}/extracted/calc/OUTCAR"}
+        recs.append({"provenance": {"source": "zenodo", "record_id": recid, "license": "cc-by-4.0"},
+                     "local_dir": recid, "calc_units": [unit]})
+    fetched = tmp_path / "fetched.jsonl"
+    fetched.write_text("".join(json.dumps(r) + "\n" for r in recs))
+    return raw, fetched
+
+
+def test_parallel_parse_matches_serial(tmp_path):
+    # parse_workers>1 parses N calcs concurrently (each in a timeout-guarded child forked from
+    # worker threads) while a single main-thread writer preserves the frames-then-metadata
+    # ordering. The dataset must be identical to a serial parse: same calc_ids + frame_ids, same
+    # frame count, and verify's bijection holds (shard ASSIGNMENT may differ by completion order).
+    raw, fetched = _build_fetched(tmp_path, n_records=6)
+    ds_s, ds_p = tmp_path / "ds_serial", tmp_path / "ds_parallel"
+    s = parse(fetched, dataset_dir=str(ds_s), rejections_path=str(tmp_path / "rej_s.jsonl"),
+              raw_dir=str(raw), parse_timeout_s=120, parse_workers=1)
+    p = parse(fetched, dataset_dir=str(ds_p), rejections_path=str(tmp_path / "rej_p.jsonl"),
+              raw_dir=str(raw), parse_timeout_s=120, parse_workers=4)
+    assert s["calcs_parsed"] == p["calcs_parsed"] == 6
+    assert s["frames"] == p["frames"] > 0
+    assert verify_dataset(ds_s)["ok"] and verify_dataset(ds_p)["ok"]
+
+    def _ids(ds: Path) -> tuple[list, list]:
+        recs = list(read_jsonl(ds / "metadata.jsonl"))
+        return (sorted(r["calc_id"] for r in recs),
+                sorted(f for r in recs for f in r["frame_ids"]))
+
+    assert _ids(ds_s) == _ids(ds_p)
+
+
+def test_parallel_parse_resumes(tmp_path):
+    # Resume safety with parallel workers: a second parse of the same input into the same dir
+    # adds nothing (all calcs already committed) and verify still holds.
+    raw, fetched = _build_fetched(tmp_path, n_records=4)
+    ds = tmp_path / "ds"
+    first = parse(fetched, dataset_dir=str(ds), rejections_path=str(tmp_path / "rej.jsonl"),
+                  raw_dir=str(raw), parse_timeout_s=120, parse_workers=3)
+    assert first["calcs_parsed"] == 4
+    again = parse(fetched, dataset_dir=str(ds), rejections_path=str(tmp_path / "rej.jsonl"),
+                  raw_dir=str(raw), parse_timeout_s=120, parse_workers=3)
+    assert again["calcs_parsed"] == 0 and again["skipped_existing"] == 4
+    assert verify_dataset(ds)["ok"]
+
+
 # --------------------------------------------------------------------------- #
 # vasprun.xml path: frames + labels + the SCF convergence MAGNITUDE            #
 # --------------------------------------------------------------------------- #

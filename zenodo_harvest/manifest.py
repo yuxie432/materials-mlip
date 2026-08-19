@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -75,13 +76,21 @@ class JsonlWriter:
 
 
 class RejectionLogger:
-    """Records dropped items with a reason so recall stays auditable."""
+    """Records dropped items with a reason so recall stays auditable.
+
+    Thread-safe: the parallel parse (``parse(parse_workers>1)``) replays each worker's
+    rejection lines through one shared logger from several threads at once, so ``reject``
+    serialises on a lock (JSONL lines can exceed the atomic-append size, so concurrent
+    unlocked writes could interleave and corrupt the audit log).
+    """
 
     def __init__(self, path: str | Path):
         self._w = JsonlWriter(path)
+        self._lock = threading.Lock()
 
     def reject(self, stage: str, ident: str, reason: str, **detail: Any) -> None:
-        self._w.write({"stage": stage, "id": ident, "reason": reason, **detail})
+        with self._lock:
+            self._w.write({"stage": stage, "id": ident, "reason": reason, **detail})
 
     @property
     def n(self) -> int:

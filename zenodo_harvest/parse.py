@@ -1439,6 +1439,7 @@ def parse(
     max_primary_bytes: int = 0,
     parse_timeout_s: float = 0,
     retry_rejected: bool = False,
+    parse_workers: int = 1,
 ) -> dict:
     """Parse every fetched record into extxyz shards + a metadata JSONL.
 
@@ -1475,6 +1476,18 @@ def parse(
     the parser on files it has already proven unparseable wastes minutes per resume on a big
     bad record and duplicates rejection lines. ``retry_rejected=True`` re-attempts them (use
     after a pymatgen/ase upgrade).
+
+    ``parse_workers`` (>1) parses that many calc units concurrently: N worker threads each run
+    :func:`_parse_one` (which forks a timeout-guarded child), while the MAIN thread writes each
+    result's frames-then-metadata serially — so the pymatgen/ASE parse (the CPU cost) runs N-way
+    but the shard/metadata writers stay single-threaded, preserving the one-calc-at-a-time
+    crash-safety ordering the resume/prune logic relies on. This is the lever for a
+    parse-throughput-bound harvest of MANY SMALL calcs (NOMAD's ~7M tiny vaspruns parse ~0.26 s
+    each single-threaded → weeks; N-way cuts that to weeks/N). Use it WITH ``parse_timeout_s>0``
+    so each parse is a real child process (true parallelism past the GIL); the calcs must be
+    small enough that ``parse_workers × per-parse RSS`` fits the node RAM (NOMAD vaspruns are
+    tiny, so a high worker count is safe — size against ``--max-primary-bytes``). Default 1 keeps
+    the historical serial behaviour (unchanged for the Zenodo harvest / the offline tests).
     """
     dataset_dir = Path(dataset_dir)
     raw_dir = Path(raw_dir)
@@ -1499,55 +1512,104 @@ def parse(
                 ShardedExtxyzWriter(dataset_dir, frames_per_shard, start_index=start_index,
                                     compresslevel=gzip_level) as xyz, \
                 MetadataWriter(metadata_path) as meta_w:
-            for rec in read_jsonl(in_path):
-                stats["records"] += 1
-                base_meta = {"provenance": rec["provenance"],
-                             "_extracted_root": str(_resolve(raw_dir, rec["local_dir"]) / "extracted")}
-                # Per-calc availability (fetch now scopes heavy-output flags to each calc's
-                # own directory). Aligned index-for-index with calc_units; fall back to the
-                # record-level union for older manifests that predate calc_availability.
-                calc_avails = rec.get("calc_availability")
-                for idx, unit in enumerate(rec["calc_units"]):
-                    stats["calc_units"] += 1
-                    # Resolve stored (relative, or legacy absolute) paths against raw_dir.
-                    unit = {k: str(_resolve(raw_dir, v)) for k, v in unit.items()}
-                    calc_id = _calc_id(unit, base_meta)
-                    if calc_id in done_calc_ids:
-                        stats["skipped_existing"] += 1
-                        continue
-                    if calc_id in rejected_calc_ids:  # known-bad; don't re-run the parser
-                        stats["skipped_rejected"] += 1
-                        continue
-                    availability = (calc_avails[idx]
-                                    if isinstance(calc_avails, list) and idx < len(calc_avails)
-                                    else rec.get("availability", {}))
-                    # Name the calc BEFORE parsing so a slow/hung parse is identifiable live
-                    # (`tail -f` the log at DEBUG) and by the last line if killed mid-parse. This
-                    # is DEBUG, not INFO: at NOMAD scale (millions of tiny calcs) a per-calc INFO
-                    # line floods stderr (~7M lines / >1 GB). A true hang is caught by
-                    # --parse-timeout anyway; the periodic INFO line below shows liveness cheaply.
+            # One shared writer, MAIN THREAD ONLY: frames-then-metadata per calc, one calc at a
+            # time — the crash-safety ordering the resume/prune logic assumes. Parses may run in
+            # parallel (below), but writes never do, so at a crash at most one calc has frames
+            # without metadata (prunable orphan tail).
+            def _write_result(result: Any) -> None:
+                if not result:
+                    return
+                frames, meta = result
+                shards: set[str] = set()
+                for fr in frames:
+                    shards.add(xyz.write(fr))
+                    stats["frames"] += 1
+                meta["shards"] = sorted(shards)
+                # durability ordering: frames must be on disk BEFORE their metadata, or a crash
+                # could leave metadata pointing at frames in no shard.
+                xyz.flush()
+                meta_w.write(_jsonable(meta))
+                done_calc_ids.add(meta["calc_id"])   # a duplicate unit later this run is skipped
+                stats["calcs_parsed"] += 1
+
+            _log_at = [0]
+
+            def _maybe_log_progress() -> None:
+                if stats["calcs_parsed"] - _log_at[0] >= 2000:
+                    _log_at[0] = stats["calcs_parsed"]
+                    logger.info("parse progress: %d calcs parsed, %d frames",
+                                stats["calcs_parsed"], stats["frames"])
+
+            def _iter_units() -> Any:
+                """Yield (unit, base_meta, availability, calc_id) for not-yet-done calcs, updating
+                the scan stats. Dedups within this run (a duplicate primary later is skipped)."""
+                seen: set[str] = set()
+                for rec in read_jsonl(in_path):
+                    stats["records"] += 1
+                    base_meta = {"provenance": rec["provenance"],
+                                 "_extracted_root": str(_resolve(raw_dir, rec["local_dir"]) / "extracted")}
+                    # Per-calc availability (fetch scopes heavy-output flags to each calc's own
+                    # dir), aligned index-for-index; fall back to the record-level union for older
+                    # manifests predating calc_availability.
+                    calc_avails = rec.get("calc_availability")
+                    for idx, unit in enumerate(rec["calc_units"]):
+                        stats["calc_units"] += 1
+                        unit = {k: str(_resolve(raw_dir, v)) for k, v in unit.items()}
+                        calc_id = _calc_id(unit, base_meta)
+                        if calc_id in done_calc_ids or calc_id in seen:
+                            stats["skipped_existing"] += 1
+                            continue
+                        if calc_id in rejected_calc_ids:  # known-bad; don't re-run the parser
+                            stats["skipped_rejected"] += 1
+                            continue
+                        seen.add(calc_id)
+                        availability = (calc_avails[idx]
+                                        if isinstance(calc_avails, list) and idx < len(calc_avails)
+                                        else rec.get("availability", {}))
+                        yield unit, base_meta, availability, calc_id
+                    if max_records and stats["records"] >= max_records:
+                        break
+
+            if parse_workers and parse_workers > 1:
+                # PARALLEL parse (see the docstring): N worker threads each run _parse_one — the
+                # forks serialise in CPython's forkserver but the child PARSES run concurrently —
+                # while the MAIN thread writes results as they complete. A bounded in-flight
+                # window (~2N) keeps memory flat over a huge part; results land in completion
+                # order (fine: frame_ids are unique and prune drops the orphan tail).
+                from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+                units = _iter_units()
+                inflight: set = set()
+                exhausted = False
+                with ThreadPoolExecutor(max_workers=parse_workers) as pool:
+                    def _submit_one() -> None:
+                        nonlocal exhausted
+                        try:
+                            u, bm, av, cid = next(units)
+                        except StopIteration:
+                            exhausted = True
+                            return
+                        logger.debug("parsing %s", cid)
+                        inflight.add(pool.submit(_parse_one, u, bm, av, rej,
+                                                 max_primary_bytes, parse_timeout_s, cid))
+
+                    while not exhausted and len(inflight) < parse_workers * 2:
+                        _submit_one()
+                    while inflight:
+                        done, inflight = wait(inflight, return_when=FIRST_COMPLETED)
+                        for fut in done:
+                            try:
+                                _write_result(fut.result())
+                            except Exception as exc:  # noqa: BLE001 - _parse_one shouldn't raise
+                                logger.warning("parse worker raised unexpectedly: %s", exc)
+                            _maybe_log_progress()
+                            if not exhausted:
+                                _submit_one()
+            else:
+                for unit, base_meta, availability, calc_id in _iter_units():
                     logger.debug("parsing %s", calc_id)
-                    if stats["calc_units"] % 2000 == 0:
-                        logger.info("parse progress: %d calc_units seen, %d parsed, %d frames",
-                                    stats["calc_units"], stats["calcs_parsed"], stats["frames"])
-                    result = _parse_one(unit, base_meta, availability,
-                                        rej, max_primary_bytes, parse_timeout_s, calc_id)
-                    if not result:
-                        continue
-                    frames, meta = result
-                    shards: set[str] = set()
-                    for fr in frames:
-                        shards.add(xyz.write(fr))
-                        stats["frames"] += 1
-                    meta["shards"] = sorted(shards)
-                    # durability ordering: frames must be on disk BEFORE their metadata,
-                    # or a crash could leave metadata pointing at frames in no shard.
-                    xyz.flush()
-                    meta_w.write(_jsonable(meta))
-                    done_calc_ids.add(calc_id)  # a duplicate unit later in THIS run is skipped too
-                    stats["calcs_parsed"] += 1
-                if max_records and stats["records"] >= max_records:
-                    break
+                    _maybe_log_progress()
+                    _write_result(_parse_one(unit, base_meta, availability, rej,
+                                             max_primary_bytes, parse_timeout_s, calc_id))
     stats["rejections"] = rej.n
     stats["pruned"] = pruned
     logger.info("parse: %s", stats)
