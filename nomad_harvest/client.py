@@ -99,6 +99,7 @@ class NomadClient:
         self.session.headers.setdefault("User-Agent", "materials-mlip-nomad/0.1")
         self._last = 0.0
         self._upload_last = 0.0   # separate pacing for the /uploads/{id}/raw throttle (below)
+        self.upload_gets = 0      # count of /uploads/{id}/raw HTTP attempts (for req/s diagnostics)
 
     def _throttle(self) -> None:
         wait = self.min_interval - (time.monotonic() - self._last)
@@ -275,6 +276,7 @@ class NomadClient:
         url = f"{self.base}/uploads/{quote(upload_id, safe='')}/raw"
         for attempt in range(self.max_retries):
             self._pace_upload()
+            self.upload_gets += 1
             try:
                 r = self.session.get(url, headers={"Range": range_header},
                                      stream=stream, timeout=self.timeout)

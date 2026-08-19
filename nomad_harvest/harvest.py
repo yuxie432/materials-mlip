@@ -17,6 +17,7 @@ import json
 import logging
 import re
 import shutil
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable
@@ -662,6 +663,7 @@ def _fetch_upload(client: NomadClient, upload_id: str, entries: list[dict[str, A
     # the batch is NOT flushed mid-loop (below) — the single final flush spans every admitted
     # member in one request.
     whole = _should_whole_stream(members, entries, want_outcar)
+    stats["whole_uploads" if whole else "targeted_uploads"] += 1
 
     pending: list[tuple[dict[str, Any], list[tuple[ZipMember, Path, str]], list[int]]] = []
     batch: list[tuple[ZipMember, Path]] = []
@@ -683,6 +685,7 @@ def _fetch_upload(client: NomadClient, upload_id: str, entries: list[dict[str, A
                     w.write(fe)
                     done.add(entry["entry_id"])
                     stats["staged"] += 1
+                    stats["staged_bytes"] += sum(m.on_disk_size for m, _dp, _r in plan)
                 else:                                   # staged files but no parseable calc unit
                     _refund_and_delete(dest_root, budget, own)
                     rej.reject("nomad_fetch", entry["entry_id"],
@@ -771,7 +774,8 @@ def fetch_candidates(client: NomadClient, in_path: str | Path,
     done = {rec["recid"] for rec in read_jsonl(out)} if out.is_file() else set()
     rej = RejectionLogger(manifests / "nomad_fetch_rejections.jsonl")
     stats: dict[str, Any] = {"records": 0, "staged": 0, "failed": 0, "skipped_existing": 0,
-                             "uploads": 0, "per_entry_fallback": 0,
+                             "uploads": 0, "whole_uploads": 0, "targeted_uploads": 0,
+                             "per_entry_fallback": 0, "staged_bytes": 0,
                              "stopped_disk_budget": False, "stopped_on": ""}
     raw_dir.mkdir(parents=True, exist_ok=True)
     base_b, base_f = (_dir_usage(raw_dir) if (max_disk_bytes or max_disk_files) else (0, 0))
@@ -792,6 +796,8 @@ def fetch_candidates(client: NomadClient, in_path: str | Path,
             order.append(up)
         groups[up].append(entry)
 
+    t0 = time.monotonic()
+    req0 = getattr(client, "upload_gets", 0)
     with JsonlWriter(out) as w:
         for up in order:
             if budget.full() or (max_records and stats["staged"] >= max_records):
@@ -807,7 +813,19 @@ def fetch_candidates(client: NomadClient, in_path: str | Path,
         stats["stopped_on"] = budget.pause or budget.hit_limit
     stats.update(budget.stats())
     stats["items_over_whole_budget"] = budget.unfittable
+    # Throughput diagnostics (the answer to "download- or request-limited?"): MB/s is the achieved
+    # transfer rate; req/s against the ~0.2 (1-per-5s) throttle ceiling shows whether the endpoint's
+    # rate limit or raw bandwidth is the bound; whole vs targeted shows the hybrid is engaging.
+    elapsed = max(time.monotonic() - t0, 1e-6)
+    stats["upload_requests"] = getattr(client, "upload_gets", 0) - req0
+    stats["fetch_seconds"] = round(elapsed, 1)
     logger.info("nomad fetch: %s", stats)
+    logger.info("nomad fetch rate: %.2f MB/s | %.2f req/s (ceil ~0.2 = 1-per-5s throttle) | "
+                "%.1f entries/s | %d uploads = %d whole + %d targeted | fallback %d",
+                stats["staged_bytes"] / (1 << 20) / elapsed,
+                stats["upload_requests"] / elapsed, stats["staged"] / elapsed,
+                stats["uploads"], stats["whole_uploads"], stats["targeted_uploads"],
+                stats["per_entry_fallback"])
     return {"out": str(out), **stats}
 
 
