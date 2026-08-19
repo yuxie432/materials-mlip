@@ -32,6 +32,7 @@ from nomad_harvest.client import (
 from nomad_harvest import upload_zip
 from nomad_harvest.harvest import (
     RecordTooBig,
+    _should_whole_stream,
     build_fetched_entry,
     canonical_staged_name,
     choose_primary,
@@ -836,6 +837,89 @@ def test_fetch_candidates_upload_resume_skips(tmp_path):
     assert summary["skipped_existing"] == 1 and summary["staged"] == 0
     assert client.upload_gets == gets                        # no re-fetch (upload skipped wholesale)
     assert len(list(read_jsonl(out))) == 1
+
+
+# --- whole-upload streaming extraction (the hybrid fetch's fast path) -----------
+
+def test_stream_members_extracts_all_in_one_request(tmp_path):
+    members = {f"c{i}/vasprun.xml": (f"<modeling>{i}</modeling>".encode() * (i + 1))
+               for i in range(6)}
+    client = FakeUploadClient({"U": _make_zip(members)})
+    cd, _ = upload_zip.read_central_directory(client, "U")
+    items = [(cd[name], tmp_path / f"out{i}.xml") for i, name in enumerate(members)]
+    client.upload_gets = 0
+    results = upload_zip.stream_members(client, "U", items)
+    assert all(results.values())
+    assert client.upload_gets == 1                           # ONE streaming request for all members
+    for (m, dest), name in zip(items, members):
+        assert dest.read_bytes() == members[name]            # exact bytes, CRC-verified
+
+
+def test_stream_members_crc_failure_does_not_desync(tmp_path):
+    # A CRC-failed member is not written AND does not knock the stream out of alignment: the
+    # next member still extracts (its bytes were consumed either way).
+    members = {"c/vasprun.xml": b"<modeling/>", "d/vasprun.xml": b"<modeling>d</modeling>"}
+    client = FakeUploadClient({"U": _make_zip(members)})
+    cd, _ = upload_zip.read_central_directory(client, "U")
+    cd["c/vasprun.xml"].crc ^= 0xFFFF                        # corrupt the FIRST member's expected CRC
+    dests = {n: tmp_path / f"{n.split('/')[0]}.xml" for n in members}
+    results = upload_zip.stream_members(client, "U", [(cd[n], dests[n]) for n in members])
+    assert results[dests["c/vasprun.xml"]] is False and not dests["c/vasprun.xml"].exists()
+    assert results[dests["d/vasprun.xml"]] is True
+    assert dests["d/vasprun.xml"].read_bytes() == members["d/vasprun.xml"]
+
+
+def _vm(name, off, size):
+    return upload_zip.ZipMember(name, 0, size, size, 0, off)   # STORED member at a synthetic offset
+
+
+def test_should_whole_stream_true_for_low_bloat_high_entry():
+    members, entries, off = {}, [], 0
+    for i in range(300):                                     # 300 contiguous vaspruns: span ~= wanted
+        n = f"c{i}/vasprun.xml"
+        members[n] = _vm(n, off, 1000)
+        entries.append({"mainfile": n})
+        off += 40 + 1000
+    assert _should_whole_stream(members, entries, False) is True
+
+
+def test_should_whole_stream_false_for_high_bloat():
+    members, entries, off = {}, [], 0
+    for i in range(300):                                     # vaspruns 2 MB apart -> ~600 MB span
+        n = f"c{i}/vasprun.xml"
+        members[n] = _vm(n, off, 1000)
+        entries.append({"mainfile": n})
+        off += 40 + 1000 + 2_000_000
+    assert _should_whole_stream(members, entries, False) is False
+
+
+def test_should_whole_stream_false_for_few_entries():
+    members, entries, off = {}, [], 0
+    for i in range(50):                                      # <= MAX_RANGES_PER_REQUEST: 1 batch
+        n = f"c{i}/vasprun.xml"
+        members[n] = _vm(n, off, 1000)
+        entries.append({"mainfile": n})
+        off += 40 + 1000
+    assert _should_whole_stream(members, entries, False) is False
+
+
+def test_fetch_candidates_whole_stream_path_stages_identically(tmp_path):
+    # >256 low-bloat entries in ONE upload -> the chooser picks whole-stream: everything staged in
+    # ONE request, byte-identical, with the SAME fetched.jsonl the targeted path would produce
+    # (so parse/store/verify see identical input + metadata).
+    members = {f"c{i}/vasprun.xml": f"<modeling>{i}</modeling>".encode() for i in range(260)}
+    client = FakeUploadClient({"U": _make_zip(members)})
+    keep = _upload_keep(tmp_path, [(f"E{i}", "U", f"c{i}/vasprun.xml") for i in range(260)])
+    out = tmp_path / "fetched.jsonl"
+    summary = fetch_candidates(client, keep, raw_dir=tmp_path / "raw", out_path=out)
+    assert summary["staged"] == 260 and summary["per_entry_fallback"] == 0
+    assert client.upload_gets == 2                           # 1 CD read + 1 whole-stream (not 260!)
+    recs = {r["recid"]: r for r in read_jsonl(out)}
+    assert len(recs) == 260
+    assert recs["E7"]["provenance"]["source"] == "nomad"
+    assert recs["E7"]["calc_units"][0]["vasprun"].endswith("vasprun.xml")
+    staged = tmp_path / "raw" / "E7" / "extracted" / "calc" / "vasprun.xml"
+    assert staged.read_bytes() == b"<modeling>7</modeling>"
 
 
 # --- split by upload ------------------------------------------------------------

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import shutil
 from collections import defaultdict
@@ -582,6 +583,57 @@ def _fallback_entries(client: NomadClient, entries: list[dict[str, Any]], raw_di
     return False
 
 
+# Whole-vs-targeted chooser. The /uploads/{id}/raw endpoint costs ~5 s per request (1 in-flight
+# per IP), so TARGETED needs ceil(n/256)+1 throttled requests per upload, while a WHOLE-STREAM is
+# ONE transfer-bound request spanning every wanted member (upload_zip.stream_members). Streaming
+# also pays for the interior bloat bytes between the wanted members, so it only wins when the
+# wanted members are a large-enough fraction of their byte span (i.e. a LOW-bloat upload). We
+# decide per upload by modelled wall-time at a nominal transfer rate; the split is stable across
+# 8-20 MB/s (survey 2026-08-19: 62-71% of entries -> whole-stream, adding only ~5% transfer since
+# ~90% of entries sit in uploads whose vaspruns are >0.7 of the bytes). Only the FETCH mechanism
+# differs — the staged files, calc_units, availability and provenance are byte-identical either
+# way, so parse/store/verify are unaffected.
+_NOMINAL_RATE_BPS = 15 << 20            # 15 MB/s: the chooser's modelled transfer rate
+
+
+def _wanted_members(members: dict[str, ZipMember], entries: list[dict[str, Any]],
+                    want_outcar: bool) -> list[ZipMember]:
+    """The zip members this upload's kept entries would stage (each mainfile + optional sibling
+    OUTCAR) — the same set the fetch admits, used to size the whole-vs-targeted decision."""
+    out: list[ZipMember] = []
+    for entry in entries:
+        mf = entry.get("mainfile") or ""
+        m = members.get(mf)
+        if m is None or _role_of(mf) is None:
+            continue
+        out.append(m)
+        if want_outcar and _role_of(mf) == "vasprun":
+            oc = _sibling_outcar(members, mf)
+            if oc is not None:
+                out.append(oc)
+    return out
+
+
+def _should_whole_stream(members: dict[str, ZipMember], entries: list[dict[str, Any]],
+                         want_outcar: bool) -> bool:
+    """True if this upload is cheaper fetched as ONE whole-stream than as targeted multi-range
+    requests (see the module comment above). False for any upload needing only a single member
+    batch (targeted is already minimal) or whose wanted members are too sparse in the zip."""
+    wanted = _wanted_members(members, entries, want_outcar)
+    n = len(wanted)
+    if n <= upload_zip.MAX_RANGES_PER_REQUEST:          # one member-batch: targeted is already 1 req
+        return False
+    wanted_bytes = sum(m.on_disk_size for m in wanted)
+    ends = [m.local_offset + 30 + len(m.name) + upload_zip._LOCAL_EXTRA_PAD + m.comp_size
+            for m in wanted]
+    span = max(ends) - min(m.local_offset for m in wanted)
+    interval = NomadClient.UPLOAD_MIN_INTERVAL
+    req_t = math.ceil(n / upload_zip.MAX_RANGES_PER_REQUEST) + 1
+    t_targeted = max(req_t * interval, wanted_bytes / _NOMINAL_RATE_BPS)
+    t_whole = interval + span / _NOMINAL_RATE_BPS
+    return t_whole < t_targeted
+
+
 def _fetch_upload(client: NomadClient, upload_id: str, entries: list[dict[str, Any]],
                   raw_dir: Path, budget: StagingBudget, want_outcar: bool, w: JsonlWriter,
                   done: set[str], rej: RejectionLogger, stats: dict[str, Any],
@@ -602,6 +654,12 @@ def _fetch_upload(client: NomadClient, upload_id: str, entries: list[dict[str, A
         return _fallback_entries(client, entries, raw_dir, budget, want_outcar,
                                  w, done, rej, stats, max_records)
 
+    # Choose the fetch mechanism for this whole upload: one transfer-bound stream (low-bloat,
+    # many entries) or targeted multi-range batches (high-bloat or few entries). When streaming,
+    # the batch is NOT flushed mid-loop (below) — the single final flush spans every admitted
+    # member in one request.
+    whole = _should_whole_stream(members, entries, want_outcar)
+
     pending: list[tuple[dict[str, Any], list[tuple[ZipMember, Path, str]], list[int]]] = []
     batch: list[tuple[ZipMember, Path]] = []
     to_fallback: list[dict[str, Any]] = []
@@ -611,7 +669,8 @@ def _fetch_upload(client: NomadClient, upload_id: str, entries: list[dict[str, A
         nonlocal pending, batch
         if not batch:
             return
-        results = upload_zip.fetch_members(client, upload_id, batch)
+        results = (upload_zip.stream_members(client, upload_id, batch) if whole
+                   else upload_zip.fetch_members(client, upload_id, batch))
         for entry, plan, own in pending:
             dest_root = raw_dir / entry["entry_id"]
             if all(results.get(dp) for _m, dp, _r in plan):
@@ -664,7 +723,9 @@ def _fetch_upload(client: NomadClient, upload_id: str, entries: list[dict[str, A
         plan = [(m, calc_dir / canonical_staged_name(m.name, r), r) for m, r in targets]
         pending.append((entry, plan, own))
         batch.extend((m, dp) for m, dp, _r in plan)
-        if len(batch) >= upload_zip.MAX_RANGES_PER_REQUEST:
+        # Targeted flushes each full multi-range batch as it fills; whole-stream accumulates the
+        # whole upload and streams it all in the single final flush (one transfer-bound request).
+        if not whole and len(batch) >= upload_zip.MAX_RANGES_PER_REQUEST:
             flush()
     flush()                                            # stage the admitted remainder, then...
 

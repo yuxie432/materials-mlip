@@ -28,10 +28,12 @@
 # combined one later with `zenodo_harvest.cli merge-datasets`. The ONLY Zenodo path this job
 # reads is the dataset/metadata.jsonl used for cross-source dedup at discover time (read-only).
 #
-# The full 7.1M direct-upload set is fetched by TARGETED RANGE-EXTRACTION from each upload's
-# PRE-PACKED zip (GET /uploads/{id}/raw; ~30k requests total — see docs/NOMAD_HARVEST.md §3),
-# at ~15-30 MB/s. The endpoint is rate-limited to one connection per IP every ~5 s, so the
-# fetch is intrinsically SERIAL (no --workers). It is a ~1.5-3 day single self-resubmitting run.
+# The full 7.1M direct-upload set is fetched from each upload's PRE-PACKED zip
+# (GET /uploads/{id}/raw — see docs/NOMAD_HARVEST.md §3), per upload choosing WHOLE-STREAM (one
+# transfer-bound request) for low-bloat uploads or TARGETED multi-range for high-bloat ones. The
+# endpoint is REQUEST-bound (~5 s/request, one connection per IP; CSD3 compute shares one NAT IP
+# so it is intrinsically SERIAL, no --workers). The hybrid makes it a **~2-4 day** single
+# self-resubmitting run (vs ~6-9 days all-targeted); an exemption would take it sub-day.
 # Scoping with 10_discover.sh's MAX_ENTRIES is optional (an early checkpoint), not required.
 # Everything is resumable, so re-submit by hand OR set RESUBMIT=1 to self-chain across
 # wallclock kills:  RESUBMIT=1 sbatch scripts/csd3/nomad/20_pipeline.sh

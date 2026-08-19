@@ -466,13 +466,26 @@ tail is ~170 TB).
   - `harvest.py` — stage 0 discover (keyset-scan → license-gate + Zenodo-`references`-dedup →
     slimmed keep-list) and stage 2 fetch. **`fetch_candidates` groups the keep-list by
     `upload_id`** (`split_by_upload` keeps each upload whole in one pipeline part → its central
-    directory is read once), then per upload reads the CD and multi-range-fetches each entry's
-    `mainfile` member (vasprun, or OUTCAR for OUTCAR-mainfile entries; `--want-outcar` also grabs
-    a sibling OUTCAR). Disk/inode-paced by the shared `StagingBudget` (reserving each entry's
-    EXACT footprint from the CD), manifest resume, `stopped_disk_budget` for the pipeline. It is
-    **serial** (the endpoint's 1-conn/5s limit); an upload/member the pre-packed path can't
-    deliver **falls back to the per-entry `entries/{id}/raw` path** (a separate throttle bucket)
-    → no coverage loss. **Availability is derived from the upload's central directory** (the zip's
+    directory is read once), then per upload reads the CD and fetches each entry's `mainfile`
+    member (vasprun, or OUTCAR for OUTCAR-mainfile entries; `--want-outcar` also grabs a sibling
+    OUTCAR). **The fetch is REQUEST-bound, not bandwidth-bound** (the endpoint costs ~5 s/request,
+    1-in-flight/5s per IP — confirmed on CSD3 compute; both nodes share one NAT egress IP, so it is
+    intrinsically serial and multi-node/parallel cannot help without a NOMAD rate-limit exemption),
+    so `_fetch_upload` picks **per upload** between two mechanisms via `_should_whole_stream`
+    (modelled wall-time at ~15 MB/s): **targeted** multi-range (`upload_zip.fetch_members`,
+    ≤256 members/request — the 8 KB Range-header cap) for high-bloat or few-entry uploads, or
+    **whole-stream** (`upload_zip.stream_members`) — ONE transfer-bound request spanning all the
+    wanted members, extracting each from the stream by offset (interior bloat streamed past and
+    discarded, so peak disk == wanted bytes) — for LOW-bloat, many-entry uploads. The hybrid
+    collapses ceil(n/256)+1 throttled requests/upload into ~2 for the low-bloat majority (survey
+    2026-08-19: ~90% of entries live in uploads whose vaspruns are >0.7 of the bytes, so
+    whole-stream sends 62-71% of entries and adds only ~5% transfer) → **~2-4 days vs the ~9-day
+    all-targeted floor, no exemption**. Only the FETCH mechanism differs; staged files, calc_units,
+    availability and provenance are byte-identical either way (validated live on a real ZIP64
+    upload). Disk/inode-paced by the shared `StagingBudget` (reserving each entry's EXACT footprint
+    from the CD), manifest resume, `stopped_disk_budget` for the pipeline. **Serial**; an
+    upload/member the pre-packed path can't deliver **falls back to the per-entry
+    `entries/{id}/raw` path** (a separate throttle bucket) → no coverage loss. **Availability is derived from the upload's central directory** (the zip's
     own per-calc file list) OR'd with NOMAD's parsed `available_properties` (`dos_electronic[_new]`
     →`dos`, `band_structure_electronic`→`eigenvalues`) + the parse-time embedded-vasprun probe —
     so the old fragile `rawdir/query` step is gone. `available_properties` is kept by

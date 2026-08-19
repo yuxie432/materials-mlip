@@ -99,7 +99,7 @@ curl -sS -X POST 'https://nomad-lab.eu/prod/v1/api/v1/entries/query' \
   (https://docs.nomad-lab.eu/1.4.3/howto/manage/program/api.html). **HTTP 503 = rate-limited** → back off. There are **no `RateLimit-*`/`Retry-After` headers**, so self-throttle.
 - **The raw-DOWNLOAD endpoint `GET /uploads/{id}/raw` has a STRICTER, separate limit (live-verified 2026-08-17):** *"one in-flight connection is allowed, and new connections allowed every 5 seconds"* per IP (HTTP 429). This is what the fetch (§5/§7) is paced around — it is intrinsically serial and cannot be parallelised from one IP. The `entries/*` endpoints keep the looser ~30 req/s / 10 concurrent floor.
 - **Contacting NOMAD is NOT a documented prerequisite for a large harvest** (checked 2026-08-14 across the API how-to, download how-to, FAQ, Terms, and Support pages — none require or request it). The *only* contact text is **reactive**: the 503 FAQ
-  (https://nomad-lab.eu/nomad-lab/faqs.html) says to lower your request rate and, if the limit is genuinely too low for a legitimate use, to "contact us … if you want to get exempted from the rate-limit." So emailing **support@nomad-lab.eu** is an **optional courtesy** — worth doing only to *request a rate-limit exemption* (lifting the per-IP concurrent-connection cap on `/uploads/{id}/raw` so the targeted fetch can run several streams → hours instead of ~1.5–3 days), not a gate to clear before starting. NOMAD serves published uploads as **pre-packed zips** `GET /uploads/{id}/raw` (streamed off disk, Range-capable — §7); there is **no public data dump**; NOMAD Oasis is a local-install of the software, not a mirror of the public archive.
+  (https://nomad-lab.eu/nomad-lab/faqs.html) says to lower your request rate and, if the limit is genuinely too low for a legitimate use, to "contact us … if you want to get exempted from the rate-limit." So emailing **support@nomad-lab.eu** is an **optional courtesy** — worth doing only to *request a rate-limit exemption* (lifting the per-IP concurrent-connection cap on `/uploads/{id}/raw` so the fetch can run several streams → sub-day instead of the hybrid whole-stream's ~2–4 days), not a gate to clear before starting. NOMAD serves published uploads as **pre-packed zips** `GET /uploads/{id}/raw` (streamed off disk, Range-capable — §7); there is **no public data dump**; NOMAD Oasis is a local-install of the software, not a mirror of the public archive.
 
 ---
 
@@ -277,14 +277,28 @@ is the whole story, and it was root-caused by reading NOMAD's server source + li
   so a targeted fetch is exact bytes. This is the implemented default.
 * **The governor is that endpoint's rate limit: per IP, one in-flight connection, a new one only every
   ~5 s** (explicit 429 — a *different, stricter* limit than the `entries/*` "~30 req/s / 10 concurrent",
-  and a **separate bucket** from it). So the fetch is **serial** — concurrency/extra nodes cannot help
-  (CSD3 shares a NAT). Grouping entries by upload + ~250 members per multi-range request keeps it to
-  **~30k requests → ~1.5–3 days** for the whole 7.1M (throughput varies 3–30 MB/s with NOMAD load).
-* **Levers if 1.5–3 days is too slow:** a **rate-limit exemption** (`support@nomad-lab.eu`) raising the
-  per-IP concurrent-connection cap so the targeted fetch runs several streams in parallel → ~hours
-  (cheap for NOMAD — static byte-range serving, no assembly; optional, not required); or **scope down**
-  to a diverse 1–2M slice (`--max-entries`). A **token does NOT help** (per-IP limit, and the endpoint
-  is anonymous). See the `nomad-throughput-bottleneck` memory for the full investigation.
+  and a **separate bucket** from it). So the fetch is **REQUEST-bound, not bandwidth-bound**: every
+  request costs ~5 s regardless of size (CSD3-compute-verified 2026-08-19 — both compute nodes share
+  ONE NAT egress IP and the throttle strictly refuses a 2nd in-flight connection, so it is intrinsically
+  **serial** and neither extra nodes nor staggered pipelining help without an exemption; a single
+  connection itself does ~14–22 MB/s, so the ~3.9 MB/s live-job rate was throttle *dead-time*, not
+  bandwidth). Pure targeted needs `ceil(n/256)+1` requests **per upload** (256 members/multi-range,
+  the 8 KB Range-header cap), and since ~93% of entries live in 1k–10k-entry uploads that is ~42k-request
+  floor → **~6–9 days** with real overhead (under-filled batches, 48 MB CD reads, 429 retries).
+* **The fix — HYBRID whole-stream (implemented 2026-08-19, no exemption):** per upload the fetch picks
+  (`harvest._should_whole_stream`) between targeted multi-range and a **single transfer-bound stream**
+  spanning all the wanted members (`upload_zip.stream_members`), extracting each from the stream by
+  offset (interior bloat streamed past + discarded → peak disk == wanted bytes). A survey (full census +
+  55 stratified central-directory reads) found the bloat is favourable **entry-weighted** — ~90% of
+  entries sit in uploads whose vaspruns are >0.7 of the bytes (median 0.73) — so whole-stream carries
+  62–71% of entries for only ~5% extra transfer while collapsing `ceil(n/256)+1` throttled requests/upload
+  into ~2. Result: **~2–4 days** (≈3× faster; transfer-bound, so it hits its number where targeted never
+  hits its floor). Data/metadata are byte-identical either way (only the fetch mechanism differs).
+* **Further levers if 2–4 days is still too slow:** a **rate-limit exemption** (`support@nomad-lab.eu`)
+  raising the per-IP concurrent-connection cap so several streams run in parallel → sub-day (the only
+  way past the strict 1-in-flight throttle; optional); or **scope down** to a diverse 1–2M slice
+  (`--max-entries`). A **token does NOT help** (per-IP limit, endpoint is anonymous). See the
+  `nomad-fetch-bottleneck-decomposition` + `nomad-throughput-bottleneck` memories for the full investigation.
 
 ---
 
@@ -353,17 +367,25 @@ HTTP **Range** and **multi-range**. So `harvest.fetch_candidates`:
 2. Per upload, **one suffix-Range read of the zip tail → the central directory**
    (`upload_zip.read_central_directory`, ZIP64-aware — the big uploads are >4 GB).
 3. Matches each kept entry's `mainfile` to a member (**verified 800/800 exact matches**, incl.
-   `.bz2`), then **multi-range-fetches those members** (~250 per request, capped by the ~8 KB Range
-   header) straight out of the zip (`upload_zip.fetch_members`), each **CRC-verified** against the
-   central directory. Members are STORED, so this is exact bytes — zero server-side work.
+   `.bz2`), then fetches those members straight out of the zip, each **CRC-verified** against the
+   central directory (members are STORED → exact bytes, zero server-side work), by **one of two
+   mechanisms chosen per upload** (`harvest._should_whole_stream`, by modelled wall-time):
+   **targeted** multi-range (`upload_zip.fetch_members`, ≤256 members/request — the ~8 KB Range-header
+   cap) for high-bloat or few-entry uploads, or **whole-stream** (`upload_zip.stream_members`) — ONE
+   transfer-bound request spanning all the wanted members, extracting each from the stream by offset
+   (interior bloat discarded → peak disk == wanted bytes) — for the low-bloat, many-entry majority.
+   The two are interchangeable downstream: identical staged bytes, `calc_units`, availability, provenance.
 
-**Request count & time:** ~7.1M/250 member-batches + ~3,792 central-directory reads ≈ **~30k
-requests**. The endpoint is rate-limited **per IP to one in-flight connection, a new one every
-~5 s** (a *separate, stricter* bucket than the `entries/*` endpoints), so the fetch is **serial** —
-there is no `--workers`, and CSD3's shared NAT means extra nodes cannot parallelise it. At ~15–30
-MB/s the whole 1.9 TB is **~1.5–3 days** (a request ≥5 s is transfer-bound; a shorter one waits out
-the 5 s). A **rate-limit exemption** (`support@nomad-lab.eu`) lifting the concurrency cap would drop
-that to hours — optional. A **token does not help** (per-IP limit; the endpoint is anonymous).
+**Request count & time (REQUEST-bound):** the endpoint is rate-limited **per IP to one in-flight
+connection, a new one every ~5 s** (a *separate, stricter* bucket than the `entries/*` endpoints,
+CSD3-compute-verified — both nodes share one NAT egress IP and a 2nd in-flight connection is strictly
+refused), so the fetch is **serial** and **every request costs ~5 s regardless of size**. Pure targeted
+is therefore ~`ceil(n/256)+1` requests per upload (~42k floor for the whole 7.1M) → **~6–9 days** with
+real overhead — a single connection does ~14–22 MB/s, so this is *throttle dead-time*, not bandwidth.
+The **hybrid whole-stream** (§ above; chosen per upload) collapses the low-bloat majority to ~2
+requests/upload and is transfer-bound → **~2–4 days** for the whole 1.9 TB, no exemption. A **rate-limit
+exemption** (`support@nomad-lab.eu`) lifting the 1-in-flight cap so several streams run in parallel is
+the only sub-day path — optional. A **token does not help** (per-IP limit; the endpoint is anonymous).
 
 **Availability is now free + reliable:** the central directory *is* the per-calc file list, so
 CHGCAR/DOSCAR/WAVECAR/… flags come from it directly (OR'd with `available_properties` for DOS/eigen

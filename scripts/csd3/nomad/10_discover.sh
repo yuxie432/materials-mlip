@@ -42,8 +42,8 @@ cd "${SLURM_SUBMIT_DIR:-.}"      # repo root
 # docs/NOMAD_HARVEST.md). MAX_ENTRIES caps the keep-list: a keyset scan is ordered by the
 # entry_id hash, so a cap is a DIVERSE spread across uploads, not the first upload only.
 # Raise it (or set to a huge number) to widen the sample; combine with ELEMENTS to focus.
-# The full run is ~1.5-3 days (targeted pre-packed-zip fetch, docs/NOMAD_HARVEST.md §3), so a
-# cap is OPTIONAL — an early checkpoint, not a requirement.
+# The full run is ~2-4 days (hybrid whole-stream / targeted pre-packed-zip fetch, docs/NOMAD_HARVEST.md
+# §3), so a cap is OPTIONAL — an early checkpoint, not a requirement.
 MAX_ENTRIES="${MAX_ENTRIES:-200000}"   # cap the keep-list; set EMPTY or 0 for the FULL 7.1M run
 ELEMENTS="${ELEMENTS:-}"               # e.g. "Ti O" -> only materials containing ALL of these
 # --------------------------------------------------------------------------------

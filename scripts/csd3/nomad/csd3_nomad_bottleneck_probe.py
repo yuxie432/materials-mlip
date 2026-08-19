@@ -375,7 +375,7 @@ def main() -> None:
         print(f"       BOTH SUCCEEDED -> aggregate {agg/wall:.1f} MB/s (vs {n_whole:.1f} single). "
               f"Parallel from ONE IP is allowed!")
     else:
-        print(f"       a 429 -> a 2nd simultaneous connection is refused (throttle is real).")
+        print("       a 429 -> a 2nd simultaneous connection is refused (throttle is real).")
 
     # E2: start a LONG stream, wait 5.1 s (past the "every 5 s" window), start a 2nd while the
     #     1st is STILL in flight. 206 here (with the 1st not yet done) means "1 in-flight" is NOT
@@ -455,12 +455,27 @@ def main() -> None:
         print("  * [E] confirms 1-in-flight-per-IP: single IP is serial. Check the launcher's")
         print("    two-node egress IPs — if they DIFFER, run the pipeline on K nodes (K disjoint")
         print("    upload slices -> own dataset dir -> merge) for ~Kx with NO exemption.")
-    reqs = N_FULL / 250 + 3792
-    for label, mbs in (("targeted", n_targeted), ("whole", n_whole)):
-        if mbs:
-            days = (N_FULL * 262 * 1024) / MB / mbs / 86400
-            print(f"  * full-7.1M single-stream at the measured {label} {mbs:.0f} MB/s "
-                  f"~= {days:.1f} days ({reqs/1000:.0f}k requests).")
+    # Time = max(transfer-bound, THROTTLE-bound). Every request costs ~5 s regardless of size, so
+    # the sustained rate is NOT the single-request MB/s above when the pattern makes many small
+    # requests. TARGETED is throttle-bound: members are capped at ~250/request by the 8 KB Range
+    # header + 1 CD read/upload + small uploads under-fill batches (the real job averaged ~47
+    # calcs/request => ~150k requests => ~9 days). WHOLE-download is transfer-bound: one long
+    # request per upload, so its MB/s IS sustainable.
+    UPLOADS, WANTED_B = 3792, N_FULL * 262 * 1024        # ~1.9 TB of vasprun bytes
+    if n_targeted:
+        reqs_best = N_FULL / 250 + UPLOADS               # best case: full 250-member batches
+        thr_best = reqs_best * 5 / 86400
+        thr_real = (N_FULL / 47 + UPLOADS) * 5 / 86400   # real job's ~47 calcs/request
+        xfer = WANTED_B / MB / n_targeted / 86400
+        print(f"  * TARGETED full-7.1M: transfer-bound {xfer:.1f}d, but THROTTLE-bound "
+              f"{thr_best:.1f}d best / ~{thr_real:.0f}d at the real ~47 calcs/request "
+              f"-> ~{max(xfer, thr_real):.0f} days (this is why the live job is ~9d, not ~1.5d).")
+    if n_whole and bloat_med:
+        xfer = (WANTED_B / bloat_med) / MB / n_whole / 86400   # whole-download low-bloat uploads
+        thr = 2 * UPLOADS * 5 / 86400
+        print(f"  * WHOLE/HYBRID full-7.1M: transfer-bound {xfer:.1f}d (pull ~{1/bloat_med:.1f}x "
+              f"wanted bytes at {n_whole:.0f} MB/s), throttle floor {thr:.1f}d "
+              f"-> ~{max(xfer, thr):.1f} days. THE win: 1 request/upload, no 5 s-per-batch tax.")
     print("=" * 78)
 
 

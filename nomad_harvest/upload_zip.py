@@ -35,6 +35,7 @@ from __future__ import annotations
 import logging
 import struct
 import zlib
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -57,10 +58,13 @@ _ZIP64_SENTINEL16 = 0xFFFF
 # ~15-20 MB central directory, so 48 MB covers the common case in a single suffix-range read;
 # a rare larger one triggers one extra explicit read (see read_central_directory).
 _TAIL_BYTES = 48 << 20
-# Multi-range request budget. NOMAD's proxy caps the Range HEADER at ~8 KB (~300 compact
-# ranges); stay well under. And cap the in-memory batch bytes so a multi-range response is
-# read into RAM safely — a member bigger than this is streamed to disk on its own instead.
-MAX_RANGES_PER_REQUEST = 200
+# Multi-range request budget. NOMAD's proxy caps the Range HEADER at ~8 KB (~350 compact
+# ranges: an offset in a >4 GB ZIP64 is ~11 digits, so a range is ~24 bytes). 256 keeps the
+# header ~6.1 KB — safely under — while cutting member-requests ~28% vs the old 200 (every
+# request costs the endpoint's ~5 s throttle, so fewer, fuller requests is a direct win). And
+# cap the in-memory batch bytes so a multi-range response is read into RAM safely — a member
+# bigger than this is streamed to disk on its own instead.
+MAX_RANGES_PER_REQUEST = 256
 MAX_BATCH_BYTES = 96 << 20
 # Room for a local-file-header extra field (observed 0; padded so a rare non-zero elen still
 # lands the member's data inside the fetched range).
@@ -382,4 +386,159 @@ def fetch_members(client: "NomadClient", upload_id: str,
         batch.append((m, dest))
         batch_bytes += m.on_disk_size
     flush()
+    return results
+
+
+# --- whole-upload streaming extraction (the hybrid fetch's fast path) -----------
+#
+# For a LOW-BLOAT upload (most of its bytes ARE the wanted vaspruns — the common case:
+# survey 2026-08-19 found ~90% of entries live in uploads whose vaspruns are >0.7 of the
+# bytes), pulling each member with its own multi-range request wastes the endpoint's harsh
+# throttle: every request costs ~5 s regardless of size, and members cap at ~256/request, so a
+# 4,000-vasprun upload needs ~16 throttled requests. Instead we make ONE transfer-bound request
+# spanning all the wanted members and extract them from the stream as their byte offsets pass —
+# 1 request/upload, and only the wanted members are written to disk (interior bloat bytes are
+# streamed past and discarded, so peak disk == wanted bytes, exactly like the targeted path).
+# The per-upload whole-vs-targeted choice lives in ``harvest._should_whole_stream``; a stream that
+# fails partway leaves the un-extracted members ``False`` so the caller falls back per-entry.
+
+
+class _StreamReader:
+    """Sequential reader over a Range response body that tracks the current file offset, so a
+    member can be located by its central-directory ``local_offset`` without random seeks."""
+
+    def __init__(self, chunks: Iterator[bytes], start_offset: int) -> None:
+        self._it = chunks
+        self._buf = bytearray()
+        self.pos = start_offset          # file offset of the next unconsumed byte
+        self._eof = False
+
+    def _fill(self) -> bool:
+        """Pull the next non-empty chunk into the buffer. False at end of stream."""
+        if self._eof:
+            return False
+        for chunk in self._it:           # resumes the iterator; returns on the first data chunk
+            if chunk:
+                self._buf += chunk
+                return True
+        self._eof = True
+        return False
+
+    def discard(self, n: int) -> bool:
+        """Skip ``n`` bytes forward (interior bloat / a member's name+extra). False if the stream
+        ends first."""
+        while n > 0:
+            if not self._buf and not self._fill():
+                return False
+            take = min(n, len(self._buf))
+            del self._buf[:take]
+            self.pos += take
+            n -= take
+        return True
+
+    def read_exact(self, n: int) -> bytes | None:
+        """Return exactly ``n`` bytes, or None if the stream ends first."""
+        while len(self._buf) < n:
+            if not self._fill():
+                return None
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        self.pos += n
+        return out
+
+    def stream_exact(self, n: int, sink: "Callable[[bytes], object]",
+                     crc: int) -> tuple[bool, int]:
+        """Stream ``n`` bytes to ``sink`` (a file's ``write``), folding them into ``crc`` as they
+        pass so a STORED member is CRC-verified without buffering the whole file. Returns
+        ``(complete, crc)``."""
+        remaining = n
+        while remaining > 0:
+            if not self._buf and not self._fill():
+                return False, crc
+            take = min(remaining, len(self._buf))
+            piece = bytes(self._buf[:take])
+            del self._buf[:take]
+            self.pos += take
+            sink(piece)
+            crc = zlib.crc32(piece, crc)
+            remaining -= take
+        return True, crc
+
+
+def _extract_member_streaming(reader: _StreamReader, m: ZipMember, dest: Path) -> bool:
+    """Extract member ``m`` from the sequential ``reader`` (positioned at or before its offset)
+    to ``dest``, CRC-verified. Returns success; the reader is left positioned just after ``m``'s
+    data on success so the next member follows contiguously."""
+    if reader.pos > m.local_offset:                    # cannot rewind (must be called in order)
+        return False
+    if not reader.discard(m.local_offset - reader.pos):
+        return False
+    lfh = reader.read_exact(30)
+    if lfh is None or lfh[:4] != _LFH_SIG:
+        return False
+    nlen, elen = struct.unpack("<HH", lfh[26:30])
+    if not reader.discard(nlen + elen):                # skip the local name + extra field
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    try:
+        if m.method == 0:                              # STORED: stream to disk, CRC on the fly
+            with tmp.open("wb") as fh:
+                ok, crc = reader.stream_exact(m.comp_size, fh.write, 0)
+            if not ok or (crc & 0xFFFFFFFF) != (m.crc & 0xFFFFFFFF):
+                tmp.unlink(missing_ok=True)
+                return False
+            tmp.replace(dest)
+            return True
+        if m.method == 8:                              # DEFLATE: buffer + inflate (rare, small)
+            data = reader.read_exact(m.comp_size)
+            if data is None:
+                return False
+            try:
+                content = zlib.decompress(data, -15)
+            except zlib.error:
+                return False
+            return _verify_and_write(content, m, dest)
+        return False                                   # unsupported compression
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def stream_members(client: "NomadClient", upload_id: str,
+                   items: list[tuple[ZipMember, Path]]) -> dict[Path, bool]:
+    """Extract the given members from the upload's pre-packed zip in ONE streaming Range request.
+
+    Requests the single byte span covering all the wanted members and pulls each out of the
+    stream by offset (bloat bytes between them are discarded, never written), each CRC-verified.
+    Returns ``{dest: ok}`` for every item — a False (or a whole-request transport failure, which
+    marks every item False) lets the caller fall back to the per-entry path, so coverage is never
+    lost. This is the 1-request-per-upload alternative to :func:`fetch_members` for low-bloat
+    uploads, chosen by ``harvest._should_whole_stream``."""
+    results: dict[Path, bool] = {dest: False for _m, dest in items}
+    if not items:
+        return results
+    by_off = sorted(items, key=lambda mp: mp[0].local_offset)
+    first = by_off[0][0].local_offset
+    lm = by_off[-1][0]
+    last_end = lm.local_offset + 30 + len(lm.name) + _LOCAL_EXTRA_PAD + lm.comp_size
+    try:
+        with client.upload_raw_get(upload_id, f"bytes={first}-{last_end}", stream=True) as r:
+            start = first
+            if r.status_code == 200:                   # server ignored Range -> whole file from 0
+                start = 0
+            else:
+                cr = r.headers.get("Content-Range", "")
+                if cr.startswith("bytes "):
+                    try:
+                        start = int(cr.split("bytes ", 1)[1].split("-", 1)[0])
+                    except (IndexError, ValueError):
+                        start = first
+            reader = _StreamReader(r.iter_content(1 << 20), start)
+            for m, dest in by_off:
+                if reader.pos > m.local_offset:        # overshot (should not happen when sorted)
+                    continue
+                results[dest] = _extract_member_streaming(reader, m, dest)
+    except Exception as exc:  # noqa: BLE001 - transport failure -> per-entry fallback
+        logger.warning("whole-stream fetch failed for upload %s: %s", upload_id, exc)
     return results
