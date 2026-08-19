@@ -156,6 +156,19 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
     `run_type`/`functional`/INCAR/effective `parameters`/k-points/POTCAR are populated to
     parity with the vasprun path (closing the 25.6%-null-functional gap). The vasprun path
     also stores VASP's resolved `parameters` block now (the metadata-gaps "better fix").
+    **`--parse-workers N`** (default 1 = serial) parses N calc units CONCURRENTLY — N worker
+    threads each run the timeout-guarded `_parse_one` (child forks serialise in the forkserver but
+    the parses run in parallel) while the MAIN thread writes each result's frames-then-metadata
+    serially (single writer → the one-calc-at-a-time crash-safety/prune invariant is preserved;
+    results land in completion order, which is fine — frame_ids are unique). This is the lever for
+    a **parse-throughput-bound** harvest of MANY SMALL calcs: NOMAD's ~7M tiny vaspruns parse
+    ~0.26 s each single-threaded (~21 days) → N-way cuts that ~N-fold until the serial fetch
+    (~4 MB/s single connection) becomes the bound. Use with `--parse-timeout>0` (real child
+    processes); keep `parse_workers × per-parse RSS` under the node RAM (NOMAD vaspruns are tiny).
+    **`parse_eigen` is best-effort** (`_open_vasp_besteffort`): enabling it for the occupancy net
+    moment must never drop a calc, so a vasprun whose `<eigenvalues>` pymatgen cannot read
+    (`KeyError('eigenvalues')` on some real ISPIN=2 uploads) is retried WITHOUT eigenvalues — the
+    calc + net charge are kept, only the net moment falls back to `None`.
   - `outcar_params.py` — parse an OUTCAR **header** into a vasprun-schema `calc_parameters`:
     the user `INCAR:` echo (via pymatgen's canonical `Incar` parser, stdlib fallback) + the
     resolved-parameter blocks (`parameters`) + POTCAR titels + k-points. `run_type` is

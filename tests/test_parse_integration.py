@@ -107,6 +107,30 @@ def test_parallel_parse_matches_serial(tmp_path):
     assert _ids(ds_s) == _ids(ds_p)
 
 
+def test_open_vasp_besteffort_retries_without_eigen():
+    # parse_eigen must never cost a calc: if the eigen parse raises, retry without it (net moment
+    # -> None) instead of dropping the calc. Verified with a stub ctor (no pathological vasprun
+    # needed): the real trigger is pymatgen KeyError('eigenvalues') on some ISPIN=2 vaspruns.
+    from zenodo_harvest.parse import _open_vasp_besteffort
+    calls = []
+
+    def ctor(pe):
+        calls.append(pe)
+        if pe:
+            raise KeyError("eigenvalues")   # eigen path fails, non-eigen path succeeds
+        return "OBJ"
+
+    obj, eigen = _open_vasp_besteffort(ctor, True, "label")
+    assert obj == "OBJ" and eigen is False and calls == [True, False]   # retried without eigen
+
+    # want_eigen=True and it works -> no retry, eigen_parsed stays True
+    assert _open_vasp_besteffort(lambda pe: "OK", True, "l") == ("OK", True)
+
+    # want_eigen=False and it raises -> a genuine parse failure propagates (no silent swallow)
+    with pytest.raises(ValueError):
+        _open_vasp_besteffort(lambda pe: (_ for _ in ()).throw(ValueError("bad xml")), False, "l")
+
+
 def test_parallel_parse_resumes(tmp_path):
     # Resume safety with parallel workers: a second parse of the same input into the same dir
     # adds nothing (all calcs already committed) and verify still holds.

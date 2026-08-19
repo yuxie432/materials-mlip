@@ -736,6 +736,31 @@ def _outcar_scf_for(outcar_path: str | None
     return conv or None
 
 
+def _open_vasp_besteffort(ctor: Any, want_eigen: bool, label: str) -> tuple[Any, bool]:
+    """Build a pymatgen ``Vasprun``/``Vaspout`` via ``ctor(parse_eigen: bool)``, retrying WITHOUT
+    eigenvalues if the eigen parse raises. Returns ``(obj, eigen_parsed)``.
+
+    ``parse_eigen`` is enabled ONLY to reverse-engineer the net moment from eigenvalue occupancies
+    (a collinear spin calc with no OUTCAR). But pymatgen's ``<eigenvalues>`` reader raises on some
+    real vaspruns that otherwise parse perfectly (e.g. ``KeyError('eigenvalues')``), so eigen
+    parsing must NEVER cost the whole calc: on such a failure we retry with ``parse_eigen=False`` —
+    the trajectory, forces, net *charge* and everything else are kept exactly as before, and only
+    the occupancy-method net *moment* becomes ``None`` (the honest result when the eigenvalues are
+    unreadable). Raises only if the object cannot be built even without eigenvalues (a genuinely
+    unparseable primary). Without this, enabling ``parse_eigen`` would turn a previously-parseable
+    ISPIN=2 calc into a dropped ``vasprun_parse_error`` — a regression the net-moment feature must
+    not introduce.
+    """
+    try:
+        return ctor(want_eigen), want_eigen
+    except Exception:
+        if not want_eigen:
+            raise
+        logger.warning("eigenvalue parse failed for %s; retrying without eigenvalues "
+                       "(net magnetic moment unavailable for this calc)", label)
+        return ctor(False), False
+
+
 def parse_vasprun(vasprun_path: str, calc_id: str, outcar_path: str | None,
                   source: str = "zenodo") -> tuple[list[Atoms], dict]:
     """Parse one vasprun.xml into (frames, calc_metadata).
@@ -744,18 +769,21 @@ def parse_vasprun(vasprun_path: str, calc_id: str, outcar_path: str | None,
     collinear spin-polarised calc (ISPIN=2, cheap pre-scan) with no OUTCAR beside it. With an
     OUTCAR the moment comes from its magnetization line; ISPIN=1 has none; non-collinear needs
     the projected magnetization we do not parse. So the ISPIN=1 majority and every
-    OUTCAR-accompanied calc parse exactly as before (no eigen cost).
+    OUTCAR-accompanied calc parse exactly as before (no eigen cost). Eigen parsing is best-effort
+    (:func:`_open_vasp_besteffort`): a vasprun whose ``<eigenvalues>`` pymatgen cannot read is still
+    kept (net moment → None), never dropped.
     """
     from pymatgen.io.vasp.outputs import Vasprun
     parse_eigen = False
     if outcar_path is None:
         flags = _scan_vasprun_spin_flags(vasprun_path)
         parse_eigen = flags.get("ispin") == 2  # occupancy method: collinear spin-polarised only
-    v = Vasprun(vasprun_path, parse_dos=False, parse_eigen=parse_eigen,
-                parse_projected_eigen=False, parse_potcar_file=False,
-                exception_on_bad_xml=False)
+    v, eigen_parsed = _open_vasp_besteffort(
+        lambda pe: Vasprun(vasprun_path, parse_dos=False, parse_eigen=pe,
+                           parse_projected_eigen=False, parse_potcar_file=False,
+                           exception_on_bad_xml=False), parse_eigen, vasprun_path)
     return _frames_and_meta(v, calc_id, outcar_path, "pymatgen.Vasprun", source,
-                            eigen_parsed=parse_eigen, atominfo_path=vasprun_path)
+                            eigen_parsed=eigen_parsed, atominfo_path=vasprun_path)
 
 
 def parse_vaspout(vaspout_path: str, calc_id: str, outcar_path: str | None,
@@ -776,11 +804,12 @@ def parse_vaspout(vaspout_path: str, calc_id: str, outcar_path: str | None,
     """
     from pymatgen.io.vasp.outputs import Vaspout
     parse_eigen = outcar_path is None
-    v = Vaspout(vaspout_path, parse_dos=False, parse_eigen=parse_eigen,
-                parse_projected_eigen=False, store_potcar=False)
+    v, eigen_parsed = _open_vasp_besteffort(
+        lambda pe: Vaspout(vaspout_path, parse_dos=False, parse_eigen=pe,
+                           parse_projected_eigen=False, store_potcar=False), parse_eigen, vaspout_path)
     outcar_scf = _outcar_scf_for(outcar_path)
     return _frames_and_meta(v, calc_id, outcar_path, "pymatgen.Vaspout", source,
-                            eigen_parsed=parse_eigen, atominfo_path=None, outcar_scf=outcar_scf)
+                            eigen_parsed=eigen_parsed, atominfo_path=None, outcar_scf=outcar_scf)
 
 
 def electronic_block_for_unit(unit: dict) -> dict:
@@ -799,23 +828,25 @@ def electronic_block_for_unit(unit: dict) -> dict:
         from pymatgen.io.vasp.outputs import Vasprun, Vaspout
         if vasprun:
             try:
-                parse_eigen = (outcar is None
-                               and _scan_vasprun_spin_flags(vasprun).get("ispin") == 2)
-                v = Vasprun(vasprun, parse_dos=False, parse_eigen=parse_eigen,
-                            parse_projected_eigen=False, parse_potcar_file=False,
-                            exception_on_bad_xml=False)
+                want = (outcar is None
+                        and _scan_vasprun_spin_flags(vasprun).get("ispin") == 2)
+                v, eigen_parsed = _open_vasp_besteffort(
+                    lambda pe: Vasprun(vasprun, parse_dos=False, parse_eigen=pe,
+                                       parse_projected_eigen=False, parse_potcar_file=False,
+                                       exception_on_bad_xml=False), want, vasprun)
                 return electronic_from_object(v, atominfo_path=vasprun, outcar_path=outcar,
-                                              eigen_parsed=parse_eigen)
+                                              eigen_parsed=eigen_parsed)
             except Exception:
                 if not outcar:
-                    raise            # no fallback -> report as empty below
+                    raise            # unparseable even w/o eigen + no fallback -> empty below
         elif vaspout:
             try:
-                parse_eigen = outcar is None
-                v = Vaspout(vaspout, parse_dos=False, parse_eigen=parse_eigen,
-                            parse_projected_eigen=False, store_potcar=False)
+                v, eigen_parsed = _open_vasp_besteffort(
+                    lambda pe: Vaspout(vaspout, parse_dos=False, parse_eigen=pe,
+                                       parse_projected_eigen=False, store_potcar=False),
+                    outcar is None, vaspout)
                 return electronic_from_object(v, atominfo_path=None, outcar_path=outcar,
-                                              eigen_parsed=parse_eigen)
+                                              eigen_parsed=eigen_parsed)
             except Exception:
                 if not outcar:
                     raise
