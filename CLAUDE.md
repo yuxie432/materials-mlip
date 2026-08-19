@@ -472,7 +472,9 @@ tail is ~170 TB).
     1-in-flight/5s per IP — confirmed on CSD3 compute; both nodes share one NAT egress IP, so it is
     intrinsically serial and multi-node/parallel cannot help without a NOMAD rate-limit exemption),
     so `_fetch_upload` picks **per upload** between two mechanisms via `_should_whole_stream`
-    (modelled wall-time at ~15 MB/s): **targeted** multi-range (`upload_zip.fetch_members`,
+    (a RATE-INDEPENDENT bloat cap — whole unless it would over-fetch >2× the wanted bytes, since
+    the achieved MB/s swings 4-37× with load so no measured rate is trustworthy): **targeted**
+    multi-range (`upload_zip.fetch_members`,
     ≤256 members/request — the 8 KB Range-header cap) for high-bloat or few-entry uploads, or
     **whole-stream** (`upload_zip.stream_members`) — ONE transfer-bound request spanning all the
     wanted members, extracting each from the stream by offset (interior bloat streamed past and

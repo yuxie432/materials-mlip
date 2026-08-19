@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import re
 import shutil
 from collections import defaultdict
@@ -588,12 +587,18 @@ def _fallback_entries(client: NomadClient, entries: list[dict[str, Any]], raw_di
 # ONE transfer-bound request spanning every wanted member (upload_zip.stream_members). Streaming
 # also pays for the interior bloat bytes between the wanted members, so it only wins when the
 # wanted members are a large-enough fraction of their byte span (i.e. a LOW-bloat upload). We
-# decide per upload by modelled wall-time at a nominal transfer rate; the split is stable across
-# 8-20 MB/s (survey 2026-08-19: 62-71% of entries -> whole-stream, adding only ~5% transfer since
-# ~90% of entries sit in uploads whose vaspruns are >0.7 of the bytes). Only the FETCH mechanism
+# decide per upload by a RATE-INDEPENDENT byte comparison. Whole-stream reads SEQUENTIALLY off disk,
+# so it is at least as fast PER BYTE as targeted's scattered-seek multi-range (usually faster) AND
+# uses ~2 requests vs ceil(n/256)+1; its one cost is streaming the interior bloat. So take whole
+# unless it would over-fetch more than _WHOLE_MAX_OVERFETCH x the wanted bytes. Rate-independent is
+# deliberate: the achieved MB/s swings 4-37 with NOMAD load (single-shot probes gave whole:targeted
+# ratios of 0.5x AND 5.9x minutes apart), so no measured rate is trustworthy; the cap instead BOUNDS
+# the worst case (whole <= _WHOLE_MAX_OVERFETCH x the wanted-byte time even on a slow server) while
+# still sending the ~90% of entries in low-bloat uploads (bloat_ratio >= 0.5; survey 2026-08-19) down
+# the 1-request whole path. Only the FETCH mechanism
 # differs — the staged files, calc_units, availability and provenance are byte-identical either
 # way, so parse/store/verify are unaffected.
-_NOMINAL_RATE_BPS = 15 << 20            # 15 MB/s: the chooser's modelled transfer rate
+_WHOLE_MAX_OVERFETCH = 2.0             # take whole iff its byte span <= 2x the wanted bytes (bloat_ratio >= 0.5)
 
 
 def _wanted_members(members: dict[str, ZipMember], entries: list[dict[str, Any]],
@@ -621,17 +626,15 @@ def _should_whole_stream(members: dict[str, ZipMember], entries: list[dict[str, 
     batch (targeted is already minimal) or whose wanted members are too sparse in the zip."""
     wanted = _wanted_members(members, entries, want_outcar)
     n = len(wanted)
-    if n <= upload_zip.MAX_RANGES_PER_REQUEST:          # one member-batch: targeted is already 1 req
+    if n <= upload_zip.MAX_RANGES_PER_REQUEST:          # <=1 targeted batch already: whole saves ~nothing
         return False
     wanted_bytes = sum(m.on_disk_size for m in wanted)
+    if wanted_bytes <= 0:
+        return False
     ends = [m.local_offset + 30 + len(m.name) + upload_zip._LOCAL_EXTRA_PAD + m.comp_size
             for m in wanted]
     span = max(ends) - min(m.local_offset for m in wanted)
-    interval = NomadClient.UPLOAD_MIN_INTERVAL
-    req_t = math.ceil(n / upload_zip.MAX_RANGES_PER_REQUEST) + 1
-    t_targeted = max(req_t * interval, wanted_bytes / _NOMINAL_RATE_BPS)
-    t_whole = interval + span / _NOMINAL_RATE_BPS
-    return t_whole < t_targeted
+    return span <= _WHOLE_MAX_OVERFETCH * wanted_bytes
 
 
 def _fetch_upload(client: NomadClient, upload_id: str, entries: list[dict[str, Any]],

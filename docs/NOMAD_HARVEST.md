@@ -369,7 +369,8 @@ HTTP **Range** and **multi-range**. So `harvest.fetch_candidates`:
 3. Matches each kept entry's `mainfile` to a member (**verified 800/800 exact matches**, incl.
    `.bz2`), then fetches those members straight out of the zip, each **CRC-verified** against the
    central directory (members are STORED → exact bytes, zero server-side work), by **one of two
-   mechanisms chosen per upload** (`harvest._should_whole_stream`, by modelled wall-time):
+   mechanisms chosen per upload** (`harvest._should_whole_stream`, a rate-independent bloat cap —
+   whole unless it would over-fetch >2× the wanted bytes):
    **targeted** multi-range (`upload_zip.fetch_members`, ≤256 members/request — the ~8 KB Range-header
    cap) for high-bloat or few-entry uploads, or **whole-stream** (`upload_zip.stream_members`) — ONE
    transfer-bound request spanning all the wanted members, extracting each from the stream by offset

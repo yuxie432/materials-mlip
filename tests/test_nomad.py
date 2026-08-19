@@ -907,7 +907,10 @@ def test_fetch_candidates_whole_stream_path_stages_identically(tmp_path):
     # >256 low-bloat entries in ONE upload -> the chooser picks whole-stream: everything staged in
     # ONE request, byte-identical, with the SAME fetched.jsonl the targeted path would produce
     # (so parse/store/verify see identical input + metadata).
-    members = {f"c{i}/vasprun.xml": f"<modeling>{i}</modeling>".encode() for i in range(260)}
+    # realistically-sized members (data >> local-header overhead) so span/wanted ~ 1 (low bloat);
+    # 22-byte toy members would make the header dominate the span and (correctly) pick targeted.
+    body = {i: (f"<modeling>{i}</modeling>".encode() * 100) for i in range(260)}   # ~2.2 KB each
+    members = {f"c{i}/vasprun.xml": body[i] for i in range(260)}
     client = FakeUploadClient({"U": _make_zip(members)})
     keep = _upload_keep(tmp_path, [(f"E{i}", "U", f"c{i}/vasprun.xml") for i in range(260)])
     out = tmp_path / "fetched.jsonl"
@@ -919,7 +922,7 @@ def test_fetch_candidates_whole_stream_path_stages_identically(tmp_path):
     assert recs["E7"]["provenance"]["source"] == "nomad"
     assert recs["E7"]["calc_units"][0]["vasprun"].endswith("vasprun.xml")
     staged = tmp_path / "raw" / "E7" / "extracted" / "calc" / "vasprun.xml"
-    assert staged.read_bytes() == b"<modeling>7</modeling>"
+    assert staged.read_bytes() == body[7]
 
 
 # --- split by upload ------------------------------------------------------------
