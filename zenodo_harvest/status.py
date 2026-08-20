@@ -8,7 +8,10 @@ files — every manifest is flushed per line, and a torn final line is tolerated
 
 Progress percentages come from pairing a numerator with the denominator the harvest
 already records: fetched records vs the triage keep-list; parsed calcs vs the calc-units
-the fetch manifest says were staged.
+staged. "Fetched" and "staged" fold in the dataset's own records — a record parsed in an
+earlier run is done even though the global dataset-skip means it never re-enters the fetch
+manifest — so a resume that keeps the dataset (fetch manifests reset) still reports honest
+progress instead of parsed>fetched (>100%) and the whole dataset as untouched.
 """
 
 from __future__ import annotations
@@ -204,16 +207,26 @@ def status_report(
                         and isinstance(rid, str) and ":" not in rid):
                     fetch_reject_recids.add(rid)
 
-    # RECORD-level progress: a record is "attempted" once it is fetched (yielded VASP) or
-    # record-level rejected at fetch. This is the denominator status previously lacked —
-    # fetched_records alone hides the ~2/3 of the keep-list that is attempted-but-rejected.
-    attempted_recids = seen_recids | fetch_reject_recids
+    # RECORD-level progress: a record is "done" once it is fetched (yielded VASP) OR already
+    # present in the dataset, and "attempted" once done or record-level rejected at fetch. A
+    # record parsed in an EARLIER run is in the dataset but ABSENT from the current fetched
+    # manifests — the global dataset-skip means it is never re-fetched, and a clean restart
+    # (parts dir cleared) resets those per-part sidecars — so it must be counted done from the
+    # dataset, not the manifest. Without this, a resume that keeps the dataset reports the whole
+    # dataset as "untouched". In a single continuous run parsed_recids ⊆ seen_recids (a no-op).
+    done_recids = seen_recids | parsed_recids
+    attempted_recids = done_recids | fetch_reject_recids
     if keep_recids:  # count only records actually on the keep-list (no stale-recid overshoot)
         attempted_recids &= keep_recids
     n_attempted = len(attempted_recids)
-    n_fetched_in_keep = len(seen_recids & keep_recids) if keep_recids else n_fetched
-    n_fetch_rejected = max(0, n_attempted - n_fetched_in_keep)
+    n_done_in_keep = len(done_recids & keep_recids) if keep_recids else n_fetched
+    n_fetch_rejected = max(0, n_attempted - n_done_in_keep)
     n_untouched = max(0, n_keep - n_attempted)
+    # A calc cannot be parsed unless it was first fetched, so the dataset's parsed-calc count is
+    # a lower bound on calc-units fetched. Use it as the FETCH/PARSE denominator when the fetched
+    # manifest was reset on restart, else parsed/fetched exceeds 100% (the >100% artefact). In a
+    # continuous run n_calc_units (manifest sum) >= n_calcs, so this leaves that case unchanged.
+    n_calc_units_known = max(n_calc_units, n_calcs)
 
     return {
         "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -222,14 +235,14 @@ def status_report(
         "discover": {"candidates": n_candidates,
                      "files": [p.name for p in cand_files]},
         "triage": {"keep": n_keep},
-        "fetch": {"fetched_records": n_fetched, "to_fetch": n_keep,
-                  "pct": _pct(n_fetched, n_keep), "calc_units": n_calc_units},
+        "fetch": {"fetched_records": n_done_in_keep, "to_fetch": n_keep,
+                  "pct": _pct(n_done_in_keep, n_keep), "calc_units": n_calc_units_known},
         "records": {"keep": n_keep, "attempted": n_attempted,
-                    "pct": _pct(n_attempted, n_keep), "fetched": n_fetched_in_keep,
+                    "pct": _pct(n_attempted, n_keep), "fetched": n_done_in_keep,
                     "fetch_rejected": n_fetch_rejected, "untouched": n_untouched,
                     "with_frames": len(parsed_recids)},
-        "parse": {"calcs_parsed": n_calcs, "calc_units_fetched": n_calc_units,
-                  "pct": _pct(n_calcs, n_calc_units), "frames": n_frames,
+        "parse": {"calcs_parsed": n_calcs, "calc_units_fetched": n_calc_units_known,
+                  "pct": _pct(n_calcs, n_calc_units_known), "frames": n_frames,
                   "frames_with_forces": n_frames_forces},
         "store": {"shards": len(shards), "dataset_bytes": ds_bytes},
         "staging": {"walked": staging_walk,

@@ -2972,6 +2972,41 @@ def test_status_report_empty_dirs_no_crash(tmp_path):
     assert "n/a" in format_status(r)                                 # renders cleanly
 
 
+def test_status_restart_counts_dataset_as_fetched_not_untouched(tmp_path):
+    # After a clean restart that KEEPS the dataset but resets the fetch manifests (parts dir
+    # cleared), records parsed in earlier runs are in metadata.jsonl but ABSENT from the fetched
+    # manifests (the global dataset-skip never re-fetches them). status must count them as
+    # done/fetched — not report the dataset as "untouched" and parsed>fetched (>100%). This is
+    # the >16000% PARSE figure observed live after the PARTS=160 restart.
+    from zenodo_harvest.status import format_status, status_report
+
+    man, ds = tmp_path / "manifests", tmp_path / "dataset"
+    man.mkdir()
+    ds.mkdir()
+    (man / "keep.jsonl").write_text(
+        '{"recid":"1"}\n{"recid":"2"}\n{"recid":"3"}\n{"recid":"4"}\n')
+    # fetched manifest holds ONLY this run's new fetch (recid 4); 1,2,3 were fetched earlier
+    # and their sidecars were cleared on the restart.
+    parts = man / "keep.pipeline_parts"
+    parts.mkdir()
+    (parts / "keep.part-000.fetched.jsonl").write_text('{"recid":"4","n_calc_units":1}\n')
+    # dataset carries 1,2,3 from earlier runs (parsed, never re-fetched).
+    (ds / "metadata.jsonl").write_text(
+        '{"calc_id":"zenodo:1:a","provenance":{"record_id":"1"},"quality":{"n_frames":3,"n_frames_with_forces":3}}\n'
+        '{"calc_id":"zenodo:2:a","provenance":{"record_id":"2"},"quality":{"n_frames":3,"n_frames_with_forces":3}}\n'
+        '{"calc_id":"zenodo:3:a","provenance":{"record_id":"3"},"quality":{"n_frames":3,"n_frames_with_forces":3}}\n')
+
+    r = status_report(manifests_dir=man, raw_dir=tmp_path / "raw", dataset_dir=ds)
+
+    # 3 dataset + 1 fresh = 4 done; nothing untouched; parse never exceeds 100%.
+    assert r["fetch"]["fetched_records"] == 4 and r["fetch"]["pct"] == 100.0
+    assert r["fetch"]["calc_units"] == 3          # max(manifest 1, dataset 3) — dataset lower bound
+    assert r["records"]["attempted"] == 4 and r["records"]["untouched"] == 0
+    assert r["records"]["with_frames"] == 3
+    assert r["parse"]["calcs_parsed"] == 3 and r["parse"]["pct"] == 100.0   # not 300%
+    assert "16848" not in format_status(r) and "%" in format_status(r)
+
+
 def test_split_manifest_weighted_balances_calc_cost(tmp_path):
     # One calc-heavy record among many light ones: round-robin by RECORD piles the
     # parse cost onto whichever part the heavy record lands in, LPT by calc-unit count
