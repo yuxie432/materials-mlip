@@ -2909,10 +2909,11 @@ def test_status_report_counts_and_pct(tmp_path):
     parts.mkdir()
     (parts / "keep.part-000.fetched.jsonl").write_text('{"recid":"1","n_calc_units":2}\n')
     (parts / "keep.part-001.fetched.jsonl").write_text('{"recid":"2","n_calc_units":3}\n')
-    # parse: metadata line per calc; frames from quality
+    # parse: metadata line per calc; frames from quality. Both calcs belong to record "1"
+    # (fetched with 2 calc_units), so record "1" is parsed and record "2" is not.
     (ds / "metadata.jsonl").write_text(
-        '{"calc_id":"1::a","quality":{"n_frames":10,"n_frames_with_forces":8}}\n'
-        '{"calc_id":"1::b","quality":{"n_frames":5,"n_frames_with_forces":5}}\n')
+        '{"calc_id":"zenodo:1:a","provenance":{"record_id":"1"},"quality":{"n_frames":10,"n_frames_with_forces":8}}\n'
+        '{"calc_id":"zenodo:1:b","provenance":{"record_id":"1"},"quality":{"n_frames":5,"n_frames_with_forces":5}}\n')
     (ds / "shard-00000.extxyz.gz").write_bytes(b"gz")
     # rejections: fetch log (manifests) + parse log (dataset)
     (man / "rejections.jsonl").write_text('{"stage":"fetch","id":"9","reason":"archive_no_vasp"}\n')
@@ -2926,7 +2927,10 @@ def test_status_report_counts_and_pct(tmp_path):
     assert r["fetch"]["fetched_records"] == 2 and r["fetch"]["calc_units"] == 5
     assert abs(r["fetch"]["pct"] - (2 / 3 * 100)) < 1e-6
     assert r["parse"]["calcs_parsed"] == 2 and r["parse"]["frames"] == 15
-    assert abs(r["parse"]["pct"] - (2 / 5 * 100)) < 1e-6      # calcs vs calc_units
+    # parse% = this-run parsed calc-units / this-run fetched calc-units: record "1" parsed
+    # (its 2 fetched calc-units), record "2" not (its 3) -> 2/5.
+    assert r["parse"]["this_run_parsed"] == 2 and r["parse"]["this_run_fetched"] == 5
+    assert abs(r["parse"]["pct"] - (2 / 5 * 100)) < 1e-6
     assert r["store"]["shards"] == 1
     assert r["staging"]["files"] == 1 and r["staging"]["inodes"] == 2  # 1 file + the 111/ subdir
     assert r["errors"]["rejections"] == 2
@@ -2998,12 +3002,17 @@ def test_status_restart_counts_dataset_as_fetched_not_untouched(tmp_path):
 
     r = status_report(manifests_dir=man, raw_dir=tmp_path / "raw", dataset_dir=ds)
 
-    # 3 dataset + 1 fresh = 4 done; nothing untouched; parse never exceeds 100%.
+    # 3 dataset + 1 fresh = 4 done; nothing untouched (the dataset is not "untouched").
     assert r["fetch"]["fetched_records"] == 4 and r["fetch"]["pct"] == 100.0
-    assert r["fetch"]["calc_units"] == 3          # max(manifest 1, dataset 3) — dataset lower bound
     assert r["records"]["attempted"] == 4 and r["records"]["untouched"] == 0
     assert r["records"]["with_frames"] == 3
-    assert r["parse"]["calcs_parsed"] == 3 and r["parse"]["pct"] == 100.0   # not 300%
+    # calcs_parsed stays the CUMULATIVE dataset total (3); the FETCH calc_units count is
+    # cumulative too = parsed(3) + this-run backlog(1) = 4.
+    assert r["parse"]["calcs_parsed"] == 3 and r["fetch"]["calc_units"] == 4
+    # parse% is THIS-RUN progress: the 1 freshly-fetched calc-unit (record 4) is not yet in the
+    # dataset, so 0/1 parsed = 0% — a real backlog signal, NOT the >100% (or pinned-100%) artefact.
+    assert r["parse"]["this_run_fetched"] == 1 and r["parse"]["this_run_parsed"] == 0
+    assert r["parse"]["pct"] == 0.0
     assert "16848" not in format_status(r) and "%" in format_status(r)
 
 

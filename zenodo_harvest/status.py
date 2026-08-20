@@ -7,11 +7,13 @@ files — every manifest is flushed per line, and a torn final line is tolerated
 ``read_jsonl``. It only counts lines and walks directories; nothing here mutates state.
 
 Progress percentages come from pairing a numerator with the denominator the harvest
-already records: fetched records vs the triage keep-list; parsed calcs vs the calc-units
-staged. "Fetched" and "staged" fold in the dataset's own records — a record parsed in an
-earlier run is done even though the global dataset-skip means it never re-enters the fetch
-manifest — so a resume that keeps the dataset (fetch manifests reset) still reports honest
-progress instead of parsed>fetched (>100%) and the whole dataset as untouched.
+already records: fetched records vs the triage keep-list, and — to reveal the live
+fetch->parse backlog — THIS-RUN parsed calcs vs THIS-RUN fetched calc-units. Both fold in
+the dataset's own records: a record parsed in an earlier run is done even though the global
+dataset-skip means it never re-enters the fetch manifest, so record progress and the
+cumulative calc/frame totals survive a restart that resets the fetch manifests. Pairing the
+per-run parse count (not the cumulative one) with the per-run fetch count keeps parse% a
+moving backlog gauge instead of the >100% (or pinned-at-100%) artefact a scope mismatch gives.
 """
 
 from __future__ import annotations
@@ -137,6 +139,7 @@ def status_report(
     fetched_files = sorted({p for g in fglobs for p in manifests_dir.rglob(g)})
     n_fetched = n_calc_units = 0
     seen_recids: set[str] = set()
+    fetched_cu_by_recid: dict[str, int] = {}  # this-run calc-units per record (parse-lag numerator)
     for p in fetched_files:
         for rec in read_jsonl(p):
             recid = rec.get("recid")
@@ -145,7 +148,10 @@ def status_report(
             if recid:
                 seen_recids.add(recid)
             n_fetched += 1
-            n_calc_units += int(rec.get("n_calc_units", 0) or 0)
+            cu = int(rec.get("n_calc_units", 0) or 0)
+            n_calc_units += cu
+            if recid:
+                fetched_cu_by_recid[recid] = cu
 
     # PARSE — one metadata line per parsed calc; frames come from each calc's quality block.
     meta = dataset_dir / "metadata.jsonl"
@@ -222,11 +228,16 @@ def status_report(
     n_done_in_keep = len(done_recids & keep_recids) if keep_recids else n_fetched
     n_fetch_rejected = max(0, n_attempted - n_done_in_keep)
     n_untouched = max(0, n_keep - n_attempted)
-    # A calc cannot be parsed unless it was first fetched, so the dataset's parsed-calc count is
-    # a lower bound on calc-units fetched. Use it as the FETCH/PARSE denominator when the fetched
-    # manifest was reset on restart, else parsed/fetched exceeds 100% (the >100% artefact). In a
-    # continuous run n_calc_units (manifest sum) >= n_calcs, so this leaves that case unchanged.
-    n_calc_units_known = max(n_calc_units, n_calcs)
+    # PARSE progress must reveal the live fetch->parse backlog, so it pairs THIS-RUN parsed with
+    # THIS-RUN fetched. The fetched manifest is this-run-only after a restart (the global
+    # dataset-skip never re-fetches parsed records), so pairing CUMULATIVE parsed (n_calcs) with
+    # it gives the >100% artefact; pairing this-run parsed with it moves with the backlog as it
+    # should. this-run parsed = calc-units of this-run-fetched records now in the dataset (bounded
+    # above by n_calc_units, so pct <= 100). calcs_parsed/frames stay CUMULATIVE (dataset totals).
+    n_this_run_parsed = sum(cu for rid, cu in fetched_cu_by_recid.items() if rid in parsed_recids)
+    # Cumulative calc-units fetched (FETCH line) = parsed (definitely fetched) + this-run's
+    # not-yet-parsed backlog; never below n_calcs, so it survives the manifest reset.
+    n_fetched_calcs_cum = n_calcs + max(0, n_calc_units - n_this_run_parsed)
 
     return {
         "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -236,14 +247,15 @@ def status_report(
                      "files": [p.name for p in cand_files]},
         "triage": {"keep": n_keep},
         "fetch": {"fetched_records": n_done_in_keep, "to_fetch": n_keep,
-                  "pct": _pct(n_done_in_keep, n_keep), "calc_units": n_calc_units_known},
+                  "pct": _pct(n_done_in_keep, n_keep), "calc_units": n_fetched_calcs_cum},
         "records": {"keep": n_keep, "attempted": n_attempted,
                     "pct": _pct(n_attempted, n_keep), "fetched": n_done_in_keep,
                     "fetch_rejected": n_fetch_rejected, "untouched": n_untouched,
                     "with_frames": len(parsed_recids)},
-        "parse": {"calcs_parsed": n_calcs, "calc_units_fetched": n_calc_units_known,
-                  "pct": _pct(n_calcs, n_calc_units_known), "frames": n_frames,
-                  "frames_with_forces": n_frames_forces},
+        "parse": {"calcs_parsed": n_calcs, "frames": n_frames,
+                  "frames_with_forces": n_frames_forces,
+                  "this_run_fetched": n_calc_units, "this_run_parsed": n_this_run_parsed,
+                  "pct": _pct(n_this_run_parsed, n_calc_units)},
         "store": {"shards": len(shards), "dataset_bytes": ds_bytes},
         "staging": {"walked": staging_walk,
                     "bytes": raw_bytes, "files": raw_files, "dirs": raw_dirs,
@@ -284,8 +296,9 @@ def format_status(r: dict[str, Any]) -> str:
              f"RECORDS   attempted:  {rc['attempted']:,} / {rc['keep']:,}  ({_pctstr(rc['pct'])})"
              f"   fetched {rc['fetched']:,} · fetch-rejected {rc['fetch_rejected']:,} · "
              f"untouched {rc['untouched']:,}   in-dataset {rc['with_frames']:,}",
-             f"PARSE     parsed:     {p['calcs_parsed']:,} / {p['calc_units_fetched']:,} calc_units  "
-             f"({_pctstr(p['pct'])})   frames: {p['frames']:,}",
+             f"PARSE     parsed:     {p['calcs_parsed']:,} calcs   frames: {p['frames']:,}   "
+             f"(this run: {p['this_run_parsed']:,}/{p['this_run_fetched']:,} fetched parsed, "
+             f"{_pctstr(p['pct'])})",
              f"STORE     shards: {s['shards']:,}   dataset: {_h(s['dataset_bytes'])}"]
     if not st.get("walked", True):
         lines.append("STAGING   (walk skipped)  read /rds usage from: "
