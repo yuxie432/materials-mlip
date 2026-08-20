@@ -108,10 +108,12 @@ PARSE_WORKERS="${PARSE_WORKERS:-6}"
 # RAM guard: refuse to ATTEMPT a primary bigger than this (0 = attempt everything). pymatgen peak
 # RSS is ~10x the (uncompressed) primary size, and PARSE_WORKERS parse AT ONCE, so RAM ~=
 # PARSE_WORKERS x MAX_PRIMARY_BYTES x 10 must fit the job. NOMAD vaspruns are tiny (median 0.36 MB),
-# so 300 MB is ample and leaves RAM to spare for scaling workers later: 6 x 0.3 GB x 10 = 18 GiB <<
-# 8 cores x 6.76 GiB = 54 GiB. An over-cap primary is skipped (primary_too_large, non-terminal). If
-# you raise PARSE_WORKERS or cpus-per-task, keep PARSE_WORKERS x MAX_PRIMARY_BYTES x 10 under job RAM.
-MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-300000000}"
+# RAM budget: 6 workers x 0.8 GB x 10 (pymatgen peak ~10x the uncompressed primary) = 48 GiB <
+# 8 cores x 6.76 GiB = 54 GiB. 800 MB covers even large AIMD vaspruns so few are needlessly skipped
+# (primary_too_large is non-terminal + retryable on a bigger-RAM run). Keep PARSE_WORKERS x
+# MAX_PRIMARY_BYTES x 10 under the job RAM if you change either. (300 MB was a leftover from a
+# reverted 14-worker plan; 800 MB is right for 6 workers and avoids skipping big primaries.)
+MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-800000000}"
 # Hard-kill a single calc's parse after this many seconds (0 = off), so one non-terminating
 # pymatgen/ASE parse can't silently freeze the whole overlapped pipeline until wallclock.
 PARSE_TIMEOUT="${PARSE_TIMEOUT:-1200}"
