@@ -44,6 +44,14 @@ from .upload_zip import UploadNotAvailable, ZipMember
 
 logger = logging.getLogger(__name__)
 
+_FETCH_LOG_EVERY = 2000        # log a fetch-progress line every this many staged entries
+# Abort a per-entry fallback after this many CONSECUTIVE failures: when an upload's pre-packed
+# /uploads/{id}/raw 500s, its entries fall back to /entries/{id}/rawdir which 500s too, and each
+# 500 costs ~60 s of client retries — so a single bad upload (thousands of entries) would burn the
+# whole wallclock. Bailing after a short run of failures caps that at ~minutes; the skipped entries
+# retry on the next resume. (Root-caused from a live stall, 2026-08-20.)
+_FALLBACK_MAX_CONSEC_FAIL = 8
+
 
 class RecordTooBig(Exception):
     """One entry's own footprint exceeds the WHOLE disk/inode budget — no parse+purge can
@@ -550,7 +558,14 @@ def _fallback_entries(client: NomadClient, entries: list[dict[str, Any]], raw_di
                       budget: StagingBudget, want_outcar: bool, w: JsonlWriter,
                       done: set[str], rej: RejectionLogger, stats: dict[str, Any],
                       max_records: int | None) -> bool:
-    """Per-entry fallback for a list of entries. Returns True if the disk valve deferred."""
+    """Per-entry fallback for a list of entries. Returns True if the disk valve deferred.
+
+    Bails out after ``_FALLBACK_MAX_CONSEC_FAIL`` consecutive failures: an upload whose pre-packed
+    endpoint 500s falls back here in bulk, and if ``entries/{id}/rawdir`` is also erroring every
+    call costs ~60 s of retries — so without this a single bad upload would consume the whole
+    wallclock (root-caused from a live stall on upload 4P6jmC…, 2026-08-20). The skipped entries
+    stay out of ``done`` and are retried on the next resume."""
+    consec_fail = 0
     for entry in entries:
         eid = entry["entry_id"]
         if eid in done:
@@ -570,7 +585,14 @@ def _fallback_entries(client: NomadClient, entries: list[dict[str, Any]], raw_di
         except Exception as exc:  # noqa: BLE001 - one bad entry must not abort the run
             rej.reject("nomad_fetch", eid, "fetch_error", detail=f"{type(exc).__name__}: {exc}")
             stats["failed"] += 1
+            consec_fail += 1
+            if consec_fail >= _FALLBACK_MAX_CONSEC_FAIL:
+                logger.warning("per-entry fallback: %d consecutive failures (endpoint likely "
+                               "erroring for this upload); skipping its remaining entries this "
+                               "pass — they retry on the next resume", consec_fail)
+                break
             continue
+        consec_fail = 0                                    # a success clears the streak
         stats["per_entry_fallback"] += 1
         if fe is None:
             assert reject is not None
@@ -600,6 +622,10 @@ def _fallback_entries(client: NomadClient, entries: list[dict[str, Any]], raw_di
 # differs — the staged files, calc_units, availability and provenance are byte-identical either
 # way, so parse/store/verify are unaffected.
 _WHOLE_MAX_OVERFETCH = 2.0             # take whole iff its byte span <= 2x the wanted bytes (bloat_ratio >= 0.5)
+# ...AND the span is under this: one whole-stream is a SINGLE request, so a huge span (e.g. a 35 GB
+# low-bloat upload) is both un-resumable and prone to a mid-transfer IncompleteRead (observed live
+# on upload 9EW, 2026-08-20). Above this, use targeted (chunked ~256-member requests, resumable).
+_WHOLE_MAX_SPAN_BYTES = 2 << 30        # 2 GB
 
 
 def _wanted_members(members: dict[str, ZipMember], entries: list[dict[str, Any]],
@@ -635,6 +661,8 @@ def _should_whole_stream(members: dict[str, ZipMember], entries: list[dict[str, 
     ends = [m.local_offset + 30 + len(m.name) + upload_zip._LOCAL_EXTRA_PAD + m.comp_size
             for m in wanted]
     span = max(ends) - min(m.local_offset for m in wanted)
+    if span > _WHOLE_MAX_SPAN_BYTES:                # too big for one un-resumable request -> targeted
+        return False
     return span <= _WHOLE_MAX_OVERFETCH * wanted_bytes
 
 
@@ -664,6 +692,17 @@ def _fetch_upload(client: NomadClient, upload_id: str, entries: list[dict[str, A
     # member in one request.
     whole = _should_whole_stream(members, entries, want_outcar)
     stats["whole_uploads" if whole else "targeted_uploads"] += 1
+    # Per-upload log = the live signal of what the fetch is doing RIGHT NOW. A whole-stream pulls the
+    # whole upload in ONE request and commits its entries (manifest + stats["staged"]) only when that
+    # request FINISHES, so during a big low-bloat upload's multi-minute stream the counters and the
+    # periodic tracker look frozen even though members are landing in raw/. This line fires as the
+    # upload STARTS, so a long download is visible (and shows the whole/targeted choice + its size).
+    _wm = _wanted_members(members, entries, want_outcar)
+    _span_mb = (max((m.local_offset + 30 + len(m.name) + upload_zip._LOCAL_EXTRA_PAD + m.comp_size
+                     for m in _wm), default=0)
+                - min((m.local_offset for m in _wm), default=0)) / (1 << 20)
+    logger.info("fetch upload %s: %d entries via %s (%d members, span %.0f MB)", upload_id,
+                len(entries), "whole-stream" if whole else "targeted", len(_wm), _span_mb)
 
     pending: list[tuple[dict[str, Any], list[tuple[ZipMember, Path, str]], list[int]]] = []
     batch: list[tuple[ZipMember, Path]] = []
@@ -798,13 +837,26 @@ def fetch_candidates(client: NomadClient, in_path: str | Path,
 
     t0 = time.monotonic()
     req0 = getattr(client, "upload_gets", 0)
+    next_log = _FETCH_LOG_EVERY
     with JsonlWriter(out) as w:
         for up in order:
             if budget.full() or (max_records and stats["staged"] >= max_records):
                 break
             stats["uploads"] += 1
-            if _fetch_upload(client, up, groups[up], raw_dir, budget, want_outcar,
-                             w, done, rej, stats, max_records):
+            stop = _fetch_upload(client, up, groups[up], raw_dir, budget, want_outcar,
+                                 w, done, rej, stats, max_records)
+            # Continuous progress (like parse's) so the live fetch rate + whole/targeted split are
+            # visible WITHOUT waiting for the per-part summary at the end of this call.
+            if stats["staged"] >= next_log:
+                _e = max(time.monotonic() - t0, 1e-6)
+                logger.info("nomad fetch progress: %d staged | %.1f MB/s | %.2f req/s | "
+                            "%.1f entries/s | %d whole + %d targeted uploads",
+                            stats["staged"], stats["staged_bytes"] / (1 << 20) / _e,
+                            (getattr(client, "upload_gets", 0) - req0) / _e,
+                            stats["staged"] / _e, stats["whole_uploads"],
+                            stats["targeted_uploads"])
+                next_log += _FETCH_LOG_EVERY
+            if stop:
                 break
 
     rej.close()

@@ -535,10 +535,13 @@ def stream_members(client: "NomadClient", upload_id: str,
                     except (IndexError, ValueError):
                         start = first
             reader = _StreamReader(r.iter_content(1 << 20), start)
-            for m, dest in by_off:
+            n_total = len(by_off)
+            for i, (m, dest) in enumerate(by_off, 1):
                 if reader.pos > m.local_offset:        # overshot (should not happen when sorted)
                     continue
                 results[dest] = _extract_member_streaming(reader, m, dest)
+                if i % 1000 == 0:                      # intra-stream progress for a big upload
+                    logger.info("whole-stream %s: %d/%d members extracted", upload_id, i, n_total)
     except Exception as exc:  # noqa: BLE001 - transport failure -> per-entry fallback
         logger.warning("whole-stream fetch failed for upload %s: %s", upload_id, exc)
     return results

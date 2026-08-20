@@ -903,6 +903,34 @@ def test_should_whole_stream_false_for_few_entries():
     assert _should_whole_stream(members, entries, False) is False
 
 
+def test_should_whole_stream_false_for_huge_span():
+    # Low-bloat (contiguous) BUT a >2 GB span -> targeted: one whole-stream would be a single
+    # un-resumable request prone to a mid-transfer IncompleteRead (observed live on 35 GB upload 9EW).
+    members, entries, off = {}, [], 0
+    size = 8 << 20                                           # 8 MB members -> ~2.4 GB total/span
+    for i in range(300):
+        n = f"c{i}/vasprun.xml"
+        members[n] = _vm(n, off, size)
+        entries.append({"mainfile": n})
+        off += 40 + size
+    # span (~2.4 GB) is within the 2x-overfetch cap (wanted ~2.4 GB) but exceeds the 2 GB span cap:
+    assert _should_whole_stream(members, entries, False) is False
+
+
+def test_fallback_aborts_after_consecutive_failures(tmp_path):
+    # Upload absent from the zip store -> UploadNotAvailable -> per-entry fallback; every rawdir
+    # call raises -> the fallback must ABORT after _FALLBACK_MAX_CONSEC_FAIL, not grind all N
+    # (the live stall: one 500ing upload's thousands of entries burned the whole wallclock).
+    from nomad_harvest.harvest import _FALLBACK_MAX_CONSEC_FAIL
+    client = FakeUploadClient({}, entries={})               # no uploads, no per-entry data -> raises
+    keep = _upload_keep(tmp_path, [(f"E{i}", "U", f"c{i}/vasprun.xml") for i in range(30)])
+    out = tmp_path / "fetched.jsonl"
+    summary = fetch_candidates(client, keep, raw_dir=tmp_path / "raw", out_path=out)
+    assert summary["staged"] == 0
+    assert summary["failed"] <= _FALLBACK_MAX_CONSEC_FAIL + 1   # bailed early, did NOT process all 30
+    assert summary["failed"] < 30
+
+
 def test_fetch_candidates_whole_stream_path_stages_identically(tmp_path):
     # >256 low-bloat entries in ONE upload -> the chooser picks whole-stream: everything staged in
     # ONE request, byte-identical, with the SAME fetched.jsonl the targeted path would produce
