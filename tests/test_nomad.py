@@ -903,18 +903,33 @@ def test_should_whole_stream_false_for_few_entries():
     assert _should_whole_stream(members, entries, False) is False
 
 
-def test_should_whole_stream_false_for_huge_span():
-    # Low-bloat (contiguous) BUT a >2 GB span -> targeted: one whole-stream would be a single
-    # un-resumable request prone to a mid-transfer IncompleteRead (observed live on 35 GB upload 9EW).
+def test_should_whole_stream_true_for_huge_low_bloat_span():
+    # A large LOW-bloat upload (>2 GB span) now uses whole-stream: stream_members chunks it into
+    # bounded ~512 MB requests, so the huge span is no longer one fragile un-resumable request.
     members, entries, off = {}, [], 0
-    size = 8 << 20                                           # 8 MB members -> ~2.4 GB total/span
+    size = 8 << 20                                           # 8 MB members -> ~2.4 GB contiguous span
     for i in range(300):
         n = f"c{i}/vasprun.xml"
         members[n] = _vm(n, off, size)
         entries.append({"mainfile": n})
         off += 40 + size
-    # span (~2.4 GB) is within the 2x-overfetch cap (wanted ~2.4 GB) but exceeds the 2 GB span cap:
-    assert _should_whole_stream(members, entries, False) is False
+    assert _should_whole_stream(members, entries, False) is True
+
+
+def test_stream_members_chunks_large_span(tmp_path, monkeypatch):
+    # With a tiny chunk cap, a multi-member span splits into SEVERAL requests, each extracting its
+    # own members; all files still land byte-correct (a broken chunk would fail only its members).
+    members = {f"c{i}/vasprun.xml": (f"<modeling>{i}</modeling>".encode() * 20) for i in range(6)}
+    client = FakeUploadClient({"U": _make_zip(members)})
+    cd, _ = upload_zip.read_central_directory(client, "U")
+    items = [(cd[name], tmp_path / f"out{i}.xml") for i, name in enumerate(members)]
+    monkeypatch.setattr(upload_zip, "_STREAM_CHUNK_BYTES", 200)   # force ~1 member per chunk
+    client.upload_gets = 0
+    results = upload_zip.stream_members(client, "U", items)
+    assert all(results.values())
+    assert client.upload_gets >= 3                           # multiple chunk requests, not one
+    for (m, dest), name in zip(items, members):
+        assert dest.read_bytes() == members[name]
 
 
 def test_fallback_aborts_after_consecutive_failures(tmp_path):

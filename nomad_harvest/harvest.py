@@ -622,10 +622,9 @@ def _fallback_entries(client: NomadClient, entries: list[dict[str, Any]], raw_di
 # differs — the staged files, calc_units, availability and provenance are byte-identical either
 # way, so parse/store/verify are unaffected.
 _WHOLE_MAX_OVERFETCH = 2.0             # take whole iff its byte span <= 2x the wanted bytes (bloat_ratio >= 0.5)
-# ...AND the span is under this: one whole-stream is a SINGLE request, so a huge span (e.g. a 35 GB
-# low-bloat upload) is both un-resumable and prone to a mid-transfer IncompleteRead (observed live
-# on upload 9EW, 2026-08-20). Above this, use targeted (chunked ~256-member requests, resumable).
-_WHOLE_MAX_SPAN_BYTES = 2 << 30        # 2 GB
+# No absolute span cap: a large low-bloat upload IS fetched by whole-stream, but
+# `upload_zip.stream_members` splits it into bounded ~512 MB Range requests (chunked), so a huge
+# span is no longer one fragile un-resumable request (the 35 GB IncompleteRead on 9EW, 2026-08-20).
 
 
 def _wanted_members(members: dict[str, ZipMember], entries: list[dict[str, Any]],
@@ -661,8 +660,6 @@ def _should_whole_stream(members: dict[str, ZipMember], entries: list[dict[str, 
     ends = [m.local_offset + 30 + len(m.name) + upload_zip._LOCAL_EXTRA_PAD + m.comp_size
             for m in wanted]
     span = max(ends) - min(m.local_offset for m in wanted)
-    if span > _WHOLE_MAX_SPAN_BYTES:                # too big for one un-resumable request -> targeted
-        return False
     return span <= _WHOLE_MAX_OVERFETCH * wanted_bytes
 
 

@@ -54,10 +54,13 @@ _LFH_SIG = b"PK\x03\x04"           # local file header
 _ZIP64_SENTINEL32 = 0xFFFFFFFF
 _ZIP64_SENTINEL16 = 0xFFFF
 
-# How much of the zip tail to read for the central directory. A ~200k-member upload has a
-# ~15-20 MB central directory, so 48 MB covers the common case in a single suffix-range read;
-# a rare larger one triggers one extra explicit read (see read_central_directory).
-_TAIL_BYTES = 48 << 20
+# How much of the zip TAIL to read for the central directory. ADAPTIVE: the EOCD (+ ZIP64 EOCD)
+# and, for most uploads, the whole central directory sit in the last few hundred KB, so we try a
+# small tail FIRST (one cheap read) and only grow to the large tail if the EOCD isn't found there;
+# the CD itself is then read exactly by offset if it extends before the tail. This avoids pulling
+# ~48 MB per upload when the real CD is tiny (the majority) — see read_central_directory.
+_CD_TAIL_SMALL = 1 << 20       # 1 MB: captures EOCD + ZIP64 EOCD + a small CD in one read
+_CD_TAIL_LARGE = 48 << 20      # grow to this only if the EOCD isn't in the small tail
 # Multi-range request budget. NOMAD's proxy caps the Range HEADER at ~8 KB (~350 compact
 # ranges: an offset in a >4 GB ZIP64 is ~11 digits, so a range is ~24 bytes). 256 keeps the
 # header ~6.1 KB — safely under — while cutting member-requests ~28% vs the old 200 (every
@@ -66,6 +69,11 @@ _TAIL_BYTES = 48 << 20
 # bigger than this is streamed to disk on its own instead.
 MAX_RANGES_PER_REQUEST = 256
 MAX_BATCH_BYTES = 96 << 20
+# Whole-stream request-size cap: one streaming Range request covers members spanning at most this
+# many bytes, so a large low-bloat upload is fetched in several bounded, independently-recoverable
+# requests rather than ONE giant one (a 35 GB single request broke mid-transfer live — upload 9EW,
+# 2026-08-20). A broken chunk fails only its own members (→ per-entry fallback), never the upload.
+_STREAM_CHUNK_BYTES = 512 << 20  # 512 MB
 # Room for a local-file-header extra field (observed 0; padded so a rare non-zero elen still
 # lands the member's data inside the fetched range).
 _LOCAL_EXTRA_PAD = 512
@@ -145,24 +153,31 @@ def read_central_directory(client: "NomadClient", upload_id: str
                            ) -> tuple[dict[str, ZipMember], int]:
     """Enumerate an upload's zip members over Range: ``({name: ZipMember}, total_size)``.
 
-    One suffix-range read grabs the tail (and the total size from ``Content-Range``); the
-    central directory usually sits inside it, so this is normally ONE request per upload. A
-    rare larger central directory triggers one extra explicit read. Handles both 32-bit and
-    ZIP64 archives (NOMAD's big uploads are >4 GB → ZIP64). Raises :class:`UploadNotAvailable`
-    if the tail/EOCD cannot be read or parsed.
+    ADAPTIVE tail: try a small (``_CD_TAIL_SMALL``) suffix read first — it captures the EOCD (and
+    ZIP64 EOCD) plus, for most uploads, the whole central directory in ONE cheap request — and only
+    grow to ``_CD_TAIL_LARGE`` if the EOCD isn't in the small tail. The CD itself is then read
+    exactly by offset if it extends before the fetched tail. Handles both 32-bit and ZIP64 archives
+    (NOMAD's big uploads are >4 GB → ZIP64). Raises :class:`UploadNotAvailable` if the tail/EOCD
+    cannot be read or parsed. (Avoids pulling ~48 MB per upload when the real CD is tiny.)
     """
-    try:
-        with client.upload_raw_get(upload_id, f"bytes=-{_TAIL_BYTES}") as r:
-            cr = r.headers.get("Content-Range", "")
-            blob = r.content
-    except Exception as exc:  # noqa: BLE001 - HTTPError (not published), network, etc.
-        raise UploadNotAvailable(f"{upload_id}: tail read failed: {exc}") from exc
-    if "/" not in cr:
-        raise UploadNotAvailable(f"{upload_id}: no Content-Range (Range not honoured)")
-    total = int(cr.split("/")[-1])
-    blob_start = total - len(blob)
-
-    idx = blob.rfind(_EOCD_SIG)
+    blob = b""
+    total = 0
+    blob_start = 0
+    idx = -1
+    for tail in (_CD_TAIL_SMALL, _CD_TAIL_LARGE):
+        try:
+            with client.upload_raw_get(upload_id, f"bytes=-{tail}") as r:
+                cr = r.headers.get("Content-Range", "")
+                blob = r.content
+        except Exception as exc:  # noqa: BLE001 - HTTPError (not published), network, etc.
+            raise UploadNotAvailable(f"{upload_id}: tail read failed: {exc}") from exc
+        if "/" not in cr:
+            raise UploadNotAvailable(f"{upload_id}: no Content-Range (Range not honoured)")
+        total = int(cr.split("/")[-1])
+        blob_start = total - len(blob)
+        idx = blob.rfind(_EOCD_SIG)
+        if idx >= 0 or len(blob) >= total:   # found it, or we already read the whole (small) file
+            break
     if idx < 0:
         raise UploadNotAvailable(f"{upload_id}: no EOCD in tail")
     # EOCD record: [12:16] central-directory size, [16:20] central-directory offset.
@@ -172,10 +187,13 @@ def read_central_directory(client: "NomadClient", upload_id: str
         if loc[:4] != _EOCD64_LOC_SIG:
             raise UploadNotAvailable(f"{upload_id}: zip64 locator missing")
         z64_off = struct.unpack("<Q", loc[8:16])[0]
-        try:
-            z = _read_range(client, upload_id, z64_off, z64_off + 55)
-        except Exception as exc:  # noqa: BLE001
-            raise UploadNotAvailable(f"{upload_id}: zip64 EOCD read failed: {exc}") from exc
+        if z64_off >= blob_start:            # the ZIP64 EOCD record is usually inside the tail too
+            z = blob[z64_off - blob_start:z64_off - blob_start + 56]
+        else:
+            try:
+                z = _read_range(client, upload_id, z64_off, z64_off + 55)
+            except Exception as exc:  # noqa: BLE001
+                raise UploadNotAvailable(f"{upload_id}: zip64 EOCD read failed: {exc}") from exc
         if z[:4] != _EOCD64_SIG:
             raise UploadNotAvailable(f"{upload_id}: zip64 EOCD missing")
         cd_size, cd_off = struct.unpack("<QQ", z[40:56])
@@ -505,23 +523,20 @@ def _extract_member_streaming(reader: _StreamReader, m: ZipMember, dest: Path) -
         raise
 
 
-def stream_members(client: "NomadClient", upload_id: str,
-                   items: list[tuple[ZipMember, Path]]) -> dict[Path, bool]:
-    """Extract the given members from the upload's pre-packed zip in ONE streaming Range request.
+def _member_end(m: ZipMember) -> int:
+    """File offset just past member ``m``'s data (pads the local extra field — see _LOCAL_EXTRA_PAD)."""
+    return m.local_offset + 30 + len(m.name) + _LOCAL_EXTRA_PAD + m.comp_size
 
-    Requests the single byte span covering all the wanted members and pulls each out of the
-    stream by offset (bloat bytes between them are discarded, never written), each CRC-verified.
-    Returns ``{dest: ok}`` for every item — a False (or a whole-request transport failure, which
-    marks every item False) lets the caller fall back to the per-entry path, so coverage is never
-    lost. This is the 1-request-per-upload alternative to :func:`fetch_members` for low-bloat
-    uploads, chosen by ``harvest._should_whole_stream``."""
-    results: dict[Path, bool] = {dest: False for _m, dest in items}
-    if not items:
-        return results
-    by_off = sorted(items, key=lambda mp: mp[0].local_offset)
-    first = by_off[0][0].local_offset
-    lm = by_off[-1][0]
-    last_end = lm.local_offset + 30 + len(lm.name) + _LOCAL_EXTRA_PAD + lm.comp_size
+
+def _stream_group(client: "NomadClient", upload_id: str,
+                  group: list[tuple[ZipMember, Path]], results: dict[Path, bool]) -> int:
+    """Fetch ONE contiguous span (the members in ``group``) in a single streaming Range request,
+    extracting each member from the stream by offset. On any transport failure the group's members
+    are left False in ``results`` (the caller falls back per-entry), so a broken chunk loses only
+    that chunk — never the whole upload. Returns the number of members successfully written."""
+    first = group[0][0].local_offset
+    last_end = _member_end(group[-1][0])
+    ok = 0
     try:
         with client.upload_raw_get(upload_id, f"bytes={first}-{last_end}", stream=True) as r:
             start = first
@@ -535,13 +550,53 @@ def stream_members(client: "NomadClient", upload_id: str,
                     except (IndexError, ValueError):
                         start = first
             reader = _StreamReader(r.iter_content(1 << 20), start)
-            n_total = len(by_off)
-            for i, (m, dest) in enumerate(by_off, 1):
+            for m, dest in group:
                 if reader.pos > m.local_offset:        # overshot (should not happen when sorted)
                     continue
-                results[dest] = _extract_member_streaming(reader, m, dest)
-                if i % 1000 == 0:                      # intra-stream progress for a big upload
-                    logger.info("whole-stream %s: %d/%d members extracted", upload_id, i, n_total)
-    except Exception as exc:  # noqa: BLE001 - transport failure -> per-entry fallback
-        logger.warning("whole-stream fetch failed for upload %s: %s", upload_id, exc)
+                if _extract_member_streaming(reader, m, dest):
+                    results[dest] = True
+                    ok += 1
+    except Exception as exc:  # noqa: BLE001 - transport failure -> per-entry fallback for THIS chunk
+        logger.warning("whole-stream chunk failed for upload %s: %s", upload_id, exc)
+    return ok
+
+
+def stream_members(client: "NomadClient", upload_id: str,
+                   items: list[tuple[ZipMember, Path]]) -> dict[Path, bool]:
+    """Extract the given members from the upload's pre-packed zip by streaming, in one or more
+    bounded Range requests.
+
+    The members are sorted by offset and split into consecutive CHUNKS whose byte span stays under
+    :data:`_STREAM_CHUNK_BYTES`; each chunk is ONE streaming request, pulling its members out of the
+    stream by offset (interior bloat is discarded, never written), each CRC-verified. A huge
+    low-bloat upload is therefore fetched as several ~512 MB requests rather than one giant one, so a
+    mid-transfer break (or a wallclock kill) costs only the current chunk, not the whole upload.
+    Returns ``{dest: ok}`` for every item — a False lets the caller fall back per-entry, so coverage
+    is never lost. This is the few-requests-per-upload alternative to :func:`fetch_members` for
+    low-bloat uploads, chosen by ``harvest._should_whole_stream``."""
+    results: dict[Path, bool] = {dest: False for _m, dest in items}
+    if not items:
+        return results
+    by_off = sorted(items, key=lambda mp: mp[0].local_offset)
+    # Split into consecutive groups whose span stays under _STREAM_CHUNK_BYTES (a single member
+    # larger than that forms its own group — one unavoidable request).
+    groups: list[list[tuple[ZipMember, Path]]] = []
+    cur: list[tuple[ZipMember, Path]] = []
+    cur_start = 0
+    for m, dest in by_off:
+        if cur and _member_end(m) - cur_start > _STREAM_CHUNK_BYTES:
+            groups.append(cur)
+            cur = []
+        if not cur:
+            cur_start = m.local_offset
+        cur.append((m, dest))
+    if cur:
+        groups.append(cur)
+
+    total_ok = 0
+    for gi, group in enumerate(groups, 1):
+        total_ok += _stream_group(client, upload_id, group, results)
+        if len(groups) > 1:                            # progress for a multi-chunk (large) upload
+            logger.info("whole-stream %s: chunk %d/%d done (%d/%d members ok)",
+                        upload_id, gi, len(groups), total_ok, len(items))
     return results
