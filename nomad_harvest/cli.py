@@ -85,7 +85,10 @@ def _fetch(client: NomadClient, in_path: str, out_path: str | None, raw_dir: str
     return fetch_candidates(client, in_path, raw_dir=raw_dir, out_path=out_path,
                             want_outcar=args.want_outcar, max_records=max_records,
                             max_disk_bytes=(args.max_disk_bytes or None),
-                            max_disk_files=(args.max_disk_files or None))
+                            max_disk_files=(args.max_disk_files or None),
+                            # global-skip: don't re-download entries already in the dataset (makes a
+                            # PARTS change between runs free of re-fetch). None if the flag is absent.
+                            dataset_dir=getattr(args, "dataset_dir", None))
 
 
 def main(argv: list[str] | None = None) -> int:

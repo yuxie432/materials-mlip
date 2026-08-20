@@ -873,47 +873,42 @@ def _vm(name, off, size):
     return upload_zip.ZipMember(name, 0, size, size, 0, off)   # STORED member at a synthetic offset
 
 
+_FAST = 50 << 20      # MB/s where the fetch is throttle-bound (favours whole)
+_SLOW = 1 << 20       # MB/s where the fetch is transfer-bound (favours targeted)
+
+
+def _spaced_members(n, size, stride):
+    """n members of `size` bytes at offsets 0, stride, 2*stride, ... (stride>size => interior bloat)."""
+    members, entries = {}, []
+    for i in range(n):
+        name = f"c{i}/vasprun.xml"
+        members[name] = _vm(name, i * stride, size)
+        entries.append({"mainfile": name})
+    return members, entries
+
+
 def test_should_whole_stream_true_for_low_bloat_high_entry():
-    members, entries, off = {}, [], 0
-    for i in range(300):                                     # 300 contiguous vaspruns: span ~= wanted
-        n = f"c{i}/vasprun.xml"
-        members[n] = _vm(n, off, 1000)
-        entries.append({"mainfile": n})
-        off += 40 + 1000
-    assert _should_whole_stream(members, entries, False) is True
+    members, entries = _spaced_members(300, 1000, 1040)      # contiguous (span ~= wanted): whole wins
+    assert _should_whole_stream(members, entries, False, _FAST) is True
 
 
 def test_should_whole_stream_false_for_high_bloat():
-    members, entries, off = {}, [], 0
-    for i in range(300):                                     # vaspruns 2 MB apart -> ~600 MB span
-        n = f"c{i}/vasprun.xml"
-        members[n] = _vm(n, off, 1000)
-        entries.append({"mainfile": n})
-        off += 40 + 1000 + 2_000_000
-    assert _should_whole_stream(members, entries, False) is False
+    members, entries = _spaced_members(300, 1000, 2_001_040)  # vaspruns ~2 MB apart -> ~600 MB span
+    assert _should_whole_stream(members, entries, False, _FAST) is False   # even fast: too much bloat
 
 
 def test_should_whole_stream_false_for_few_entries():
-    members, entries, off = {}, [], 0
-    for i in range(50):                                      # <= MAX_RANGES_PER_REQUEST: 1 batch
-        n = f"c{i}/vasprun.xml"
-        members[n] = _vm(n, off, 1000)
-        entries.append({"mainfile": n})
-        off += 40 + 1000
-    assert _should_whole_stream(members, entries, False) is False
+    members, entries = _spaced_members(50, 1000, 1040)       # <= MAX_RANGES_PER_REQUEST: 1 batch
+    assert _should_whole_stream(members, entries, False, _FAST) is False
 
 
-def test_should_whole_stream_true_for_huge_low_bloat_span():
-    # A large LOW-bloat upload (>2 GB span) now uses whole-stream: stream_members chunks it into
-    # bounded ~512 MB requests, so the huge span is no longer one fragile un-resumable request.
-    members, entries, off = {}, [], 0
-    size = 8 << 20                                           # 8 MB members -> ~2.4 GB contiguous span
-    for i in range(300):
-        n = f"c{i}/vasprun.xml"
-        members[n] = _vm(n, off, size)
-        entries.append({"mainfile": n})
-        off += 40 + size
-    assert _should_whole_stream(members, entries, False) is True
+def test_should_whole_stream_bandwidth_dependent_for_medium_bloat():
+    # THE fix: a MEDIUM-bloat upload (span ~1.35x wanted) is a whole-stream when the server is fast
+    # (throttle-bound: fewer requests win) but TARGETED when it's slow (transfer-bound: fewer bytes
+    # win — whole would over-fetch the interior bloat). 300 x 400 KB members, 540 KB stride.
+    members, entries = _spaced_members(300, 400_000, 540_000)   # wanted 120 MB, span ~162 MB (1.35x)
+    assert _should_whole_stream(members, entries, False, _FAST) is True     # fast -> whole
+    assert _should_whole_stream(members, entries, False, _SLOW) is False    # slow -> targeted
 
 
 def test_stream_members_chunks_large_span(tmp_path, monkeypatch):
@@ -944,6 +939,25 @@ def test_fallback_aborts_after_consecutive_failures(tmp_path):
     assert summary["staged"] == 0
     assert summary["failed"] <= _FALLBACK_MAX_CONSEC_FAIL + 1   # bailed early, did NOT process all 30
     assert summary["failed"] < 30
+
+
+def test_fetch_candidates_global_dataset_skip(tmp_path):
+    # An entry already parsed into the dataset is skipped globally (not re-downloaded), even though
+    # it's not in this part's fetched.jsonl — the fix that makes a PARTS change free of re-fetch.
+    zbytes = _make_zip({"a/vasprun.xml": b"<modeling>a</modeling>",
+                        "b/vasprun.xml": b"<modeling>b</modeling>"})
+    client = FakeUploadClient({"U": zbytes})
+    keep = _upload_keep(tmp_path, [("A", "U", "a/vasprun.xml"), ("B", "U", "b/vasprun.xml")])
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    write_jsonl(dataset / "metadata.jsonl",                     # entry A already parsed
+                [{"calc_id": "nomad:A:0", "provenance": {"source": "nomad", "record_id": "A"}}])
+    out = tmp_path / "fetched.jsonl"
+    summary = fetch_candidates(client, keep, raw_dir=tmp_path / "raw", out_path=out,
+                               dataset_dir=dataset)
+    assert summary["dataset_skipped"] == 1                      # A skipped because it's in the dataset
+    recs = {r["recid"] for r in read_jsonl(out)}
+    assert recs == {"B"}                                        # only B fetched; A NOT re-downloaded
 
 
 def test_fetch_candidates_whole_stream_path_stages_identically(tmp_path):

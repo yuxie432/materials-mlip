@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import shutil
 import time
@@ -607,24 +608,19 @@ def _fallback_entries(client: NomadClient, entries: list[dict[str, Any]], raw_di
 
 # Whole-vs-targeted chooser. The /uploads/{id}/raw endpoint costs ~5 s per request (1 in-flight
 # per IP), so TARGETED needs ceil(n/256)+1 throttled requests per upload, while a WHOLE-STREAM is
-# ONE transfer-bound request spanning every wanted member (upload_zip.stream_members). Streaming
-# also pays for the interior bloat bytes between the wanted members, so it only wins when the
-# wanted members are a large-enough fraction of their byte span (i.e. a LOW-bloat upload). We
-# decide per upload by a RATE-INDEPENDENT byte comparison. Whole-stream reads SEQUENTIALLY off disk,
-# so it is at least as fast PER BYTE as targeted's scattered-seek multi-range (usually faster) AND
-# uses ~2 requests vs ceil(n/256)+1; its one cost is streaming the interior bloat. So take whole
-# unless it would over-fetch more than _WHOLE_MAX_OVERFETCH x the wanted bytes. Rate-independent is
-# deliberate: the achieved MB/s swings 4-37 with NOMAD load (single-shot probes gave whole:targeted
-# ratios of 0.5x AND 5.9x minutes apart), so no measured rate is trustworthy; the cap instead BOUNDS
-# the worst case (whole <= _WHOLE_MAX_OVERFETCH x the wanted-byte time even on a slow server) while
-# still sending the ~90% of entries in low-bloat uploads (bloat_ratio >= 0.5; survey 2026-08-19) down
-# the 1-request whole path. Only the FETCH mechanism
-# differs — the staged files, calc_units, availability and provenance are byte-identical either
-# way, so parse/store/verify are unaffected.
-_WHOLE_MAX_OVERFETCH = 2.0             # take whole iff its byte span <= 2x the wanted bytes (bloat_ratio >= 0.5)
-# No absolute span cap: a large low-bloat upload IS fetched by whole-stream, but
-# `upload_zip.stream_members` splits it into bounded ~512 MB Range requests (chunked), so a huge
-# span is no longer one fragile un-resumable request (the 35 GB IncompleteRead on 9EW, 2026-08-20).
+# a few transfer-bound requests spanning every wanted member (upload_zip.stream_members, chunked).
+# Whole-stream transfers the whole member SPAN (wanted + interior bloat); targeted transfers only
+# the WANTED bytes. So the trade-off is BANDWIDTH-DEPENDENT (root-caused live 2026-08-20): at a
+# HIGH transfer rate the fetch is throttle-bound, so whole's ~few requests beat targeted's
+# ceil(n/256)+1 and it wins; at a LOW rate the fetch is transfer-bound, so whole's ~1.35x extra
+# bloat bytes make it SLOWER than targeted, which moves fewer bytes. We therefore compare modelled
+# wall-times at the CURRENT achieved rate (`rate_bps`, an aggregate the fetch loop feeds in): a
+# slow server automatically favours targeted, a fast one favours whole. This fixes the earlier
+# rate-independent cap, which over-fetched (chose whole) on a slow server. Only the FETCH mechanism
+# differs; staged files, calc_units, availability and provenance are byte-identical either way.
+# No absolute span cap: stream_members chunks a big span into bounded ~512 MB requests.
+_DEFAULT_RATE_BPS = 4 << 20            # initial rate guess before any upload completes (favours targeted)
+_MIN_RATE_BPS = 1 << 20                # floor so a 0/tiny estimate can't blow up the wall-time model
 
 
 def _wanted_members(members: dict[str, ZipMember], entries: list[dict[str, Any]],
@@ -646,10 +642,13 @@ def _wanted_members(members: dict[str, ZipMember], entries: list[dict[str, Any]]
 
 
 def _should_whole_stream(members: dict[str, ZipMember], entries: list[dict[str, Any]],
-                         want_outcar: bool) -> bool:
-    """True if this upload is cheaper fetched as ONE whole-stream than as targeted multi-range
-    requests (see the module comment above). False for any upload needing only a single member
-    batch (targeted is already minimal) or whose wanted members are too sparse in the zip."""
+                         want_outcar: bool, rate_bps: float) -> bool:
+    """True if this upload is cheaper fetched as a (chunked) whole-stream than as targeted
+    multi-range requests, at the CURRENT achieved transfer rate ``rate_bps`` (see the module
+    comment above). Compares modelled wall-times: whole = one transfer-bound stream over the member
+    SPAN; targeted = ceil(n/256)+1 requests, each ≥ the ~5 s throttle, moving only the WANTED bytes.
+    At a low rate the extra bloat bytes make whole lose; at a high rate the saved requests make it
+    win. False for an upload needing only one member batch (targeted is already minimal)."""
     wanted = _wanted_members(members, entries, want_outcar)
     n = len(wanted)
     if n <= upload_zip.MAX_RANGES_PER_REQUEST:          # <=1 targeted batch already: whole saves ~nothing
@@ -660,13 +659,18 @@ def _should_whole_stream(members: dict[str, ZipMember], entries: list[dict[str, 
     ends = [m.local_offset + 30 + len(m.name) + upload_zip._LOCAL_EXTRA_PAD + m.comp_size
             for m in wanted]
     span = max(ends) - min(m.local_offset for m in wanted)
-    return span <= _WHOLE_MAX_OVERFETCH * wanted_bytes
+    rate = max(rate_bps, _MIN_RATE_BPS)
+    interval = NomadClient.UPLOAD_MIN_INTERVAL
+    n_req_targeted = math.ceil(n / upload_zip.MAX_RANGES_PER_REQUEST) + 1
+    t_targeted = max(n_req_targeted * interval, wanted_bytes / rate)   # throttle- OR transfer-bound
+    t_whole = interval + span / rate                                  # one transfer-bound stream
+    return t_whole < t_targeted
 
 
 def _fetch_upload(client: NomadClient, upload_id: str, entries: list[dict[str, Any]],
                   raw_dir: Path, budget: StagingBudget, want_outcar: bool, w: JsonlWriter,
                   done: set[str], rej: RejectionLogger, stats: dict[str, Any],
-                  max_records: int | None) -> bool:
+                  max_records: int | None, rate_bps: float = _DEFAULT_RATE_BPS) -> bool:
     """Fetch one upload's kept entries by targeted extraction from its pre-packed zip.
 
     Reads the upload's central directory once, admits each entry against the disk/inode valve
@@ -687,7 +691,7 @@ def _fetch_upload(client: NomadClient, upload_id: str, entries: list[dict[str, A
     # many entries) or targeted multi-range batches (high-bloat or few entries). When streaming,
     # the batch is NOT flushed mid-loop (below) — the single final flush spans every admitted
     # member in one request.
-    whole = _should_whole_stream(members, entries, want_outcar)
+    whole = _should_whole_stream(members, entries, want_outcar, rate_bps)
     stats["whole_uploads" if whole else "targeted_uploads"] += 1
     # Per-upload log = the live signal of what the fetch is doing RIGHT NOW. A whole-stream pulls the
     # whole upload in ONE request and commits its entries (manifest + stats["staged"]) only when that
@@ -777,13 +781,28 @@ def _fetch_upload(client: NomadClient, upload_id: str, entries: list[dict[str, A
     return deferred
 
 
+def _dataset_record_ids(dataset_dir: str | Path) -> set[str]:
+    """entry_ids already parsed into the dataset (``provenance.record_id`` in ``metadata.jsonl``),
+    for the global fetch-skip. Empty set if there is no dataset yet."""
+    ids: set[str] = set()
+    meta = Path(dataset_dir) / "metadata.jsonl"
+    if not meta.is_file():
+        return ids
+    for rec in read_jsonl(meta):
+        rid = (rec.get("provenance") or {}).get("record_id")
+        if rid:
+            ids.add(str(rid))
+    return ids
+
+
 def fetch_candidates(client: NomadClient, in_path: str | Path,
                      raw_dir: str | Path = config.RAW_DIR,
                      out_path: str | Path | None = None,
                      want_outcar: bool = False,
                      max_records: int | None = None,
                      max_disk_bytes: int | None = None,
-                     max_disk_files: int | None = None) -> dict[str, Any]:
+                     max_disk_files: int | None = None,
+                     dataset_dir: str | Path | None = None) -> dict[str, Any]:
     """Stage 2: pull each candidate's mainfile out of its upload's PRE-PACKED zip.
 
     The default (and only) NOMAD fetch path. Groups the input's entries by ``upload_id`` and
@@ -808,6 +827,17 @@ def fetch_candidates(client: NomadClient, in_path: str | Path,
     out = Path(out_path) if out_path else manifests / "nomad_fetched.jsonl"
     out.parent.mkdir(parents=True, exist_ok=True)
     done = {rec["recid"] for rec in read_jsonl(out)} if out.is_file() else set()
+    # GLOBAL skip: also skip any entry whose calc is already in the dataset. The per-part
+    # `.fetched.jsonl` resume only recognises entries done under the SAME PARTS split, so changing
+    # PARTS between runs would otherwise re-download everything already parsed. Skipping by the
+    # dataset's own record_ids makes a PARTS change (and any manifest mismatch) free of re-fetch —
+    # a parsed entry is never re-downloaded. (Only skips PARSED entries; a fetched-but-unparsed
+    # backlog is not in the dataset and still resumes normally.)
+    n_dataset_skip = 0
+    if dataset_dir is not None:
+        parsed_ids = _dataset_record_ids(dataset_dir)
+        n_dataset_skip = len(parsed_ids - done)
+        done |= parsed_ids
     rej = RejectionLogger(manifests / "nomad_fetch_rejections.jsonl")
     stats: dict[str, Any] = {"records": 0, "staged": 0, "failed": 0, "skipped_existing": 0,
                              "uploads": 0, "whole_uploads": 0, "targeted_uploads": 0,
@@ -840,8 +870,13 @@ def fetch_candidates(client: NomadClient, in_path: str | Path,
             if budget.full() or (max_records and stats["staged"] >= max_records):
                 break
             stats["uploads"] += 1
+            # Feed the CURRENT achieved transfer rate (aggregate over this call) to the whole-vs-
+            # targeted chooser, so it prefers targeted on a slow server and whole on a fast one.
+            _el = time.monotonic() - t0
+            rate_bps = (stats["staged_bytes"] / _el if stats["staged_bytes"] > 0 and _el > 1
+                        else float(_DEFAULT_RATE_BPS))
             stop = _fetch_upload(client, up, groups[up], raw_dir, budget, want_outcar,
-                                 w, done, rej, stats, max_records)
+                                 w, done, rej, stats, max_records, rate_bps)
             # Continuous progress (like parse's) so the live fetch rate + whole/targeted split are
             # visible WITHOUT waiting for the per-part summary at the end of this call.
             if stats["staged"] >= next_log:
@@ -862,6 +897,7 @@ def fetch_candidates(client: NomadClient, in_path: str | Path,
         stats["stopped_on"] = budget.pause or budget.hit_limit
     stats.update(budget.stats())
     stats["items_over_whole_budget"] = budget.unfittable
+    stats["dataset_skipped"] = n_dataset_skip     # entries skipped because already in the dataset
     # Throughput diagnostics (the answer to "download- or request-limited?"): MB/s is the achieved
     # transfer rate; req/s against the ~0.2 (1-per-5s) throttle ceiling shows whether the endpoint's
     # rate limit or raw bandwidth is the bound; whole vs targeted shows the hybrid is engaging.

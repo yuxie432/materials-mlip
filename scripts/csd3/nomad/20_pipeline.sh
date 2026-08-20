@@ -64,11 +64,19 @@ cd "${SLURM_SUBMIT_DIR:-.}"
 # --------------------------------------------------------------------------------
 
 # ---- HARVEST PARAMETERS ---------------------------------------------------------
-PARTS="${PARTS:-40}"                   # batches; each part holds WHOLE uploads (split_by_upload),
-                                       # fetched serially. Default 40 suits a scoped run; for the
-                                       # FULL 7.1M set use PARTS>=80 so each part fits the inode
-                                       # budget in one window (else it's parsed+purged in instalments
-                                       # — still correct, just less fetch/parse overlap).
+PARTS="${PARTS:-160}"                  # batches; each part holds WHOLE uploads (split_by_upload).
+                                       # Sized so a part is MUCH smaller than the inode valve, so it
+                                       # fetches in one window AND leaves valve headroom for the next
+                                       # part to fetch WHILE this one parses+purges (real overlap).
+                                       # 7.1M/160 = ~44k entries = ~176k inodes << the 500k valve
+                                       # (leaves ~324k for the concurrent next part). PARTS=40 gave
+                                       # 708k-inode parts > the valve, so each was fetched in one
+                                       # long valve-filling installment with NO concurrent parse
+                                       # (the "parse frozen for hours" symptom). Changing PARTS is
+                                       # data-safe (dedup by calc_id; every upload still assigned to
+                                       # exactly one part) and, with fetch's global dataset-skip, does
+                                       # NOT re-download already-parsed entries. Higher (e.g. 256) is
+                                       # fine too; the only cost is a little more per-part overhead.
 # DISK/INODE PARTITION (fixed-slice design). The valve bounds only THIS job's raw staging
 # ($NOMAD_HARVEST_DATA/raw); it cannot see the Zenodo tree or another job's staging. NOMAD raw
 # staging is **INODE-bound, not byte-bound**: each entry stages 4 inodes (<entry_id>/extracted/
