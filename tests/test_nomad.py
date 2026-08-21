@@ -29,6 +29,7 @@ from nomad_harvest.client import (
     _backoff_seconds,
     direct_upload_vasp_query,
 )
+from nomad_harvest import harvest
 from nomad_harvest import upload_zip
 from nomad_harvest.cli import _part_is_complete
 from nomad_harvest.harvest import (
@@ -1123,3 +1124,22 @@ def test_part_is_complete_marker_decision():
     assert _part_is_complete({"stopped_disk_budget": False, "dead_pending": 1},
                              {"rejections": 0}) is False             # dead upload pending -> not done
     assert _part_is_complete(ok, None) is False                      # parse failed/absent -> not done
+
+
+def test_fetch_progress_logs_within_a_big_upload(tmp_path, monkeypatch, caplog):
+    # A long single targeted upload must log progress DURING its flushes, not only after it
+    # finishes — otherwise `tail -f` looks frozen for the ~80 min a 16894-entry upload takes
+    # (root-caused from the 16:14->17:07 "gap", 2026-08-21). Force a small flush + log threshold
+    # and force targeted so several flushes happen inside ONE upload.
+    monkeypatch.setattr(upload_zip, "MAX_RANGES_PER_REQUEST", 2)
+    monkeypatch.setattr(harvest, "_FETCH_LOG_EVERY", 2)
+    monkeypatch.setattr(harvest, "_should_whole_stream", lambda *a, **k: False)
+    members = {f"c{i}/vasprun.xml": f"<modeling>{i}</modeling>".encode() for i in range(6)}
+    client = FakeUploadClient({"U": _make_zip(members)})
+    keep = _upload_keep(tmp_path, [(f"E{i}", "U", f"c{i}/vasprun.xml") for i in range(6)])
+    out = tmp_path / "fetched.jsonl"
+    with caplog.at_level("INFO", logger="nomad_harvest.harvest"):
+        summary = fetch_candidates(client, keep, raw_dir=tmp_path / "raw", out_path=out)
+    assert summary["staged"] == 6 and summary["uploads"] == 1
+    progress = [r for r in caplog.records if "nomad fetch progress" in r.getMessage()]
+    assert len(progress) >= 2       # multiple progress lines DURING the one upload (intra-upload)

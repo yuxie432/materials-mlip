@@ -701,10 +701,30 @@ def _should_whole_stream(members: dict[str, ZipMember], entries: list[dict[str, 
     return t_whole < t_targeted
 
 
+def _maybe_log_progress(stats: dict[str, Any], client: NomadClient, t0: float,
+                        req0: int, next_log: list[int]) -> None:
+    """Emit a ``nomad fetch progress`` line once ``staged`` crosses the next
+    ``_FETCH_LOG_EVERY`` threshold. ``next_log`` is a 1-element mutable cursor so it advances
+    ACROSS uploads AND across the flushes INSIDE one upload — the latter is what gives live
+    visibility during a long single targeted upload (a 16894-entry / 33 GB upload can take ~80 min;
+    without this, nothing logged between its start line and completion, so `tail -f` looked frozen)."""
+    if stats["staged"] < next_log[0]:
+        return
+    e = max(time.monotonic() - t0, 1e-6)
+    logger.info("nomad fetch progress: %d staged | %.1f MB/s | %.2f req/s | %.1f entries/s | "
+                "%d whole + %d targeted uploads",
+                stats["staged"], stats["staged_bytes"] / (1 << 20) / e,
+                (getattr(client, "upload_gets", 0) - req0) / e, stats["staged"] / e,
+                stats["whole_uploads"], stats["targeted_uploads"])
+    while stats["staged"] >= next_log[0]:               # advance past every crossed threshold
+        next_log[0] += _FETCH_LOG_EVERY
+
+
 def _fetch_upload(client: NomadClient, upload_id: str, entries: list[dict[str, Any]],
                   raw_dir: Path, budget: StagingBudget, want_outcar: bool, w: JsonlWriter,
                   done: set[str], rej: RejectionLogger, stats: dict[str, Any],
-                  max_records: int | None, rate_bps: float = _DEFAULT_RATE_BPS
+                  max_records: int | None, rate_bps: float = _DEFAULT_RATE_BPS,
+                  progress_cb: Callable[[], None] | None = None
                   ) -> tuple[bool, bool]:
     """Fetch one upload's kept entries by targeted extraction from its pre-packed zip.
 
@@ -774,6 +794,8 @@ def _fetch_upload(client: NomadClient, upload_id: str, entries: list[dict[str, A
                 to_fallback.append(entry)
         pending = []
         batch = []
+        if progress_cb is not None:                     # live progress WITHIN a big upload's flushes
+            progress_cb()
 
     for entry in entries:
         if max_records and stats["staged"] >= max_records:
@@ -912,7 +934,11 @@ def fetch_candidates(client: NomadClient, in_path: str | Path,
 
     t0 = time.monotonic()
     req0 = getattr(client, "upload_gets", 0)
-    next_log = _FETCH_LOG_EVERY
+    next_log = [_FETCH_LOG_EVERY]                        # mutable cursor (advances inside a big upload too)
+
+    def _progress() -> None:
+        _maybe_log_progress(stats, client, t0, req0, next_log)
+
     with JsonlWriter(out) as w:
         for up in order:
             if budget.full() or (max_records and stats["staged"] >= max_records):
@@ -932,7 +958,7 @@ def fetch_candidates(client: NomadClient, in_path: str | Path,
             staged_before = stats["staged"]
             stop, cd_unavailable = _fetch_upload(client, up, groups[up], raw_dir, budget,
                                                  want_outcar, w, done, rej, stats, max_records,
-                                                 rate_bps)
+                                                 rate_bps, progress_cb=_progress)
             # Update the dead-upload skip-list: a zip whose CD is unreadable AND whose per-entry
             # fallback staged nothing is a failed pass (increment); any progress clears the count
             # (so a transient 500 that later recovers is never abandoned). Only CD-unavailable
@@ -947,17 +973,9 @@ def fetch_candidates(client: NomadClient, in_path: str | Path,
                     stats["dead_pending"] += 1          # will be retried on a later pass
             elif up in dead:
                 del dead[up]                            # recovered -> drop from the skip-list
-            # Continuous progress (like parse's) so the live fetch rate + whole/targeted split are
-            # visible WITHOUT waiting for the per-part summary at the end of this call.
-            if stats["staged"] >= next_log:
-                _e = max(time.monotonic() - t0, 1e-6)
-                logger.info("nomad fetch progress: %d staged | %.1f MB/s | %.2f req/s | "
-                            "%.1f entries/s | %d whole + %d targeted uploads",
-                            stats["staged"], stats["staged_bytes"] / (1 << 20) / _e,
-                            (getattr(client, "upload_gets", 0) - req0) / _e,
-                            stats["staged"] / _e, stats["whole_uploads"],
-                            stats["targeted_uploads"])
-                next_log += _FETCH_LOG_EVERY
+            # Progress after each upload too (catches a whole-stream's single flush + the final
+            # state); the intra-upload flushes above already logged during a long targeted upload.
+            _progress()
 
     rej.close()
     _save_dead_uploads(dead_path, dead)
