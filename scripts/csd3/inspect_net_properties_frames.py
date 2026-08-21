@@ -45,14 +45,31 @@ def frames(shard):
         yield lines[i + 1], lines[i + 2:i + 2 + n]   # comment, atom_rows
         i += 2 + n
 
+def _shard_index(path):
+    m = re.search(r"shard-(\d+)\.extxyz\.gz$", path)
+    return int(m.group(1)) if m else -1
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset-dir", required=True)
-    ap.add_argument("--shards", type=int, default=1, help="how many shards to scan")
+    ap.add_argument("--shards", type=int, default=1, help="scan the FIRST N shards (default)")
+    ap.add_argument("--indices", default=None,
+                    help="comma-separated shard indices to scan, e.g. 0,1200,1211")
+    ap.add_argument("--sample", type=int, default=None,
+                    help="scan K shards evenly spaced across the whole dataset (mixes parsers)")
     args = ap.parse_args()
 
-    shard_paths = sorted(glob.glob(f"{args.dataset_dir}/shard-*.extxyz.gz"))[: args.shards]
-    print(f"scanning {len(shard_paths)} shard(s): {[s.split('/')[-1] for s in shard_paths]}\n")
+    all_shards = sorted(glob.glob(f"{args.dataset_dir}/shard-*.extxyz.gz"), key=_shard_index)
+    if args.indices:
+        want = {int(x) for x in args.indices.split(",")}
+        shard_paths = [s for s in all_shards if _shard_index(s) in want]
+    elif args.sample:
+        step = max(1, len(all_shards) // args.sample)
+        shard_paths = all_shards[::step][: args.sample]
+    else:
+        shard_paths = all_shards[: args.shards]
+    print(f"scanning {len(shard_paths)} of {len(all_shards)} shard(s): "
+          f"{[s.split('/')[-1] for s in shard_paths]}\n")
 
     have = collections.Counter(); tot = collections.Counter()
     dft_cols_seen = 0

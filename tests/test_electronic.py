@@ -143,6 +143,40 @@ def test_electronic_from_outcar_charged(tmp_path):
     assert blk["net_charge"] == 2.0
 
 
+class _FakeVaspout:
+    """A vaspout.h5-like object: no atominfo XML, and (as seen in real uploads) neither NELECT
+    in .parameters nor resolvable POTCAR titels — so charge is unavailable from the object alone."""
+    def __init__(self):
+        self.parameters = {}          # HDF5 exposes no NELECT here
+        self.is_spin = False
+        self.atomic_symbols = None
+        self.potcar_symbols = None
+
+
+def test_vaspout_charge_falls_back_to_colocated_outcar(tmp_path):
+    # The fix: electronic_from_object now reads a co-located OUTCAR for net charge (not just
+    # magnetization). Without the OUTCAR the vaspout charge is unavailable; with it, it matches
+    # exactly what electronic_from_outcar computes (NELECT + ZVAL from the OUTCAR header).
+    p = _write(tmp_path, "OUTCAR", _OUTCAR)
+    # no OUTCAR -> charge unavailable (pre-fix behaviour, still correct)
+    blk0 = E.electronic_from_object(_FakeVaspout(), atominfo_path=None,
+                                    outcar_path=None, eigen_parsed=False)
+    assert blk0["net_charge"] is None and blk0["charge_source"] == "unavailable"
+    # co-located OUTCAR -> charge recovered from the header
+    blk = E.electronic_from_object(_FakeVaspout(), atominfo_path=None,
+                                   outcar_path=p, eigen_parsed=False)
+    assert blk["nelect"] == 34.0 and blk["nelect_neutral"] == 34.0    # 2*8 + 3*6
+    assert blk["net_charge"] == 0.0 and blk["charge_source"] == "outcar_header"
+
+
+def test_vaspout_charge_charged_from_outcar(tmp_path):
+    charged = _OUTCAR.replace("NELECT =      34.0000", "NELECT =      32.0000")
+    p = _write(tmp_path, "OUTCAR", charged)
+    blk = E.electronic_from_object(_FakeVaspout(), atominfo_path=None,
+                                   outcar_path=p, eigen_parsed=False)
+    assert blk["net_charge"] == 2.0 and blk["charge_source"] == "outcar_header"
+
+
 def test_outcar_neutral_nelect_mismatch_returns_none(tmp_path):
     # ZVAL count (1) != ions-per-type count (2) -> refuse (None) rather than guess.
     bad = (" PAW_PBE Fe 06Sep2000 :\n   POMASS =   55.847; ZVAL   =    8.000\n"

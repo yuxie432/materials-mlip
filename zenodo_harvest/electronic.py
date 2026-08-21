@@ -347,6 +347,28 @@ def electronic_from_object(v: Any, *, atominfo_path: str | Path | None,
         neutral = neutral_nelect_from_titels(getattr(v, "atomic_symbols", None),
                                              getattr(v, "potcar_symbols", None))
         charge_src = "potcar_stats"
+    # Co-located OUTCAR fallback for whichever of nelect / Z_neutral is still missing. A
+    # vaspout.h5 exposes no <atominfo> valence column and often neither NELECT nor resolvable
+    # POTCAR titels, so its net charge is otherwise "unavailable"; a vasprun.xml normally needs
+    # no OUTCAR here (its atominfo carries both). Reuses the SAME header helpers as the
+    # OUTCAR-only path (electronic_from_outcar), so a vaspout+OUTCAR charge is byte-identical to
+    # what the OUTCAR path computes. Lazy import keeps electronic.py light and avoids any cycle.
+    if outcar_path and (nelect is None or neutral is None):
+        from .outcar_params import build_calc_parameters, read_header_lines
+        try:
+            header_lines = read_header_lines(outcar_path)
+        except OSError:
+            header_lines = []
+        if header_lines:
+            cp = build_calc_parameters(header_lines) or {}
+            if nelect is None:
+                oc_params = cp.get("parameters") or {}
+                oc_incar = cp.get("incar") or {}
+                nelect = _to_float(oc_params.get("NELECT"))
+                if nelect is None:
+                    nelect = _to_float(oc_incar.get("NELECT"))
+            if neutral is None:
+                neutral, charge_src = _outcar_neutral_nelect(header_lines, cp.get("potcar_symbols"))
     net_charge = round(neutral - nelect, 6) if (neutral is not None and nelect is not None) else None
     return _block(net_mag, mag_src, net_charge, nelect, neutral, charge_src)
 
