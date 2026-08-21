@@ -409,6 +409,10 @@ def apply_net_properties(dataset_dir: str | Path, net_properties: str | Path,
         applied = _load_applied(marker)
         shards = existing_shard_paths(dataset_dir)
         stats["shards_total"] = len(shards)
+        n_todo = sum(1 for s in shards if s.name not in applied)
+        n_done = 0
+        logger.info("Phase 2a: %d shards total, %d already applied, %d to rewrite this run",
+                    len(shards), len(applied), n_todo)
         with marker.open("a") as mk:
             for shard in shards:
                 if shard.name in applied:
@@ -424,8 +428,17 @@ def apply_net_properties(dataset_dir: str | Path, net_properties: str | Path,
                 mk.write(shard.name + "\n")           # done (even if 0 changed → won't reprocess)
                 mk.flush()
                 os.fsync(mk.fileno())
+                n_done += 1
+                if n_done % 25 == 0 or n_done == n_todo:
+                    logger.info("Phase 2a progress: %d/%d shards rewritten this run "
+                                "(%d frames changed)", n_done, n_todo, stats["frames_changed"])
+        logger.info("Phase 2a done: %d rewritten, %d skipped-already-done, %d failed",
+                    stats["shards_rewritten"], stats["shards_skipped_done"], stats["shards_failed"])
 
         # Phase 2b: metadata (atomic rewrite, one-time backup).
+        logger.info("Phase 2b: rewriting metadata.jsonl (adds electronic block, backfills "
+                    "OUTCAR ionic_converged) — atomic, runs once after all shards")
+
         def _apply(record: dict) -> dict:
             cid = record.get("calc_id")
             entry = entries.get(cid) if cid is not None else None

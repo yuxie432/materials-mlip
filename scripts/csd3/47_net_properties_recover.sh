@@ -199,12 +199,36 @@ if [[ "$rc" -eq 0 ]]; then
         echo "backed up current metadata -> $JOB_BACKUP ($(wc -l < "$JOB_BACKUP") records)"
     fi
     echo "=== Phase 2 (apply — REWRITES SHARDS) $(date -Is) ==="
-    python -m zenodo_harvest.cli apply-net-properties --dataset-dir "$DS" --net-properties "$NP_MAP"
-    echo "=== finalizing: verify $(date -Is) ==="
-    python -m zenodo_harvest.cli verify --dataset-dir "$DS"
-    if [[ -n "$NEXT_JOBID" ]]; then
-        echo "done; cancelling pre-queued successor $NEXT_JOBID"
-        scancel "$NEXT_JOBID" 2>/dev/null || true
+    # Phase 2 MUST run in the background with an interruptible `wait`, exactly like Phase 1.
+    # A foreground `apply` blocks bash from running the USR1 trap until the command returns —
+    # so a wallclock SIGKILL mid-apply queued NO successor and stranded the run (the bug that
+    # left a 12 h Phase 2 with no resume). Backgrounding it lets `wait` be interrupted by USR1
+    # -> submit_successor, and the successor resumes apply from the per-shard
+    # .net_properties_applied marker (idempotent: done shards skip, a torn/unmarked shard is
+    # re-rewritten to the same bytes). `-v` surfaces the per-shard progress log.
+    phase2() {
+        python -m zenodo_harvest.cli -v apply-net-properties --dataset-dir "$DS" --net-properties "$NP_MAP"
+        echo "=== finalizing: verify $(date -Is) ==="
+        python -m zenodo_harvest.cli verify --dataset-dir "$DS"
+    }
+    phase2 &
+    PHASE2_PID=$!
+    set +e
+    while true; do
+        wait "$PHASE2_PID"; rc=$?
+        if [[ "$rc" -le 128 ]] || ! kill -0 "$PHASE2_PID" 2>/dev/null; then break; fi
+    done
+    set -e
+    echo "=== Phase 2 (apply) exit=$rc $(date -Is) ==="
+    if [[ "$rc" -eq 0 ]]; then
+        if [[ -n "$NEXT_JOBID" ]]; then
+            echo "done; cancelling pre-queued successor $NEXT_JOBID"
+            scancel "$NEXT_JOBID" 2>/dev/null || true
+        fi
+    else
+        # A hard (non-signal) apply/verify error and no successor queued yet: queue one so the
+        # resume retries apply from the marker (a signal kill already queued via the USR1 trap).
+        submit_successor
     fi
 else
     # Wallclock SIGKILL (or a hard error) mid-Phase-1: the successor resumes the loop.
