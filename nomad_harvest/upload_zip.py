@@ -68,7 +68,14 @@ _CD_TAIL_LARGE = 48 << 20      # grow to this only if the EOCD isn't in the smal
 # cap the in-memory batch bytes so a multi-range response is read into RAM safely — a member
 # bigger than this is streamed to disk on its own instead.
 MAX_RANGES_PER_REQUEST = 256
-MAX_BATCH_BYTES = 96 << 20
+# 256 MB (was 96 MB). For the BIG-member targeted uploads — a minority of entries but the
+# dominant slice of fetch time (log analysis 2026-08-21: ~10 MB/calc "Class A" uploads = 3% of
+# entries, 37% of fetch time) — the 96 MB cap forced a flush every ~9 members, so ~187 throttled
+# requests for a ~1,700-member upload; 256 MB cuts that ~2.7x (throttle overhead on those uploads
+# ~14% -> ~5%) at the cost of a larger in-RAM multi-range response, which a himem node holds
+# easily (the fetch is serial, so at most one such response is resident). Small-member uploads are
+# unaffected — the 256-range header cap binds first for them.
+MAX_BATCH_BYTES = 256 << 20
 # Whole-stream request-size cap: one streaming Range request covers members spanning at most this
 # many bytes, so a large low-bloat upload is fetched in several bounded, independently-recoverable
 # requests rather than ONE giant one (a 35 GB single request broke mid-transfer live — upload 9EW,

@@ -30,8 +30,11 @@ from nomad_harvest.client import (
     direct_upload_vasp_query,
 )
 from nomad_harvest import upload_zip
+from nomad_harvest.cli import _part_is_complete
 from nomad_harvest.harvest import (
+    _DEAD_UPLOAD_MAX_FAILS,
     RecordTooBig,
+    _load_dead_uploads,
     _should_whole_stream,
     build_fetched_entry,
     canonical_staged_name,
@@ -1058,3 +1061,65 @@ def test_fetch_members_big_member_crc_mismatch(tmp_path, monkeypatch):
     dest = tmp_path / "OUTCAR"
     assert upload_zip.fetch_members(client, "U", [(m, dest)])[dest] is False
     assert not dest.exists()
+
+
+# --- dead-upload skip-list + hoisted dataset-ids + .done marker decision (2026-08-21) -----
+
+def test_fetch_candidates_dead_upload_skiplist(tmp_path):
+    # An upload whose pre-packed zip is unreadable (absent -> UploadNotAvailable) AND whose
+    # per-entry fallback stages nothing is a failed pass; after _DEAD_UPLOAD_MAX_FAILS passes it
+    # is skipped WHOLESALE (no CD read attempted) instead of re-burning time every resume.
+    client = FakeUploadClient({"U": _make_zip({"a/vasprun.xml": b"<modeling>a</modeling>"})})
+    keep = _upload_keep(tmp_path, [("A", "U", "a/vasprun.xml"),
+                                   ("D1", "D", "x/vasprun.xml"), ("D2", "D", "y/vasprun.xml")])
+    out, raw = tmp_path / "fetched.jsonl", tmp_path / "raw"
+    dead_file = tmp_path / "manifests" / "nomad_dead_uploads.json"
+    for _ in range(_DEAD_UPLOAD_MAX_FAILS):                 # attempted each pass, count increments
+        s = fetch_candidates(client, keep, raw_dir=raw, out_path=out)
+        assert s["failed"] >= 2 and s["dead_skipped"] == 0
+    assert _load_dead_uploads(dead_file).get("D") == _DEAD_UPLOAD_MAX_FAILS
+    gets_before = client.upload_gets
+    s = fetch_candidates(client, keep, raw_dir=raw, out_path=out)   # now past threshold -> skipped
+    assert s["dead_skipped"] == 2 and s["uploads"] == 0
+    assert client.upload_gets == gets_before               # no CD read attempted for the dead upload
+    assert {r["recid"] for r in read_jsonl(out)} == {"A"}  # A was staged on pass 1, never lost
+
+
+def test_fetch_candidates_dead_upload_recovers_clears_count(tmp_path):
+    # A transient failure that later recovers is NOT abandoned: staging any entry clears the count.
+    client = FakeUploadClient({"U": _make_zip({"a/vasprun.xml": b"<modeling>a</modeling>"})})
+    keep = _upload_keep(tmp_path, [("D1", "D", "d/vasprun.xml")])
+    out, raw = tmp_path / "fetched.jsonl", tmp_path / "raw"
+    dead_file = tmp_path / "manifests" / "nomad_dead_uploads.json"
+    fetch_candidates(client, keep, raw_dir=raw, out_path=out)       # D absent -> fails, count 1
+    assert _load_dead_uploads(dead_file).get("D") == 1
+    client.uploads["D"] = _make_zip({"d/vasprun.xml": b"<modeling>d</modeling>"})   # now available
+    s = fetch_candidates(client, keep, raw_dir=raw, out_path=out)   # recovers -> staged, count cleared
+    assert s["staged"] == 1
+    assert "D" not in _load_dead_uploads(dead_file)
+
+
+def test_fetch_candidates_hoisted_dataset_record_ids(tmp_path):
+    # The precomputed dataset_record_ids set skips already-parsed entries WITHOUT reading
+    # metadata.jsonl per call (the hoist that removes the per-part resume churn). No dataset dir
+    # exists on disk, proving the read is skipped when the set is supplied.
+    zbytes = _make_zip({"a/vasprun.xml": b"<modeling>a</modeling>",
+                        "b/vasprun.xml": b"<modeling>b</modeling>"})
+    client = FakeUploadClient({"U": zbytes})
+    keep = _upload_keep(tmp_path, [("A", "U", "a/vasprun.xml"), ("B", "U", "b/vasprun.xml")])
+    out = tmp_path / "fetched.jsonl"
+    summary = fetch_candidates(client, keep, raw_dir=tmp_path / "raw", out_path=out,
+                               dataset_record_ids={"A"})
+    assert summary["dataset_skipped"] == 1
+    assert {r["recid"] for r in read_jsonl(out)} == {"B"}   # A skipped, only B fetched
+
+
+def test_part_is_complete_marker_decision():
+    ok = {"stopped_disk_budget": False, "dead_pending": 0}
+    assert _part_is_complete(ok, {"rejections": 0}) is True          # clean pass -> mark done
+    assert _part_is_complete(ok, {"rejections": 2}) is False         # a new rejection -> retry
+    assert _part_is_complete({"stopped_disk_budget": True, "dead_pending": 0},
+                             {"rejections": 0}) is False             # valve-deferred -> not done
+    assert _part_is_complete({"stopped_disk_budget": False, "dead_pending": 1},
+                             {"rejections": 0}) is False             # dead upload pending -> not done
+    assert _part_is_complete(ok, None) is False                      # parse failed/absent -> not done

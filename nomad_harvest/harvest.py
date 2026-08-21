@@ -52,6 +52,40 @@ _FETCH_LOG_EVERY = 2000        # log a fetch-progress line every this many stage
 # whole wallclock. Bailing after a short run of failures caps that at ~minutes; the skipped entries
 # retry on the next resume. (Root-caused from a live stall, 2026-08-20.)
 _FALLBACK_MAX_CONSEC_FAIL = 8
+# Persistent dead-upload skip-list. An upload whose pre-packed /uploads/{id}/raw zip 500s AND
+# whose per-entry fallback also stages nothing is re-attempted EVERY resume, each attempt burning
+# ~9 min (a ~60 s-retry CD read + up to 8 fallback failures) — so a handful of permanently-broken
+# uploads (e.g. iTP_-amqTACgDJsJVfQRvA, 4P6jmC…; the `fetch_error` rejections) waste growing time.
+# We persist a per-upload consecutive-failed-pass count and stop attempting one once it reaches
+# this threshold; a pass that stages ANY of the upload's entries clears the count (so a transient
+# 500 that later recovers is not abandoned). 3 gives a genuinely-transient outage a few resumes to
+# clear before we give up. Clearing the skip-list file re-attempts everything (entries stay in the
+# keep-list — nothing is lost, only deferred). (Root-caused from the re-burn seen in both
+# nomad-pipeline-34* logs, 2026-08-21.)
+_DEAD_UPLOAD_MAX_FAILS = 3
+_DEAD_UPLOADS_NAME = "nomad_dead_uploads.json"
+
+
+def _load_dead_uploads(path: Path) -> dict[str, int]:
+    """Load the {upload_id: consecutive-failed-pass count} skip-list, {} if absent/unreadable."""
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        return {str(k): int(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_dead_uploads(path: Path, counts: dict[str, int]) -> None:
+    """Persist the skip-list atomically (drop zero counts to keep the file small)."""
+    live = {k: v for k, v in counts.items() if v > 0}
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(json.dumps(live))
+        tmp.replace(path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
 
 
 class RecordTooBig(Exception):
@@ -670,22 +704,26 @@ def _should_whole_stream(members: dict[str, ZipMember], entries: list[dict[str, 
 def _fetch_upload(client: NomadClient, upload_id: str, entries: list[dict[str, Any]],
                   raw_dir: Path, budget: StagingBudget, want_outcar: bool, w: JsonlWriter,
                   done: set[str], rej: RejectionLogger, stats: dict[str, Any],
-                  max_records: int | None, rate_bps: float = _DEFAULT_RATE_BPS) -> bool:
+                  max_records: int | None, rate_bps: float = _DEFAULT_RATE_BPS
+                  ) -> tuple[bool, bool]:
     """Fetch one upload's kept entries by targeted extraction from its pre-packed zip.
 
     Reads the upload's central directory once, admits each entry against the disk/inode valve
     (reserving its EXACT footprint from the CD), and pulls the members in multi-range batches,
     each CRC-verified. Writes staged entries to ``w``; anything the zip cannot deliver goes to
-    the per-entry fallback. Returns True if the valve deferred (budget full of reclaimable
-    data → caller stops and the pacing loop resumes this part after a parse+purge).
+    the per-entry fallback. Returns ``(deferred, cd_unavailable)``: ``deferred`` True if the
+    valve deferred (budget full of reclaimable data → caller stops and the pacing loop resumes
+    this part after a parse+purge); ``cd_unavailable`` True if the pre-packed zip's central
+    directory could not be read (the dead-upload signal for the skip-list — see fetch_candidates).
     """
     try:
         members, _total = upload_zip.read_central_directory(client, upload_id)
     except UploadNotAvailable as exc:
         logger.info("upload %s not addressable (%s); per-entry fallback for %d entries",
                     upload_id, exc, len(entries))
-        return _fallback_entries(client, entries, raw_dir, budget, want_outcar,
-                                 w, done, rej, stats, max_records)
+        deferred = _fallback_entries(client, entries, raw_dir, budget, want_outcar,
+                                     w, done, rej, stats, max_records)
+        return deferred, True
 
     # Choose the fetch mechanism for this whole upload: one transfer-bound stream (low-bloat,
     # many entries) or targeted multi-range batches (high-bloat or few entries). When streaming,
@@ -778,7 +816,7 @@ def _fetch_upload(client: NomadClient, upload_id: str, entries: list[dict[str, A
     if to_fallback and not deferred:                   # ...recover anything the zip missed
         deferred = _fallback_entries(client, to_fallback, raw_dir, budget, want_outcar,
                                      w, done, rej, stats, max_records)
-    return deferred
+    return deferred, False
 
 
 def _dataset_record_ids(dataset_dir: str | Path) -> set[str]:
@@ -802,7 +840,8 @@ def fetch_candidates(client: NomadClient, in_path: str | Path,
                      max_records: int | None = None,
                      max_disk_bytes: int | None = None,
                      max_disk_files: int | None = None,
-                     dataset_dir: str | Path | None = None) -> dict[str, Any]:
+                     dataset_dir: str | Path | None = None,
+                     dataset_record_ids: set[str] | None = None) -> dict[str, Any]:
     """Stage 2: pull each candidate's mainfile out of its upload's PRE-PACKED zip.
 
     The default (and only) NOMAD fetch path. Groups the input's entries by ``upload_id`` and
@@ -833,15 +872,24 @@ def fetch_candidates(client: NomadClient, in_path: str | Path,
     # dataset's own record_ids makes a PARTS change (and any manifest mismatch) free of re-fetch —
     # a parsed entry is never re-downloaded. (Only skips PARSED entries; a fetched-but-unparsed
     # backlog is not in the dataset and still resumes normally.)
+    # `dataset_record_ids` (precomputed once by the pipeline, HOISTED out of the per-part loop)
+    # takes precedence over reading metadata.jsonl here — the read is O(dataset) and, called once
+    # per part, was the dominant cost of the resume "churn" over already-done parts (measured 2026-08-21).
     n_dataset_skip = 0
-    if dataset_dir is not None:
-        parsed_ids = _dataset_record_ids(dataset_dir)
+    parsed_ids = dataset_record_ids if dataset_record_ids is not None else (
+        _dataset_record_ids(dataset_dir) if dataset_dir is not None else None)
+    if parsed_ids is not None:
         n_dataset_skip = len(parsed_ids - done)
         done |= parsed_ids
     rej = RejectionLogger(manifests / "nomad_fetch_rejections.jsonl")
+    # Dead-upload skip-list: uploads whose pre-packed zip has failed the last few passes (see
+    # _DEAD_UPLOAD_MAX_FAILS). Loaded once; updated + saved at the end of this call.
+    dead_path = manifests / _DEAD_UPLOADS_NAME
+    dead = _load_dead_uploads(dead_path)
     stats: dict[str, Any] = {"records": 0, "staged": 0, "failed": 0, "skipped_existing": 0,
                              "uploads": 0, "whole_uploads": 0, "targeted_uploads": 0,
                              "per_entry_fallback": 0, "staged_bytes": 0,
+                             "dead_skipped": 0, "dead_pending": 0,
                              "stopped_disk_budget": False, "stopped_on": ""}
     raw_dir.mkdir(parents=True, exist_ok=True)
     base_b, base_f = (_dir_usage(raw_dir) if (max_disk_bytes or max_disk_files) else (0, 0))
@@ -869,14 +917,36 @@ def fetch_candidates(client: NomadClient, in_path: str | Path,
         for up in order:
             if budget.full() or (max_records and stats["staged"] >= max_records):
                 break
+            # Dead-upload skip: this upload's pre-packed zip has failed the last
+            # _DEAD_UPLOAD_MAX_FAILS passes, so don't waste ~9 min/pass re-attempting it. Its
+            # entries stay in the keep-list (retried if the skip-list is cleared) — never lost.
+            if dead.get(up, 0) >= _DEAD_UPLOAD_MAX_FAILS:
+                stats["dead_skipped"] += len(groups[up])
+                continue
             stats["uploads"] += 1
             # Feed the CURRENT achieved transfer rate (aggregate over this call) to the whole-vs-
             # targeted chooser, so it prefers targeted on a slow server and whole on a fast one.
             _el = time.monotonic() - t0
             rate_bps = (stats["staged_bytes"] / _el if stats["staged_bytes"] > 0 and _el > 1
                         else float(_DEFAULT_RATE_BPS))
-            stop = _fetch_upload(client, up, groups[up], raw_dir, budget, want_outcar,
-                                 w, done, rej, stats, max_records, rate_bps)
+            staged_before = stats["staged"]
+            stop, cd_unavailable = _fetch_upload(client, up, groups[up], raw_dir, budget,
+                                                 want_outcar, w, done, rej, stats, max_records,
+                                                 rate_bps)
+            # Update the dead-upload skip-list: a zip whose CD is unreadable AND whose per-entry
+            # fallback staged nothing is a failed pass (increment); any progress clears the count
+            # (so a transient 500 that later recovers is never abandoned). Only CD-unavailable
+            # uploads are tracked — an individually-bad entry is rejected terminally elsewhere. A
+            # disk-valve DEFER (`stop`) is not a failure — the upload wasn't fully attempted — so it
+            # neither increments nor clears (it retries next pass with the count intact).
+            if stop:
+                break
+            if cd_unavailable and stats["staged"] == staged_before:
+                dead[up] = dead.get(up, 0) + 1
+                if dead[up] < _DEAD_UPLOAD_MAX_FAILS:
+                    stats["dead_pending"] += 1          # will be retried on a later pass
+            elif up in dead:
+                del dead[up]                            # recovered -> drop from the skip-list
             # Continuous progress (like parse's) so the live fetch rate + whole/targeted split are
             # visible WITHOUT waiting for the per-part summary at the end of this call.
             if stats["staged"] >= next_log:
@@ -888,10 +958,13 @@ def fetch_candidates(client: NomadClient, in_path: str | Path,
                             stats["staged"] / _e, stats["whole_uploads"],
                             stats["targeted_uploads"])
                 next_log += _FETCH_LOG_EVERY
-            if stop:
-                break
 
     rej.close()
+    _save_dead_uploads(dead_path, dead)
+    if stats["dead_skipped"] or stats["dead_pending"]:
+        logger.info("nomad fetch dead-uploads: %d entries skipped (>= %d failed passes), "
+                    "%d uploads pending retry", stats["dead_skipped"], _DEAD_UPLOAD_MAX_FAILS,
+                    stats["dead_pending"])
     if budget.full():
         stats["stopped_disk_budget"] = True
         stats["stopped_on"] = budget.pause or budget.hit_limit

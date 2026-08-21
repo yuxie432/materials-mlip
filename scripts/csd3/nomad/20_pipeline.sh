@@ -5,13 +5,15 @@
 #SBATCH -p icelake-himem               # 6760 MiB/core: parse (pymatgen) needs the RAM
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8              # cores drive --parse-workers (parallel parse). START MODEST:
-                                       # parse workers only help during the valve-drain phases
-                                       # (~40% of wall-clock); the rest of the time fetch is the
-                                       # bottleneck and extra workers sit idle (wasted cores). Only
-                                       # scale up (raise this + PARSE_WORKERS, keeping
-                                       # cpus>=PARSE_WORKERS+2) IF staged_files_now stays pinned at
-                                       # the disk valve (=parse-bound). Observe first.
+#SBATCH --cpus-per-task=6              # cores drive --parse-workers (parallel parse). MEASURED
+                                       # 2026-08-21: parse runs 26-40 calc/s (6 workers) vs fetch
+                                       # ~6 calc/s, so parse finishes each batch in ~15-25 min then
+                                       # IDLES ~60-100 min waiting on the (bandwidth-bound) fetch —
+                                       # it is NOT the bottleneck. 4 workers (~27 calc/s) still far
+                                       # exceed fetch, so cpus-per-task dropped 8->6 (workers+2, keeps
+                                       # RAM headroom for the fetch thread + forkserver) to free
+                                       # cores + schedule faster. Only raise these if staged_files_now
+                                       # stays PINNED at the disk valve (=parse-bound); it does not today.
 #SBATCH --time=12:00:00                # SL3 max; SL1/SL2 may use up to 36:00:00
 #SBATCH --signal=B:USR1@600            # SIGUSR1 to the batch shell 10 min before wallclock
 #SBATCH -o logs_nomad/nomad-pipeline-%j.out  #   -> lets RESUBMIT=1 queue a resume job before the
@@ -99,20 +101,21 @@ MAX_DISK_BYTES="${MAX_DISK_BYTES:-200000000000}"
 MAX_DISK_FILES="${MAX_DISK_FILES:-500000}"
 # PARSE_WORKERS: parse this many calc units CONCURRENTLY (N worker THREADS parse; the MAIN thread is
 # the SOLE writer of shards+metadata, so workers never interleave a shard/metadata write — the
-# one-calc-at-a-time crash-safety invariant holds, parse.py:1514/1546). START at 6 (~25 calcs/s,
-# already > the observed fetch rate) and OBSERVE: extra workers only help while the disk valve is
-# pinned (parse-bound drains); when fetch is the bottleneck they idle. Override without editing:
-# `PARSE_WORKERS=10 sbatch ...` (raise cpus-per-task to >=PARSE_WORKERS+2 too). Diminishing returns
-# once parse>=fetch or the single writer saturates.
-PARSE_WORKERS="${PARSE_WORKERS:-6}"
+# one-calc-at-a-time crash-safety invariant holds, parse.py:1514/1546). 4 gives ~27 calcs/s, still
+# FAR above the ~6 calcs/s bandwidth-bound fetch (measured 2026-08-21), so parse is never the bound;
+# extra workers only help while the disk valve is pinned (parse-bound drains), which does not happen
+# today. Override without editing: `PARSE_WORKERS=8 sbatch ...` (raise cpus-per-task to
+# >=PARSE_WORKERS+2 too). Diminishing returns once parse>=fetch or the single writer saturates.
+PARSE_WORKERS="${PARSE_WORKERS:-4}"
 # RAM guard: refuse to ATTEMPT a primary bigger than this (0 = attempt everything). pymatgen peak
 # RSS is ~10x the (uncompressed) primary size, and PARSE_WORKERS parse AT ONCE, so RAM ~=
 # PARSE_WORKERS x MAX_PRIMARY_BYTES x 10 must fit the job. NOMAD vaspruns are tiny (median 0.36 MB),
-# RAM budget: 6 workers x 0.8 GB x 10 (pymatgen peak ~10x the uncompressed primary) = 48 GiB <
-# 8 cores x 6.76 GiB = 54 GiB. 800 MB covers even large AIMD vaspruns so few are needlessly skipped
-# (primary_too_large is non-terminal + retryable on a bigger-RAM run). Keep PARSE_WORKERS x
-# MAX_PRIMARY_BYTES x 10 under the job RAM if you change either. (300 MB was a leftover from a
-# reverted 14-worker plan; 800 MB is right for 6 workers and avoids skipping big primaries.)
+# RAM budget: 4 workers x 0.8 GB x 10 (pymatgen peak ~10x the uncompressed primary) = 32 GiB <
+# 6 cores x 6.76 GiB = 40 GiB. 800 MB covers even large AIMD vaspruns so few are needlessly skipped
+# (only ~30 in the whole corpus; primary_too_large is non-terminal — those records are NOT purged
+# (their calc is unparsed), so a single end-of-run sweep `parse --parse-workers 1 --max-primary-bytes 0`
+# on a himem node captures them from raw/ with NO re-fetch, giving one worker all the RAM for a big
+# vasprun). Keep PARSE_WORKERS x MAX_PRIMARY_BYTES x 10 under the job RAM if you change either.
 MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-800000000}"
 # Hard-kill a single calc's parse after this many seconds (0 = off), so one non-terminating
 # pymatgen/ASE parse can't silently freeze the whole overlapped pipeline until wallclock.

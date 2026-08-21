@@ -37,7 +37,12 @@ from zenodo_harvest.parse import parse
 from zenodo_harvest.store import DatasetLockError
 
 from .client import NomadClient, direct_upload_vasp_query
-from .harvest import discover_candidates, fetch_candidates, split_by_upload
+from .harvest import (
+    _dataset_record_ids,
+    discover_candidates,
+    fetch_candidates,
+    split_by_upload,
+)
 
 
 def nomad_paths() -> tuple[Path, Path, Path, Path]:
@@ -80,7 +85,8 @@ def _add_disk_valve(p: argparse.ArgumentParser) -> None:
 
 
 def _fetch(client: NomadClient, in_path: str, out_path: str | None, raw_dir: str,
-           args: argparse.Namespace, max_records: int | None) -> dict:
+           args: argparse.Namespace, max_records: int | None,
+           dataset_record_ids: set[str] | None = None) -> dict:
     """Run the targeted upload-zip fetch (the only NOMAD fetch path)."""
     return fetch_candidates(client, in_path, raw_dir=raw_dir, out_path=out_path,
                             want_outcar=args.want_outcar, max_records=max_records,
@@ -88,7 +94,10 @@ def _fetch(client: NomadClient, in_path: str, out_path: str | None, raw_dir: str
                             max_disk_files=(args.max_disk_files or None),
                             # global-skip: don't re-download entries already in the dataset (makes a
                             # PARTS change between runs free of re-fetch). None if the flag is absent.
-                            dataset_dir=getattr(args, "dataset_dir", None))
+                            dataset_dir=getattr(args, "dataset_dir", None),
+                            # HOISTED: the pipeline precomputes this once and passes it, so the
+                            # O(dataset) metadata.jsonl read is not repeated per part on every resume.
+                            dataset_record_ids=dataset_record_ids)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -217,6 +226,23 @@ def _status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _part_is_complete(fetch_summary: dict, parse_stats: dict | None) -> bool:
+    """Whether a pipeline part is fully done — safe to write its ``.done`` marker and skip it in
+    O(1) on future resumes (which is what kills the resume "churn" over already-done parts).
+
+    True iff this pass left nothing a future pass would redo: the fetch was NOT valve-deferred
+    (``stopped_disk_budget`` False → every upload was attempted), no dead upload is still pending
+    retry (``dead_pending`` 0 → the skip-list won't re-attempt one later), and parse produced NO
+    new rejection (``rejections`` 0 → every fetched entry is now parsed or already in the dataset;
+    a terminal rejection from a PRIOR pass shows as ``skipped_rejected``, not a new ``rejection``,
+    so a clean part is marked on its completing pass and a prior-terminal-rejection part on the
+    next; a RETRYABLE rejection — ``primary_too_large``/``parse_timeout`` — keeps the part un-marked
+    so it is retried on a later/bigger-RAM run, which is correct)."""
+    return (not fetch_summary.get("stopped_disk_budget", False)
+            and fetch_summary.get("dead_pending", 0) == 0
+            and (parse_stats or {}).get("rejections", 1) == 0)
+
+
 def _run_pipeline(client: NomadClient, args: argparse.Namespace) -> int:
     """Overlapped fetch || parse+purge over the keep-list, ending with verify.
 
@@ -236,21 +262,54 @@ def _run_pipeline(client: NomadClient, args: argparse.Namespace) -> int:
     part_paths = [Path(pw["path"]) for pw in split_info["parts_written"] if pw["lines"] > 0]
     parse_rej = str(ds_dir / "rejections.jsonl")  # disk-valve limits are read from `args` by _fetch
 
+    # Read the dataset's already-parsed record_ids ONCE (not once per part). This is the global
+    # fetch-skip set; reading it per part was the dominant "resume churn" over already-done parts.
+    # Stale within a run is fine — split_by_upload puts each upload (hence entry) in exactly ONE
+    # part, so a record parsed in an earlier part is never a re-fetch candidate in a later one.
+    parsed_ids = _dataset_record_ids(ds_dir)
+
     def _fetched_path(part: Path) -> Path:
         return part.with_name(part.stem + ".fetched.jsonl")
 
+    def _done_marker(part: Path) -> Path:
+        # PARTS-scoped so a different --parts value (which reshuffles each part's contents) never
+        # reuses a stale marker: PARTS=160's part-000 marker is ".done160", distinct from PARTS=40's.
+        # For a FIXED --parts, split_by_upload is deterministic, so a part's contents are stable
+        # across resumes and the marker is valid. (Clear these + the .fetched.jsonl if the keep-list
+        # itself changes — same staleness assumption the per-part resume already makes.)
+        return part.with_suffix(f".done{args.parts}")
+
+    # Per-part fetch summaries, so process_fn can see whether THIS part's fetch was complete
+    # before writing its .done marker. fetch_fn(i+1) writes key i+1 while process_fn(i) reads key
+    # i — distinct keys, GIL-safe.
+    fetch_summaries: dict[Path, dict] = {}
+
     def fetch_fn(part: Path) -> bool:
-        """Fetch one batch (bulk by default). Returns False if the disk-budget valve stopped
-        it part-way, so run_pipeline drains the background parse+purge and resumes THIS part."""
-        summary = _fetch(client, str(part), str(_fetched_path(part)), str(raw_dir), args, None)
+        """Fetch one batch. Returns False if the disk-budget valve stopped it part-way, so
+        run_pipeline drains the background parse+purge and resumes THIS part. A part already
+        marked .done is skipped in O(1) (no metadata read, no re-fetch) — kills the resume churn."""
+        if _done_marker(part).exists():
+            return True
+        summary = _fetch(client, str(part), str(_fetched_path(part)), str(raw_dir), args, None,
+                         dataset_record_ids=parsed_ids)
+        fetch_summaries[part] = summary
         return not summary.get("stopped_disk_budget", False)
 
     def process_fn(part: Path) -> None:
+        if _done_marker(part).exists():
+            return
         fetched = str(_fetched_path(part))
-        parse(fetched, dataset_dir=str(ds_dir), rejections_path=parse_rej,
-              raw_dir=str(raw_dir), max_primary_bytes=args.max_primary_bytes,
-              parse_timeout_s=args.parse_timeout, parse_workers=args.parse_workers)
+        pstats = parse(fetched, dataset_dir=str(ds_dir), rejections_path=parse_rej,
+                       raw_dir=str(raw_dir), max_primary_bytes=args.max_primary_bytes,
+                       parse_timeout_s=args.parse_timeout, parse_workers=args.parse_workers)
         purge_raw(str(raw_dir), str(ds_dir), fetched=fetched)
+        # Mark the part fully done (skipped in O(1) on later resumes) when this pass left nothing a
+        # future pass would redo — see _part_is_complete.
+        if _part_is_complete(fetch_summaries.get(part, {}), pstats):
+            try:
+                _done_marker(part).write_text("")
+            except OSError:
+                pass
 
     fetch_error: str | None = None
     done_parts: list[Path] = []
