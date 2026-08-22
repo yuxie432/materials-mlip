@@ -5,15 +5,14 @@
 #SBATCH -p icelake-himem               # 6760 MiB/core: parse (pymatgen) needs the RAM
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=6              # cores drive --parse-workers (parallel parse). MEASURED
-                                       # 2026-08-21: parse runs 26-40 calc/s (6 workers) vs fetch
-                                       # ~6 calc/s, so parse finishes each batch in ~15-25 min then
-                                       # IDLES ~60-100 min waiting on the (bandwidth-bound) fetch —
-                                       # it is NOT the bottleneck. 4 workers (~27 calc/s) still far
-                                       # exceed fetch, so cpus-per-task dropped 8->6 (workers+2, keeps
-                                       # RAM headroom for the fetch thread + forkserver) to free
-                                       # cores + schedule faster. Only raise these if staged_files_now
-                                       # stays PINNED at the disk valve (=parse-bound); it does not today.
+#SBATCH --cpus-per-task=8              # cores drive --parse-workers (parallel parse). 8 = 6 workers +2
+                                       # (fetch thread + forkserver + RAM headroom). Briefly tried 6/4
+                                       # when only the ~5-6 MB/s daytime fetch had been measured, but
+                                       # 2026-08-22 the OVERNIGHT fetch runs 10-14 MB/s (up to 17
+                                       # entries/s) and at 4 workers parse ran level with the fastest
+                                       # batch + peak_staged crept up — so back to 8/6 for margin.
+                                       # Raise further only if staged_files_now stays PINNED at the
+                                       # disk valve (=parse-bound); it is not today.
 #SBATCH --time=12:00:00                # SL3 max; SL1/SL2 may use up to 36:00:00
 #SBATCH --signal=B:USR1@600            # SIGUSR1 to the batch shell 10 min before wallclock
 #SBATCH -o logs_nomad/nomad-pipeline-%j.out  #   -> lets RESUBMIT=1 queue a resume job before the
@@ -79,39 +78,35 @@ PARTS="${PARTS:-160}"                  # batches; each part holds WHOLE uploads 
                                        # exactly one part) and, with fetch's global dataset-skip, does
                                        # NOT re-download already-parsed entries. Higher (e.g. 256) is
                                        # fine too; the only cost is a little more per-part overhead.
-# DISK/INODE PARTITION (fixed-slice design). The valve bounds only THIS job's raw staging
-# ($NOMAD_HARVEST_DATA/raw); it cannot see the Zenodo tree or another job's staging. NOMAD raw
-# staging is **INODE-bound, not byte-bound**: each entry stages 4 inodes (<entry_id>/extracted/
-# calc/vasprun.xml) but only ~0.26 MB, so the INODE valve caps peak staging and the byte valve is a
-# loose safety net. Peak bytes ~= (MAX_DISK_FILES/4) x 0.26 MB (~33 GB at 500k inodes; 200 GB leaves
-# generous margin for the OUTCAR-mainfile / AIMD tail). Raising NOMAD's BYTE ceiling does nothing
-# (inodes bind first); raising its INODE ceiling lets more of a part stage before the valve trips ->
-# better fetch/parse overlap. So NOMAD takes the larger INODE share and a Zenodo recovery (byte-heavy:
-# it whole-downloads tars) takes the larger BYTE share. The 1 TB / 1M-inode hpc-work quota is SHARED.
-# Worked budget (co-running NOMAD + the script-47 net-properties recovery), the two raw valves = 800 GB / 800k:
-#     NOMAD raw valve             200 GB / 500k   (this job, below — inode-bound; the big inode share)
-#     Zenodo-recovery raw valve   600 GB / 300k   (scripts/csd3/47_net_properties_recover.sh default)
-#   -> 800 GB / 800k leaves ~200 GB / ~200k of the quota for the existing Zenodo dataset (~40 GB / ~1k),
-#      the growing NOMAD dataset (~40-60 GB / ~few-k), the Phase-2 temp files, + headroom. Well under 1 TB / 1M.
-# For the FULL 7.1M run set PARTS>=80 so a part's ~355k inodes fits under the 500k valve in one window
-# (a bigger part still works — it just parses+purges in instalments, less overlap). Running NOMAD SOLO?
-# Raise to ~600 GB / 800k. The valve charges every byte + inode as created and refunds on delete, so
-# `staged <= limit` holds exactly.
-MAX_DISK_BYTES="${MAX_DISK_BYTES:-200000000000}"
-MAX_DISK_FILES="${MAX_DISK_FILES:-500000}"
+# DISK/INODE valve — bounds only THIS job's raw staging ($NOMAD_HARVEST_DATA/raw); it cannot see the
+# Zenodo tree. **BOTH bytes AND inodes bind** — the earlier "inode-bound, ~0.26 MB/entry" note was
+# wrong: measured 2026-08-22, peak staging hit 133 GB at 357k inodes (~1.5 MB/entry mean, up to
+# ~2.4 MB/entry on byte-heavy overnight batches full of big AIMD/large-cell vaspruns), so at the old
+# 200 GB byte ceiling there was only ~67 GB headroom. NOMAD now runs SOLO (no concurrent Zenodo
+# recovery), so it takes the whole raw budget: **700 GB / 700k inodes** (~0.7x the 1 TB / 1M hpc-work
+# quota — deliberately conservative, leaving ~300 GB / ~300k for the growing NOMAD dataset ~tens of GB
+# + the Zenodo dataset + comfortable headroom). More headroom = more parts can co-stage before the
+# valve trips = better fetch/parse overlap, which matters now that the overnight fetch is fast
+# (~10-14 MB/s) and staging fills quicker. 700k inodes ~= ~4 parts (a part is ~176k inodes at PARTS=160).
+# The valve charges every byte + inode as created and refunds on delete, so `staged <= limit` holds
+# exactly; a trip just stops cleanly and the pacing loop drains+resumes.
+# (If a Zenodo recovery is ever co-run again, drop these back so the two raw valves sum to <= ~800 GB / 800k.)
+MAX_DISK_BYTES="${MAX_DISK_BYTES:-700000000000}"
+MAX_DISK_FILES="${MAX_DISK_FILES:-700000}"
 # PARSE_WORKERS: parse this many calc units CONCURRENTLY (N worker THREADS parse; the MAIN thread is
 # the SOLE writer of shards+metadata, so workers never interleave a shard/metadata write — the
-# one-calc-at-a-time crash-safety invariant holds, parse.py:1514/1546). 4 gives ~27 calcs/s, still
-# FAR above the ~6 calcs/s bandwidth-bound fetch (measured 2026-08-21), so parse is never the bound;
-# extra workers only help while the disk valve is pinned (parse-bound drains), which does not happen
-# today. Override without editing: `PARSE_WORKERS=8 sbatch ...` (raise cpus-per-task to
-# >=PARSE_WORKERS+2 too). Diminishing returns once parse>=fetch or the single writer saturates.
-PARSE_WORKERS="${PARSE_WORKERS:-4}"
+# one-calc-at-a-time crash-safety invariant holds, parse.py:1514/1546). Back to 6 (was briefly 4):
+# measured 2026-08-22 the OVERNIGHT fetch runs 10-14 MB/s (~2x the daytime 5-6), and at 4 workers
+# parse (~13-16 calc/s) ran level with the fastest fetch batch (17 entries/s) and peak_staged crept up
+# — so 6 (~25-30 calc/s) restores a comfortable margin at the peak rate and keeps staging at a steady
+# ~2 parts. Extra workers beyond this only help while the disk valve is pinned (parse-bound drains).
+# Override without editing: `PARSE_WORKERS=4 sbatch ...` (keep cpus-per-task >= PARSE_WORKERS+2).
+PARSE_WORKERS="${PARSE_WORKERS:-6}"
 # RAM guard: refuse to ATTEMPT a primary bigger than this (0 = attempt everything). pymatgen peak
 # RSS is ~10x the (uncompressed) primary size, and PARSE_WORKERS parse AT ONCE, so RAM ~=
 # PARSE_WORKERS x MAX_PRIMARY_BYTES x 10 must fit the job. NOMAD vaspruns are tiny (median 0.36 MB),
-# RAM budget: 4 workers x 0.8 GB x 10 (pymatgen peak ~10x the uncompressed primary) = 32 GiB <
-# 6 cores x 6.76 GiB = 40 GiB. 800 MB covers even large AIMD vaspruns so few are needlessly skipped
+# RAM budget: 6 workers x 0.8 GB x 10 (pymatgen peak ~10x the uncompressed primary) = 48 GiB <
+# 8 cores x 6.76 GiB = 54 GiB. 800 MB covers even large AIMD vaspruns so few are needlessly skipped
 # (only ~30 in the whole corpus; primary_too_large is non-terminal — those records are NOT purged
 # (their calc is unparsed), so a single end-of-run sweep `parse --parse-workers 1 --max-primary-bytes 0`
 # on a himem node captures them from raw/ with NO re-fetch, giving one worker all the RAM for a big

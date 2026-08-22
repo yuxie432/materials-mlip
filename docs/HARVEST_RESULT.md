@@ -4,6 +4,11 @@ The first full Zenodo harvest run on CSD3 is **complete**: every one of the 1,35
 triage-kept records has been attempted, and the assembled training dataset is the
 `extxyz.gz` shards + `metadata.jsonl` under `data/dataset/`.
 
+> **All retrofit recoveries are now applied (2026-08-21)** — OUTCAR params, vasprun params,
+> per-calc availability, net moment/charge + OUTCAR SCF convergence, and the vaspout net-charge
+> fix. `verify` still passes. The "Superseded" notes below record what the *original* harvest
+> stored; the **"Current dataset state"** section gives the authoritative post-recovery metrics.
+
 ## Headline
 
 | quantity | value |
@@ -105,6 +110,54 @@ before ingesting).
 - **Provenance/filtering:** source DOI, `resource_type`, `license`, full INCAR/k-points/
   POTCAR, and `potcar_set_hash` (pseudopotential-set fingerprint — absolute energies are
   only comparable within an identical POTCAR set + functional + settings).
+
+## Current dataset state (post recoveries, 2026-08-21)
+
+Measured from `metadata.jsonl` (net charge/spin are per-calc constants broadcast to every frame,
+so frame-weighted = Σ n_frames of qualifying calcs; cross-checked against a direct shard scan).
+Parser split — calcs / frames: `ase.OUTCAR` 93,043 / 3,041,256 · `pymatgen.Vasprun` 83,351 /
+8,736,816 · `pymatgen.Vaspout` 345 / 92,457.
+
+**Net charge** (`Z_neutral − NELECT`) and **net spin** (`total_magnetization`, μ_B = N↑−N↓):
+
+| | frame-weighted | calc-weighted |
+|---|---|---|
+| net charge — non-zero / zero / null | 14.43% / 84.99% / **0.58%** | 13.85% / 85.98% / 0.17% |
+| net spin — `\|m\|>0.5` / `>1e-6` / zero / null | 6.03% / 6.96% / 92.97% / **0.07%** | 31.6% non-zero / 0.69% null |
+
+Coverage: net charge **99.42% frames / 99.83% calcs**; net spin **99.93% frames / 99.31% calcs**.
+Note the **frame-vs-calc skew**: ~31.6% of *calcs* are magnetic but only ~6% of *frames* — magnetic
+calcs have short trajectories, so frame count is dominated by non-magnetic relaxations/AIMD; balance a
+training set at the frame level accordingly.
+
+**Convergence** (calc-level `quality`, the *final* ionic step — this is what `verify` reports as
+`calcs_by_electronic_converged`; the *per-frame* verdict + `scf_dE` live on every frame in the shards):
+`electronic_converged` True 175,606 / False 841 / null 292; `total_n_frames_scf_unconverged` 20,393.
+`ionic_converged` **100% covered** (True 166,377 / False 10,362).
+
+### Why some spin/charge are still "unavailable" (and how much)
+
+| field | reason | calcs | frames |
+|---|---|---|---|
+| **net spin** | non-collinear **without an OUTCAR** — net moment needs the heavy projected magnetization, so recorded unavailable (all single-point → 1 frame each) | 1,117 | 1,117 (0.009%) |
+| **net spin** | ISPIN=2 vasprun/vaspout **without an OUTCAR** whose eigenvalues pymatgen couldn't parse (occupancy-method fallback failed) | 106 | 7,287 (0.061%) |
+| **net charge** | **vaspout.h5 without a co-located OUTCAR** — the HDF5 exposes no `<atominfo>` valence column and no resolvable NELECT/POTCAR-titel, so neither NELECT nor ZVAL is available | 282 | 68,886 (0.580%) |
+| **net charge** | vasprun/OUTCAR where NELECT or ZVAL was unresolvable (missing tag, or titel↔ions-per-type mismatch → refused rather than guessed) | 13 | 22 (0.000%) |
+
+So the only non-trivial gap is vaspout-without-OUTCAR charge (0.58% of frames). The vaspout calcs that
+*did* have a co-located OUTCAR (63, all in record `16448106`) were recovered via the OUTCAR fallback
+(`electronic_from_object`); the same clean re-fetch also corrected 24 of that record's vaspout net-spin
+values from "unavailable" to 0.0 — see below. Closing the remaining 282 would need a vaspout-HDF5
+`/input`,`/results` probe for NELECT/ZVAL.
+
+### Why the vaspout calcs had "unavailable" net spin before the `16448106` re-run
+
+Record `16448106` was a transient-failure straggler (HTTP 504s) in the first recovery, so its
+`vaspout.h5` files were staged incompletely — the compute step could not read `ISPIN` from the
+partial HDF5 and recorded the net spin (and charge) as "unavailable". The clean re-fetch produced
+intact files; since all 87 of the record's vaspout calcs are **ISPIN=1** (non-collinear=0), the net
+spin is correctly **0.0**, and 24 previously-"unavailable" values were fixed (an improvement, not a
+regression — verified against ISPIN). The 63 with a co-located OUTCAR additionally gained net charge.
 
 ## Operational lessons (for the mentor & the NOMAD phase)
 
