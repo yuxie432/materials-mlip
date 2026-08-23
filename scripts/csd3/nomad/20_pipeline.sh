@@ -5,14 +5,15 @@
 #SBATCH -p icelake-himem               # 6760 MiB/core: parse (pymatgen) needs the RAM
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8              # cores drive --parse-workers (parallel parse). 8 = 6 workers +2
-                                       # (fetch thread + forkserver + RAM headroom). Briefly tried 6/4
-                                       # when only the ~5-6 MB/s daytime fetch had been measured, but
-                                       # 2026-08-22 the OVERNIGHT fetch runs 10-14 MB/s (up to 17
-                                       # entries/s) and at 4 workers parse ran level with the fastest
-                                       # batch + peak_staged crept up — so back to 8/6 for margin.
-                                       # Raise further only if staged_files_now stays PINNED at the
-                                       # disk valve (=parse-bound); it is not today.
+#SBATCH --cpus-per-task=8              # cores set BOTH the RAM budget (6760 MiB/core on himem) and the
+                                       # parse-worker ceiling. 8 cores = 52.8 GiB, sized for
+                                       # PARSE_WORKERS=4 (see the memory sizing rule below): 4 workers x
+                                       # ~8 GiB + ~8 GiB overhead = 40 GiB < 52.8, safe to the endgame.
+                                       # *** OOM ROOT CAUSE 2026-08-23: the chain ran 6 workers on a
+                                       # 6-core/40.5 GiB node (this line was NOT pulled to CSD3) and
+                                       # hit MaxRSS 41.5 GiB -> OOM. MUST git-pull this + start a fresh
+                                       # chain. *** Do NOT raise PARSE_WORKERS without raising this to
+                                       # keep cpus-per-task >= PARSE_WORKERS + 4 AND satisfying the rule.
 #SBATCH --time=12:00:00                # SL3 max; SL1/SL2 may use up to 36:00:00
 #SBATCH --signal=B:USR1@600            # SIGUSR1 to the batch shell 10 min before wallclock
 #SBATCH -o logs_nomad/nomad-pipeline-%j.out  #   -> lets RESUBMIT=1 queue a resume job before the
@@ -93,24 +94,31 @@ PARTS="${PARTS:-160}"                  # batches; each part holds WHOLE uploads 
 # (If a Zenodo recovery is ever co-run again, drop these back so the two raw valves sum to <= ~800 GB / 800k.)
 MAX_DISK_BYTES="${MAX_DISK_BYTES:-700000000000}"
 MAX_DISK_FILES="${MAX_DISK_FILES:-700000}"
-# PARSE_WORKERS: parse this many calc units CONCURRENTLY (N worker THREADS parse; the MAIN thread is
-# the SOLE writer of shards+metadata, so workers never interleave a shard/metadata write — the
-# one-calc-at-a-time crash-safety invariant holds, parse.py:1514/1546). Back to 6 (was briefly 4):
-# measured 2026-08-22 the OVERNIGHT fetch runs 10-14 MB/s (~2x the daytime 5-6), and at 4 workers
-# parse (~13-16 calc/s) ran level with the fastest fetch batch (17 entries/s) and peak_staged crept up
-# — so 6 (~25-30 calc/s) restores a comfortable margin at the peak rate and keeps staging at a steady
-# ~2 parts. Extra workers beyond this only help while the disk valve is pinned (parse-bound drains).
-# Override without editing: `PARSE_WORKERS=4 sbatch ...` (keep cpus-per-task >= PARSE_WORKERS+2).
-PARSE_WORKERS="${PARSE_WORKERS:-6}"
-# RAM guard: refuse to ATTEMPT a primary bigger than this (0 = attempt everything). pymatgen peak
-# RSS is ~10x the (uncompressed) primary size, and PARSE_WORKERS parse AT ONCE, so RAM ~=
-# PARSE_WORKERS x MAX_PRIMARY_BYTES x 10 must fit the job. NOMAD vaspruns are tiny (median 0.36 MB),
-# RAM budget: 6 workers x 0.8 GB x 10 (pymatgen peak ~10x the uncompressed primary) = 48 GiB <
-# 8 cores x 6.76 GiB = 54 GiB. 800 MB covers even large AIMD vaspruns so few are needlessly skipped
-# (only ~30 in the whole corpus; primary_too_large is non-terminal — those records are NOT purged
-# (their calc is unparsed), so a single end-of-run sweep `parse --parse-workers 1 --max-primary-bytes 0`
-# on a himem node captures them from raw/ with NO re-fetch, giving one worker all the RAM for a big
-# vasprun). Keep PARSE_WORKERS x MAX_PRIMARY_BYTES x 10 under the job RAM if you change either.
+# PARSE_WORKERS: parse this many calc units CONCURRENTLY (N worker THREADS; each forks a child that
+# holds a whole vasprun trajectory in RAM). *** MEMORY IS THE HARD CONSTRAINT (OOM root cause,
+# 2026-08-23). *** sacct on the OOM chain (jobs 34236323/3462xx): MaxRSS 41.5 GiB on a 6-core /
+# 40.5 GiB node (ReqMem 40560M = 6 x 6760 MiB) -> OOM. The dataset (16.4M frames / 2.23M calcs) makes
+# the resume-path id-sets only ~2-4 GiB; the 41.5 GiB was the 6 PARSE WORKERS parsing ~640 MB
+# vaspruns at once (~6.4 GiB each = ~10x the uncompressed size). So the sizing rule is:
+#     PARSE_WORKERS x (10 x MAX_PRIMARY_BYTES) + OVERHEAD  <=  cpus-per-task x 6760 MiB
+# with worst-case ~8 GiB/worker at MAX_PRIMARY_BYTES=800 MB and OVERHEAD ~4 GiB now (grows to ~8 GiB
+# near 7.1M: the prune's committed_frame_ids set scales with total frames). At cpus-per-task=8
+# (52.8 GiB): 4 x 8 + 8 = 40 GiB < 52.8 -> SAFE with ~13 GiB headroom, robust to the endgame.
+# Throughput: measured ~3.3 calc/s per worker, so 4 workers ~= 13 calc/s = ~2x the measured fetch
+# (avg 6.5 entries/s), i.e. parse finishes each batch in ~half the fetch time (NOT rate-limiting);
+# rare instantaneous fetch bursts (~20 entries/s) are absorbed by the 700k-inode valve. Want more
+# parse margin for sustained overnight bursts? Raise BOTH together: `cpus-per-task=10` (SBATCH) +
+# `PARSE_WORKERS=6 sbatch ...` -> 6 x 8 + 8 = 56 GiB < 66 GiB (10 cores). Do NOT run 6 workers at
+# cpus<=8 (that is the config that OOM'd). Keep cpus-per-task >= PARSE_WORKERS + 4 for the fetch
+# thread + main + forkserver + the resume id-sets.
+PARSE_WORKERS="${PARSE_WORKERS:-4}"
+# RAM guard: refuse to ATTEMPT a primary bigger than this (0 = attempt everything); see the sizing
+# rule above. 800 MB covers all but the largest AIMD vaspruns (only ~30 skipped in the whole corpus)
+# and is NON-TERMINAL: a primary_too_large record is NOT purged (its calc stays unparsed in raw/), so
+# nothing is permanently excluded — a single end-of-run sweep `parse --parse-workers 1
+# --max-primary-bytes 0` on a himem node captures them from raw/ with NO re-fetch (one worker gets all
+# the node RAM for a big vasprun). Lowering this shrinks the per-worker peak (letting more workers fit)
+# but sends more calcs to that sweep; raising it needs fewer workers or more cpus per the rule above.
 MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-800000000}"
 # Hard-kill a single calc's parse after this many seconds (0 = off), so one non-terminating
 # pymatgen/ASE parse can't silently freeze the whole overlapped pipeline until wallclock.
