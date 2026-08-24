@@ -948,29 +948,63 @@ def _calc_id(unit: dict, base_meta: dict) -> str:
 _PRIMARY_ROLES_ORDER = ("vasprun", "vaspout", "outcar")
 
 
-def _effective_primary_size(path: str) -> int:
-    """Size to compare against ``--max-primary-bytes``: the UNCOMPRESSED size when it is
-    cheaply known, else the on-disk size.
+# A generous upper bound on how much a real vasprun/OUTCAR ``.bz2``/``.xz`` can expand. If even
+# this cannot push a compressed primary over the cap, it is safe WITHOUT decompressing (the tiny
+# majority); otherwise we stream-decompress to measure the true size. XML vaspruns compress
+# ~10-20x in practice, so 50 is a safe margin — over-estimating only costs a few extra cheap
+# size-probes, never an OOM.
+_COMPRESSED_MAX_EXPANSION = 50
 
-    pymatgen/ASE decompress a primary in memory, so peak RSS tracks the *uncompressed*
-    size, not the bytes on disk — and fetch stages many primaries still gzip-compressed
-    (``vasprun.xml.gz``/``OUTCAR.gz``; pymatgen and the OUTCAR fallback both read them
-    directly). Guarding on the on-disk size would let a compressed long-AIMD output slip
-    under the cap and still cgroup-kill the job — the exact failure the cap exists to
-    prevent. For a gzip file the uncompressed size is the 4-byte little-endian ISIZE
-    trailer (mod 2**32; exact for < 4 GiB), so use ``max(on_disk, ISIZE)``. A wrap
-    (uncompressed >= 4 GiB) is far over any sane cap, so if a sizeable gzip reports an
-    ISIZE below its own compressed size — impossible without a wrap — treat it as >= 4 GiB.
-    Other codecs (.bz2/.xz/.zst) carry no cheap uncompressed size, so they fall back to the
-    on-disk size (a documented limitation; gzip is by far the common case on Zenodo).
+
+def _uncompressed_size_capped(path: Path, opener: Any, cap: int) -> int:
+    """Uncompressed byte count of a compressed file, read as a STREAM (never held in memory) and
+    STOPPING once it exceeds ``cap`` — so the work is bounded by ~cap even for a multi-GB file.
+    The returned count is ``> cap`` iff the file's uncompressed size exceeds the cap."""
+    n = 0
+    with opener(path, "rb") as fh:
+        while True:
+            chunk = fh.read(1 << 20)
+            if not chunk:
+                break
+            n += len(chunk)
+            if n > cap:
+                break
+    return n
+
+
+def _effective_primary_size(path: str, max_primary_bytes: int = 0) -> int:
+    """Size to compare against ``--max-primary-bytes``: the UNCOMPRESSED size (what pymatgen/ASE
+    hold in RAM), computed cheaply where possible.
+
+    pymatgen/ASE decompress a primary in memory, so peak RSS tracks the *uncompressed* size, not
+    the bytes on disk — and fetch stages primaries compressed (``vasprun.xml.gz`` on Zenodo,
+    predominantly ``vasprun.xml.bz2`` on NOMAD). Guarding on the on-disk size would let a
+    compressed long-AIMD output slip under the cap and still cgroup-kill the job — the exact
+    failure the cap exists to prevent (root-caused from a live NOMAD OOM, 2026-08-24: a ``.bz2``
+    vasprun ~10-20x smaller than its trajectory blew a worker to ~50 GiB RSS).
+
+    * **gzip**: the uncompressed size is the 4-byte little-endian ISIZE trailer (mod 2**32; exact
+      for < 4 GiB), so use ``max(on_disk, ISIZE)``. A wrap (uncompressed >= 4 GiB) is far over any
+      sane cap, so a sizeable gzip whose ISIZE is below its own compressed size is treated as >= 4 GiB.
+    * **bz2 / xz / lzma**: no cheap uncompressed-size field. If even the max plausible expansion
+      (:data:`_COMPRESSED_MAX_EXPANSION`) keeps it under ``max_primary_bytes`` it is safe without
+      decompressing; otherwise stream-count the uncompressed bytes, stopping at the cap
+      (:func:`_uncompressed_size_capped` — bounded work, never holds the file in memory). Needs the
+      cap, hence the ``max_primary_bytes`` argument (0/absent = the caller is not enforcing a cap,
+      so the cheap on-disk size is returned).
+    * **plain**: on-disk == uncompressed.
+
     Returns 0 if the file is missing/unreadable (the normal parse paths report that).
     """
+    import bz2
+    import lzma
     p = Path(path)
     try:
         size = p.stat().st_size
     except OSError:
         return 0
-    if p.suffix.lower() == ".gz":
+    suf = p.suffix.lower()
+    if suf == ".gz":
         try:
             with p.open("rb") as fh:
                 fh.seek(-4, 2)  # 2 == SEEK_END; ISIZE is the last four bytes of a gzip
@@ -980,6 +1014,14 @@ def _effective_primary_size(path: str) -> int:
         if size >= (1 << 29) and isize < size:  # ISIZE wrapped -> uncompressed >= 4 GiB
             return max(size, 1 << 32)
         return max(size, isize)
+    if suf in (".bz2", ".xz", ".lzma"):
+        if not max_primary_bytes or size * _COMPRESSED_MAX_EXPANSION <= max_primary_bytes:
+            return size  # safe without decompressing (or no cap being enforced)
+        opener = {".bz2": bz2.open, ".xz": lzma.open, ".lzma": lzma.open}[suf]
+        try:
+            return _uncompressed_size_capped(p, opener, max_primary_bytes)
+        except Exception:  # noqa: BLE001 - corrupt/odd stream -> fall back; the parse will report it
+            return size
     return size
 
 
@@ -992,8 +1034,8 @@ def _oversized_primaries(unit: dict, max_primary_bytes: int) -> list[str]:
     scheduler that is not a caught ``MemoryError`` but a cgroup SIGKILL of the whole
     job, losing the fetch progress too. This lets a long unattended run cap what it
     will attempt (0 = no cap) and log the skip instead. Sizing is on the *uncompressed*
-    footprint for gzip primaries (see :func:`_effective_primary_size`), since RAM tracks
-    that, not the compressed bytes on disk.
+    footprint (uncompressed — including for ``.bz2``/``.xz``, the NOMAD norm; see
+    :func:`_effective_primary_size`), since RAM tracks that, not the compressed bytes on disk.
     """
     if not max_primary_bytes:
         return []
@@ -1002,7 +1044,7 @@ def _oversized_primaries(unit: dict, max_primary_bytes: int) -> list[str]:
         path = unit.get(role)
         if not path:
             continue
-        if _effective_primary_size(path) > max_primary_bytes:
+        if _effective_primary_size(path, max_primary_bytes) > max_primary_bytes:
             over.append(role)
     return over
 

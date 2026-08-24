@@ -5,15 +5,21 @@
 #SBATCH -p icelake-himem               # 6760 MiB/core: parse (pymatgen) needs the RAM
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8              # cores set BOTH the RAM budget (6760 MiB/core on himem) and the
-                                       # parse-worker ceiling. 8 cores = 52.8 GiB, sized for
-                                       # PARSE_WORKERS=4 (see the memory sizing rule below): 4 workers x
-                                       # ~8 GiB + ~8 GiB overhead = 40 GiB < 52.8, safe to the endgame.
-                                       # *** OOM ROOT CAUSE 2026-08-23: the chain ran 6 workers on a
-                                       # 6-core/40.5 GiB node (this line was NOT pulled to CSD3) and
-                                       # hit MaxRSS 41.5 GiB -> OOM. MUST git-pull this + start a fresh
-                                       # chain. *** Do NOT raise PARSE_WORKERS without raising this to
-                                       # keep cpus-per-task >= PARSE_WORKERS + 4 AND satisfying the rule.
+#SBATCH --cpus-per-task=12             # on himem the cores ARE the RAM budget (6760 MiB/core -> 79.2
+                                       # GiB / 85 GB at 12) — parse is fetch-bound-idle, so we buy cores
+                                       # for RAM, not compute. Sized PARSE_WORKERS=3 x MAX_PRIMARY_BYTES=1.6
+                                       # GB (uncompressed): a worker peaks at ~12x = ~19 GiB, so 3 x 19
+                                       # + ~10 GiB overhead (endgame) = ~67 GiB < 79.2 -> SAFE to ~15.6x RSS
+                                       # (16.5x now at ~6 GiB overhead; measured is ~10-12x, no record >14x). 3
+                                       # workers (not 4) let the cap go HIGHER (1.6 vs ~1.1 GB) same RAM -> fewer
+                                       # deferrals, which matters because there is NO automatic sweep
+                                       # (a primary_too_large calc stays unparsed in raw/). *** Two OOM
+                                       # rounds fixed: (1) 6 workers on a 6-core node (Aug 23); (2) the
+                                       # --max-primary-bytes guard sized .bz2 by COMPRESSED size, so
+                                       # multi-GB-uncompressed NOMAD vaspruns slipped the cap and blew a
+                                       # worker to ~50 GiB (Aug 24, fixed in parse._effective_primary_size).
+                                       # MUST git-pull both + start a FRESH chain (cpus is a frozen
+                                       # #SBATCH directive). *** Rule: cpus x 6760 MiB >= PARSE_WORKERS x 12 x MAX_PRIMARY_BYTES + overhead.
 #SBATCH --time=12:00:00                # SL3 max; SL1/SL2 may use up to 36:00:00
 #SBATCH --signal=B:USR1@600            # SIGUSR1 to the batch shell 10 min before wallclock
 #SBATCH -o logs_nomad/nomad-pipeline-%j.out  #   -> lets RESUBMIT=1 queue a resume job before the
@@ -95,31 +101,28 @@ PARTS="${PARTS:-160}"                  # batches; each part holds WHOLE uploads 
 MAX_DISK_BYTES="${MAX_DISK_BYTES:-700000000000}"
 MAX_DISK_FILES="${MAX_DISK_FILES:-700000}"
 # PARSE_WORKERS: parse this many calc units CONCURRENTLY (N worker THREADS; each forks a child that
-# holds a whole vasprun trajectory in RAM). *** MEMORY IS THE HARD CONSTRAINT (OOM root cause,
-# 2026-08-23). *** sacct on the OOM chain (jobs 34236323/3462xx): MaxRSS 41.5 GiB on a 6-core /
-# 40.5 GiB node (ReqMem 40560M = 6 x 6760 MiB) -> OOM. The dataset (16.4M frames / 2.23M calcs) makes
-# the resume-path id-sets only ~2-4 GiB; the 41.5 GiB was the 6 PARSE WORKERS parsing ~640 MB
-# vaspruns at once (~6.4 GiB each = ~10x the uncompressed size). So the sizing rule is:
-#     PARSE_WORKERS x (10 x MAX_PRIMARY_BYTES) + OVERHEAD  <=  cpus-per-task x 6760 MiB
-# with worst-case ~8 GiB/worker at MAX_PRIMARY_BYTES=800 MB and OVERHEAD ~4 GiB now (grows to ~8 GiB
-# near 7.1M: the prune's committed_frame_ids set scales with total frames). At cpus-per-task=8
-# (52.8 GiB): 4 x 8 + 8 = 40 GiB < 52.8 -> SAFE with ~13 GiB headroom, robust to the endgame.
-# Throughput: measured ~3.3 calc/s per worker, so 4 workers ~= 13 calc/s = ~2x the measured fetch
-# (avg 6.5 entries/s), i.e. parse finishes each batch in ~half the fetch time (NOT rate-limiting);
-# rare instantaneous fetch bursts (~20 entries/s) are absorbed by the 700k-inode valve. Want more
-# parse margin for sustained overnight bursts? Raise BOTH together: `cpus-per-task=10` (SBATCH) +
-# `PARSE_WORKERS=6 sbatch ...` -> 6 x 8 + 8 = 56 GiB < 66 GiB (10 cores). Do NOT run 6 workers at
-# cpus<=8 (that is the config that OOM'd). Keep cpus-per-task >= PARSE_WORKERS + 4 for the fetch
-# thread + main + forkserver + the resume id-sets.
-PARSE_WORKERS="${PARSE_WORKERS:-4}"
-# RAM guard: refuse to ATTEMPT a primary bigger than this (0 = attempt everything); see the sizing
-# rule above. 800 MB covers all but the largest AIMD vaspruns (only ~30 skipped in the whole corpus)
-# and is NON-TERMINAL: a primary_too_large record is NOT purged (its calc stays unparsed in raw/), so
-# nothing is permanently excluded — a single end-of-run sweep `parse --parse-workers 1
-# --max-primary-bytes 0` on a himem node captures them from raw/ with NO re-fetch (one worker gets all
-# the node RAM for a big vasprun). Lowering this shrinks the per-worker peak (letting more workers fit)
-# but sends more calcs to that sweep; raising it needs fewer workers or more cpus per the rule above.
-MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-800000000}"
+# holds a whole vasprun trajectory in RAM). *** MEMORY IS THE HARD CONSTRAINT. *** Sizing rule
+# (per-worker peak ~= 10-12x the UNCOMPRESSED primary size — pymatgen holds the trajectory):
+#     PARSE_WORKERS x (12 x MAX_PRIMARY_BYTES) + OVERHEAD  <=  cpus-per-task x 6760 MiB
+# OVERHEAD ~6 GiB now, ~10 GiB near 7.1M — dominated by the prune`s committed_frame_ids set (ONE
+# string per dataset frame, ~52M at 7.1M) which scales with total frames; sized for the endgame.
+# Config: 3 workers x (~12x x 1.6 GB = ~19 GiB) + ~10 (endgame overhead) = ~67 GiB < 79.2 GiB (12 cores; safe to ~15.6x).
+# 3 workers ~= 10 calc/s (measured ~3.3/worker) > the ~6.5 entries/s fetch, so parse is NOT rate-
+# limiting (fetch-bound harvest; bursts absorbed by the valve). Chose 3 (not 4) so the cap can go
+# HIGHER for the same RAM -> fewer deferrals (no sweep, see below). Do NOT raise without re-checking the rule.
+PARSE_WORKERS="${PARSE_WORKERS:-3}"
+# RAM guard: skip a primary whose UNCOMPRESSED size exceeds this (0 = attempt everything). The guard is
+# on the UNCOMPRESSED footprint for .gz AND .bz2/.xz (parse._effective_primary_size, fixed 2026-08-24)
+# — RAM tracks the decompressed trajectory, and NOMAD vaspruns are .bz2 that expand ~10-20x, so
+# guarding on the compressed size let multi-GB trajectories slip the cap and OOM a worker. 1.6 GB
+# (uncompressed) keeps essentially all vaspruns inline; only the extreme >1.6 GB AIMD tail is deferred.
+# *** THERE IS NO AUTOMATIC SWEEP *** (user pref 2026-08-24 — it would slow the harvest). A deferred
+# primary_too_large calc is NON-TERMINAL but stays UNPARSED and its raw/ dir is NOT purged, so deferrals
+# accumulate on disk over the campaign. Keep this cap HIGH (few deferrals) and WATCH the primary_too_large
+# count (status/rejections) + raw/ size; if the un-purgeable leftovers ever eat into the disk valve, run
+# a one-off recovery pass by hand LATER (`parse --parse-workers 1 --max-primary-bytes 0` on a big-RAM
+# node, then purge-raw). Raise this only with more cpus per the rule; lowering it defers MORE (worse here).
+MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-1600000000}"
 # Hard-kill a single calc's parse after this many seconds (0 = off), so one non-terminating
 # pymatgen/ASE parse can't silently freeze the whole overlapped pipeline until wallclock.
 PARSE_TIMEOUT="${PARSE_TIMEOUT:-1200}"

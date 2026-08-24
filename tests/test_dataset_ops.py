@@ -414,6 +414,33 @@ def test_effective_primary_size_uses_uncompressed_size_for_gzip(tmp_path):
     assert _effective_primary_size(str(plain)) == 2048
 
 
+def test_effective_primary_size_uses_uncompressed_size_for_bz2(tmp_path):
+    # NOMAD stages vaspruns .bz2-compressed and XML expands ~10-20x, so the RAM guard MUST size on
+    # the uncompressed length for .bz2 too — else a .bz2 vasprun ~10x smaller than its trajectory
+    # slips under --max-primary-bytes and OOM-kills a worker (root cause of the 2026-08-24 OOMs).
+    import bz2
+
+    from zenodo_harvest.parse import _effective_primary_size, _oversized_primaries
+    root = tmp_path / "raw" / "1" / "extracted" / "calc"
+    root.mkdir(parents=True)
+    payload = b"<modeling>\n" + b"  <calculation/>\n" * 300_000    # ~5 MB uncompressed, compresses hard
+    bz = root / "vasprun.xml.bz2"
+    bz.write_bytes(bz2.compress(payload))
+    on_disk = bz.stat().st_size
+    assert on_disk < len(payload) // 20, "fixture must compress well for a meaningful test"
+    # WITHOUT a cap the cheap on-disk size is returned (no decompression).
+    assert _effective_primary_size(str(bz)) == on_disk
+    # A cap below on_disk*_COMPRESSED_MAX_EXPANSION forces the streaming uncompressed-count path,
+    # which sees the real (much larger) uncompressed size and flags it — the OOM guard for .bz2.
+    cap = on_disk * 10
+    assert on_disk < cap < len(payload)
+    assert _effective_primary_size(str(bz), cap) > cap
+    assert _oversized_primaries({"dir": str(root), "vasprun": str(bz)}, cap) == ["vasprun"]
+    # A comfortably-large cap: the gate keeps it cheap (no decompression) AND it is not flagged.
+    big_cap = len(payload) * 10
+    assert _oversized_primaries({"dir": str(root), "vasprun": str(bz)}, big_cap) == []
+
+
 def test_parse_unit_rejects_when_every_primary_is_oversized(tmp_path):
     from zenodo_harvest.manifest import RejectionLogger
     from zenodo_harvest.parse import parse_calc_unit
