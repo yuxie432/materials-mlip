@@ -27,6 +27,7 @@ import logging
 import os
 import shutil
 from collections import Counter
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -225,7 +226,7 @@ def _scan_disk(dataset_dir: str | Path) -> tuple[Counter, Counter, list[str]]:
     return disk_counts, elements, truncated
 
 
-def check_integrity(records: list[dict], disk_counts: Counter,
+def check_integrity(records: Iterable[dict], disk_counts: Counter,
                     truncated_shards: list[str]) -> dict:
     """metadata<->shard frame_id bijection (the cheap sanity gate after every array job).
 
@@ -278,7 +279,7 @@ def _key(value: Any) -> str:
     return "null" if value is None else str(value)
 
 
-def _dataset_stats(records: list[dict], elements: Counter) -> dict:
+def _dataset_stats(records: Iterable[dict], elements: Counter) -> dict:
     """Curation stats from the metadata records + the element Counter that the
     streaming disk scan (:func:`_scan_disk`) already accumulated.
 
@@ -295,7 +296,9 @@ def _dataset_stats(records: list[dict], elements: Counter) -> dict:
     by_resource_type: Counter = Counter()
     conv = {"true": 0, "false": 0, "null": 0}
     tot_scf_unconverged = tot_dropped = tot_with_forces = tot_with_stress = 0
-    for rec in records:
+    n_calcs = 0
+    for rec in records:                                  # single streaming pass (no materialisation)
+        n_calcs += 1
         nf = len(rec.get("frame_ids", []))
         cp = rec.get("calc_parameters", {}) or {}
         prov = rec.get("provenance", {}) or {}
@@ -314,7 +317,7 @@ def _dataset_stats(records: list[dict], elements: Counter) -> dict:
 
     # `elements` was accumulated during the single streaming disk scan (no re-read).
     return {
-        "n_calcs": len(records),
+        "n_calcs": n_calcs,
         "frames_by_parser": dict(by_parser),
         "frames_by_run_type": dict(by_run_type),
         "frames_by_functional": dict(by_functional),
@@ -337,10 +340,16 @@ def verify_dataset(dataset_dir: str | Path) -> dict:
     extra I/O). ``ok`` is False on any integrity mismatch; the CLI maps that to a
     non-zero exit. A truncated top shard is surfaced as a warning, not a failure.
     """
-    records = _load_metadata(dataset_dir)
+    # STREAM the metadata (two cheap passes) rather than materialising every record — the same
+    # scaling OOM the per-part purge hit (millions of deep dicts ~= tens of GiB). Each consumer
+    # makes a single pass, so a fresh read_jsonl generator per consumer is correct and holds only
+    # its accumulator (integrity's frame_id multiset; stats' counters), not the records. Fixed 2026-08-29.
+    mp = Path(dataset_dir) / "metadata.jsonl"
+    def _recs() -> Iterable[dict]:
+        return read_jsonl(mp) if mp.is_file() else iter(())
     disk_counts, elements, truncated = _scan_disk(dataset_dir)
-    integrity = check_integrity(records, disk_counts, truncated)
-    stats = _dataset_stats(records, elements)
+    integrity = check_integrity(_recs(), disk_counts, truncated)
+    stats = _dataset_stats(_recs(), elements)
     stats["n_frames_metadata"] = integrity["n_frames_metadata"]
     stats["n_frames_on_disk"] = integrity["n_frames_on_disk"]
     return {"dataset_dir": str(dataset_dir), "ok": integrity["ok"],
@@ -724,8 +733,14 @@ def purge_raw(raw_dir: str | Path, dataset_dir: str | Path,
     if not fetched_path.is_file():
         raise FileNotFoundError(f"fetched manifest not found: {fetched_path}")
 
-    parsed = {rec["calc_id"] for rec in _load_metadata(dataset_dir) if rec.get("calc_id")}
-    fetched_records = list(read_jsonl(fetched_path))  # read fully BEFORE any deletion
+    # STREAM the dataset's calc_ids — never materialise all metadata records. metadata.jsonl grows
+    # with the dataset (millions of deep INCAR/POTCAR/quality dicts, ~15-18 KB each in RAM), so
+    # `list(read_jsonl(...))` here was ~80 GiB at 4.4M calcs and OOM-killed the per-part purge (the
+    # dominant cost is purely the calc_id set, ~0.5 GiB). Fixed 2026-08-29.
+    _mp = dataset_dir / "metadata.jsonl"
+    parsed = ({rec["calc_id"] for rec in read_jsonl(_mp) if rec.get("calc_id")}
+              if _mp.is_file() else set())
+    fetched_records = list(read_jsonl(fetched_path))  # read fully BEFORE any deletion (one part, small)
 
     per_recid: list[dict] = []
     n_purged = n_kept = bytes_freed = files_removed = 0

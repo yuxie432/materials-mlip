@@ -674,3 +674,25 @@ def test_enrich_is_idempotent(tmp_path):
     assert mp.read_text() == once                           # stable
     rec = next(iter(read_jsonl(mp)))
     assert "resolved" not in rec["calc_parameters"]["resolved"]   # not nested
+
+
+def test_purge_and_verify_stream_metadata_not_materialize(tmp_path, monkeypatch):
+    # purge_raw and verify_dataset must STREAM metadata.jsonl (calc_id set / frame_id multiset),
+    # never materialise every record — `list(read_jsonl(...))` was ~80 GiB at 4.4M calcs and OOM-killed
+    # the per-part purge on a 12-core (79 GiB) node (2026-08-29). Guard by making the materialising
+    # helper raise: if either path still calls it this fails; the streaming versions succeed.
+    import zenodo_harvest.dataset_ops as dops
+    raw = tmp_path / "raw"
+    manifests = tmp_path / "manifests"
+    manifests.mkdir(parents=True)
+    ds = tmp_path / "dataset"
+    rec_full, ids_full = _fetched_record(raw, "111", ["relaxA"])
+    write_jsonl(manifests / "fetched.jsonl", [rec_full])
+    _dataset_with_calcs(ds, ids_full)
+
+    def _boom(*a, **k):
+        raise AssertionError("_load_metadata must not be called — purge/verify must stream")
+    monkeypatch.setattr(dops, "_load_metadata", _boom)
+
+    assert purge_raw(raw, ds, fetched=manifests / "fetched.jsonl")["ok"] is True
+    assert verify_dataset(ds)["ok"] is True
