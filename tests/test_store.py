@@ -591,6 +591,33 @@ def test_rejected_calc_ids_empty_when_file_absent(tmp_path):
     assert parse_mod._rejected_calc_ids(tmp_path / "nope.jsonl") == set()
 
 
+def test_rejected_calc_ids_config_aware_deferrals(tmp_path):
+    """primary_too_large/parse_timeout are skipped on resume ONLY when the CURRENT config
+    guarantees an identical re-failure — the fix for the resume 'churn'. Raising the cap/
+    timeout (or 0 = off) re-attempts them; an unchanged/lower config skips them."""
+    rp = tmp_path / "rej.jsonl"
+    with RejectionLogger(rp) as rej:
+        rej.reject("parse", "n:big/vasprun.xml", "primary_too_large",
+                   roles=["vasprun"], max_primary_bytes=1_600_000_000)
+        rej.reject("parse", "n:slow/vasprun.xml", "parse_timeout", timeout_s=1200)
+        rej.reject("parse", "n:term/vasprun.xml", "vasprun_parse_error")  # always skipped
+        rej.reject("parse", "n:nocap/vasprun.xml", "primary_too_large")   # no recorded cap
+
+    term = {"n:term/vasprun.xml"}
+    # Same config as when they were rejected -> both deferrals re-fail -> skipped.
+    assert parse_mod._rejected_calc_ids(rp, 1_600_000_000, 1200) == (
+        term | {"n:big/vasprun.xml", "n:slow/vasprun.xml"})
+    # LOWER cap / SHORTER timeout -> still re-fail -> still skipped.
+    assert parse_mod._rejected_calc_ids(rp, 800_000_000, 600) == (
+        term | {"n:big/vasprun.xml", "n:slow/vasprun.xml"})
+    # HIGHER cap / LONGER timeout -> might now succeed -> re-attempted (NOT skipped).
+    assert parse_mod._rejected_calc_ids(rp, 4_000_000_000, 3600) == term
+    # Uncapped / no timeout (0 = attempt everything) -> re-attempted.
+    assert parse_mod._rejected_calc_ids(rp, 0, 0) == term
+    # A primary_too_large with no recorded cap is never config-skipped (fail-safe).
+    assert "n:nocap/vasprun.xml" not in parse_mod._rejected_calc_ids(rp, 1_000_000_000, 0)
+
+
 # --------------------------------------------------------------------------- #
 # parse() feeds each calc its OWN per-calc availability (fix #1 wiring).        #
 # --------------------------------------------------------------------------- #

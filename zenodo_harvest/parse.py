@@ -1348,15 +1348,49 @@ _PARSE_TERMINAL_REJECT_REASONS = frozenset({
 })
 
 
-def _rejected_calc_ids(rejections_path: Path) -> set[str]:
-    """calc_ids already rejected with a DETERMINISTIC parse failure — skipped on resume so
-    the parser is not re-run on files it has already proven it cannot parse."""
+def _rejected_calc_ids(
+    rejections_path: Path,
+    max_primary_bytes: int = 0,
+    parse_timeout_s: float = 0,
+) -> set[str]:
+    """calc_ids to SKIP on resume rather than re-run the parser on. Two groups:
+
+    * DETERMINISTIC parse failures (:data:`_PARSE_TERMINAL_REJECT_REASONS`) — a re-parse of the
+      same file with the same pymatgen/ASE reproduces them identically.
+    * CONFIG-DETERMINISTIC deferrals whose CURRENT settings guarantee an identical re-failure:
+      a ``primary_too_large`` calc whose recorded cap is >= the current ``max_primary_bytes``
+      (the primary is still over the cap) and a ``parse_timeout`` calc whose recorded timeout
+      is >= the current ``parse_timeout_s``. These stay RETRYABLE — RAISING the cap/timeout (or
+      setting it to 0 = off) drops them from the skip set so a bigger-RAM / longer run
+      re-attempts them — but under an UNCHANGED config they re-fail on every resume, so
+      re-attempting them each resubmit is pure waste that also keeps the containing pipeline
+      part perpetually un-``.done`` (the resume "churn": every resubmit re-pays a full
+      O(dataset) metadata rescan for such a part before doing any new work). Skipping them
+      makes the part's fresh-``rejections`` count fall to 0 so it is marked done and skipped
+      O(1) thereafter. No data is lost: they remain in rejections.jsonl and their raw/ dir is
+      not purged (its calc never entered the dataset), so a later ``--retry-rejected`` / higher
+      ``--max-primary-bytes`` recovery on the fetched manifest still reaches them (that manual
+      path reads the manifest directly and ignores the pipeline's ``.done`` markers)."""
     if not rejections_path.is_file():
         return set()
-    return {r["id"] for r in read_jsonl(rejections_path)
-            if r.get("stage") == "parse"
-            and r.get("reason") in _PARSE_TERMINAL_REJECT_REASONS
-            and isinstance(r.get("id"), str)}
+    skip: set[str] = set()
+    for r in read_jsonl(rejections_path):
+        cid, reason = r.get("id"), r.get("reason")
+        if r.get("stage") != "parse" or not isinstance(cid, str):
+            continue
+        if reason in _PARSE_TERMINAL_REJECT_REASONS:
+            skip.add(cid)
+        elif reason == "primary_too_large" and max_primary_bytes:
+            rec = r.get("max_primary_bytes")
+            # size > rec (it was rejected under rec); current cap <= rec => size > cap => re-fails.
+            if isinstance(rec, (int, float)) and max_primary_bytes <= rec:
+                skip.add(cid)
+        elif reason == "parse_timeout" and parse_timeout_s:
+            rec = r.get("timeout_s")
+            # timed out at rec; current timeout <= rec => still times out.
+            if isinstance(rec, (int, float)) and parse_timeout_s <= rec:
+                skip.add(cid)
+    return skip
 
 
 # --- per-calc parse timeout (isolate a non-terminating pymatgen/ASE parse) ---------
@@ -1547,8 +1581,12 @@ def parse(
     On resume, calcs already rejected with a *deterministic* parse failure (see
     :data:`_PARSE_TERMINAL_REJECT_REASONS`) are **skipped** rather than re-parsed — re-running
     the parser on files it has already proven unparseable wastes minutes per resume on a big
-    bad record and duplicates rejection lines. ``retry_rejected=True`` re-attempts them (use
-    after a pymatgen/ase upgrade).
+    bad record and duplicates rejection lines. So are ``primary_too_large`` / ``parse_timeout``
+    deferrals whose *current* ``max_primary_bytes`` / ``parse_timeout_s`` guarantee an identical
+    re-failure (see :func:`_rejected_calc_ids`) — this stops the pipeline re-deferring the same
+    oversized/slow calcs on every resubmit (the resume "churn"). Both groups stay recoverable:
+    ``retry_rejected=True`` re-attempts everything (use after a pymatgen/ase upgrade), and merely
+    RAISING the cap/timeout re-attempts the config-deterministic ones.
 
     ``parse_workers`` (>1) parses that many calc units concurrently: N worker threads each run
     :func:`_parse_one` (which forks a timeout-guarded child), while the MAIN thread writes each
@@ -1573,7 +1611,9 @@ def parse(
     # (the parallel model is one dataset dir per array task; merge afterwards).
     with DatasetLock(dataset_dir):
         done_calc_ids, committed_frame_ids = _load_committed(metadata_path)
-        rejected_calc_ids = set() if retry_rejected else _rejected_calc_ids(Path(rejections_path))
+        rejected_calc_ids = (set() if retry_rejected
+                             else _rejected_calc_ids(Path(rejections_path),
+                                                     max_primary_bytes, parse_timeout_s))
         pruned = prune_uncommitted_frames(dataset_dir, committed_frame_ids)
         start_index = next_shard_index(dataset_dir)  # after pruning may drop shards
         if done_calc_ids or rejected_calc_ids or pruned["frames_dropped"]:
