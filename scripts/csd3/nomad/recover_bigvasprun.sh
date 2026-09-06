@@ -8,25 +8,29 @@
                                        # Peak = resume frame_id set (~8 GiB, appending to the 7M
                                        # dataset) + ONE parse of the largest remaining file
                                        # (3.47 GB x ~12 pymatgen blow-up = ~42 GiB) = ~50 GiB
-                                       # -> ~16 GiB headroom. The 8.51 GB monster is EXCLUDED
-                                       # (recover_bigvasprun_manifest.py); do it separately with
-                                       # cpus-per-task=24. If any single parse still overshoots,
+                                       # -> ~16 GiB headroom. The 8.51 GB monster is EXCLUDED when
+                                       # you build the manifest; do it separately with cpus=24.
                                        # --parse-timeout>0 runs each calc in a child, so a cgroup
-                                       # OOM kills only that child (logged parse_worker_died,
-                                       # retryable) — the job survives and the rest complete.
-#SBATCH --time=04:00:00                # only ~24 small-ish calcs; serial finishes in well under this
+                                       # OOM kills only that child (parse_worker_died, retryable) —
+                                       # the job survives and the rest complete.
+#SBATCH --time=04:00:00                # only ~24 small-ish calcs; serial finishes well under this
 #SBATCH -o logs_nomad/nomad-recover-bigvasprun-%j.out
 #SBATCH -e logs_nomad/nomad-recover-bigvasprun-%j.err
 #SBATCH --mail-type=END,FAIL
 #
-# Re-parse the primary_too_large vasprun.xml calcs (the long-AIMD trajectories deferred by the
-# RAM cap) into the EXISTING dataset. No re-fetch: the staged files are still on disk (parse
-# failures never purge). Steps: build the subset fetched manifest -> parse uncapped (serial) ->
-# verify -> purge-raw those records. Idempotent + resumable.
+# STEP 2 of the primary_too_large recovery: re-parse the deferred long-AIMD vasprun.xml calcs
+# (uncapped, SERIAL) into the EXISTING dataset, then verify + purge-raw. No re-fetch (the staged
+# files are still on disk). Same pymatgen/parse/store as the 7M existing calcs -> consistent.
 #
-# WHY SERIAL (parse-workers=1): only ~24 calcs, so throughput is irrelevant (serial finishes in
-# minutes); serial removes any risk of two multi-GB parses colliding in RAM and makes the budget
-# trivial to reason about. RAM — not CPU — is the binding constraint here.
+# WHY SERIAL (parse-workers=1, the standalone `parse` default): only ~24 calcs, so throughput is
+# irrelevant (finishes in minutes); serial keeps peak RAM at ONE multi-GB parse and makes the
+# budget trivial. RAM — not CPU — is the binding constraint.
+#
+# *** STEP 1 (build the subset manifest) MUST BE RUN FIRST, on a login node: ***
+#     module load python/3.11.0-icl && source ~/materials-mlip/.venv/bin/activate
+#     cd ~/materials-mlip && python scripts/csd3/nomad/build_reparse_manifest.py \
+#         --reason primary_too_large --exclude dhOiawS2QOf-3IH1c7bYLS2RN4OR \
+#         --out $NOMAD_HARVEST_DATA/manifests/nomad_bigvasprun_fetched.jsonl
 #
 # Create logs_nomad/ BEFORE submitting: mkdir -p logs_nomad
 set -euo pipefail
@@ -46,7 +50,14 @@ DATASET_DIR="$NOMAD_HARVEST_DATA/dataset"
 RAW="$NOMAD_HARVEST_DATA/raw"
 FETCHED="$MAN/nomad_bigvasprun_fetched.jsonl"
 
-echo "=== recover-bigvasprun START $(date -Is) on $(hostname) ==="
+echo "=== recover-bigvasprun (parse) START $(date -Is) on $(hostname) ==="
+if [[ ! -s "$FETCHED" ]]; then
+    echo "ERROR: $FETCHED missing/empty. Run step 1 on a login node first:" >&2
+    echo "       python scripts/csd3/nomad/build_reparse_manifest.py --reason primary_too_large \\" >&2
+    echo "           --exclude dhOiawS2QOf-3IH1c7bYLS2RN4OR --out $FETCHED" >&2
+    exit 2
+fi
+echo "records to re-parse: $(wc -l < "$FETCHED")"
 quota 2>/dev/null || lfs quota -u "$USER" "$NOMAD_HARVEST_DATA" 2>/dev/null || true
 
 if [[ -e "$DATASET_DIR/.parse.lock" ]]; then
@@ -54,19 +65,8 @@ if [[ -e "$DATASET_DIR/.parse.lock" ]]; then
     rm -f "$DATASET_DIR/.parse.lock"
 fi
 
-# ---- step 1: build the subset fetched manifest ----------------------------------
-echo "=== step 1: build big-vasprun fetched manifest $(date -Is) ==="
-python scripts/csd3/nomad/recover_bigvasprun_manifest.py
-if [[ ! -s "$FETCHED" ]]; then
-    echo "no records to re-parse; exiting 0."
-    exit 0
-fi
-echo "records to re-parse: $(wc -l < "$FETCHED")"
-
-# ---- step 2: parse uncapped (serial), into the existing dataset ------------------
-# --max-primary-bytes 0 disables the cap, so ONLY the primary_too_large deferrals are re-attempted
+# --max-primary-bytes 0 disables the cap -> ONLY the primary_too_large deferrals are re-attempted
 # (terminal parse failures stay skipped via the rejection log; already-parsed calcs skip via resume).
-echo "=== step 2: parse (uncapped, serial) $(date -Is) ==="
 python -m zenodo_harvest.cli parse \
     --in "$FETCHED" \
     --dataset-dir "$DATASET_DIR" \
@@ -75,8 +75,7 @@ python -m zenodo_harvest.cli parse \
     --max-primary-bytes 0 \
     --parse-timeout 3600
 
-# ---- step 3: verify + reclaim the now-parsed staging ----------------------------
-echo "=== step 3: verify + purge-raw $(date -Is) ==="
+echo "=== verify + purge-raw $(date -Is) ==="
 python -m zenodo_harvest.cli verify --dataset-dir "$DATASET_DIR"
 python -m zenodo_harvest.cli purge-raw --raw-dir "$RAW" --dataset-dir "$DATASET_DIR" \
     --fetched "$FETCHED"

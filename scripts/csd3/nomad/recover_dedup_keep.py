@@ -27,6 +27,14 @@ import os
 import sys
 from pathlib import Path
 
+# Put the repo root on sys.path so `python scripts/csd3/nomad/recover_dedup_keep.py` (which
+# sets sys.path[0] to the SCRIPT's dir, not the repo root) can import the harvest packages —
+# the same reason the harvest itself is always launched as `python -m nomad_harvest.cli`.
+for _root in Path(__file__).resolve().parents:
+    if (_root / "nomad_harvest").is_dir():
+        sys.path.insert(0, str(_root))
+        break
+
 from nomad_harvest import harvest
 from nomad_harvest.client import CANDIDATE_REQUIRED, NomadClient
 from zenodo_harvest.manifest import JsonlWriter, read_jsonl

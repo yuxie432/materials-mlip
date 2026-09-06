@@ -13,17 +13,19 @@
 #SBATCH -e logs_nomad/nomad-recover-dedup-%j.err
 #SBATCH --mail-type=END,FAIL
 #
-# Recover the ~18,615 NOMAD VASP-DFT calcs wrongly dropped as duplicate_of_zenodo (they only
-# CITE a Zenodo code release that holds no VASP data and was never harvested — see
-# recover_dedup_keep.py). Two steps in one compute job:
-#   1. rebuild a corrected keep-list (re-query metadata + narrowed dedup) -> nomad_recover_keep.jsonl
-#   2. fetch+parse it into the EXISTING NOMAD dataset (the global dataset-skip touches only these
-#      new entries; verify runs at the end).
-# Everything is resumable: re-submitting this script continues both steps where they stopped.
-# This does NOT change discover's dedup rule for future runs — that one-line fix in harvest.py is
-# left for later (see the investigation notes); this recovery inlines the narrowed rule itself.
+# STEP 2 of the dedup false-positive recovery: fetch+parse the corrected keep-list into the
+# EXISTING NOMAD dataset. The global dataset-skip means only the newly-kept entries are fetched;
+# the shared parse/store append new shards+metadata in the SAME schema as the existing 7M calcs
+# (same pymatgen 2026.5.4, disjoint calc_ids), and the run ends with `verify` (bijection check).
 #
-# Create logs_nomad/ BEFORE submitting (SLURM opens -o/-e before the body runs): mkdir -p logs_nomad
+# *** STEP 1 (build the keep-list) MUST BE RUN FIRST, on a login node: ***
+#     module load python/3.11.0-icl && source ~/materials-mlip/.venv/bin/activate
+#     cd ~/materials-mlip && python scripts/csd3/nomad/recover_dedup_keep.py
+#   -> writes $NOMAD_HARVEST_DATA/manifests/nomad_recover_keep.jsonl (network-light metadata query;
+#      confirm it reports ~18,615 kept before submitting this job).
+#
+# Everything is resumable: re-submitting this script continues where it stopped.
+# Create logs_nomad/ BEFORE submitting: mkdir -p logs_nomad
 set -euo pipefail
 
 # ---- ENV SETUP (edit me) --------------------------------------------------------
@@ -41,27 +43,21 @@ DATASET_DIR="$NOMAD_HARVEST_DATA/dataset"
 RAW="$NOMAD_HARVEST_DATA/raw"
 KEEP="$MAN/nomad_recover_keep.jsonl"
 
-echo "=== recover-dedup START $(date -Is) on $(hostname) ==="
+echo "=== recover-dedup (fetch+parse) START $(date -Is) on $(hostname) ==="
+if [[ ! -s "$KEEP" ]]; then
+    echo "ERROR: $KEEP missing/empty. Run step 1 on a login node first:" >&2
+    echo "       python scripts/csd3/nomad/recover_dedup_keep.py" >&2
+    exit 2
+fi
+echo "recovery keep-list entries: $(wc -l < "$KEEP")"
 quota 2>/dev/null || lfs quota -u "$USER" "$NOMAD_HARVEST_DATA" 2>/dev/null || true
 
-# ---- clear a stale parse lock (this is the only harvest job running) -------------
+# The chain is one job, so any parse lock present at startup is stale.
 if [[ -e "$DATASET_DIR/.parse.lock" ]]; then
     echo "clearing leftover parse lock: $(cat "$DATASET_DIR/.parse.lock" 2>/dev/null)"
     rm -f "$DATASET_DIR/.parse.lock"
 fi
 
-# ---- step 1: rebuild the corrected keep-list ------------------------------------
-echo "=== step 1: rebuild recovery keep-list $(date -Is) ==="
-python scripts/csd3/nomad/recover_dedup_keep.py
-if [[ ! -s "$KEEP" ]]; then
-    echo "recovery keep-list is empty (nothing to recover); exiting 0."
-    exit 0
-fi
-echo "recovery keep-list entries: $(wc -l < "$KEEP")"
-
-# ---- step 2: fetch + parse the recovered entries into the existing dataset -------
-# Disk/inode valve sized generously (solo job) but bounded for the shared 1 TB / 1M quota.
-echo "=== step 2: pipeline fetch+parse+verify $(date -Is) ==="
 python -m nomad_harvest.cli -v pipeline \
     --in "$KEEP" \
     --parts 8 \
