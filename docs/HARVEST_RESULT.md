@@ -185,6 +185,10 @@ regression — verified against ISPIN). The 63 with a co-located OUTCAR addition
 ## Next step
 
 Zenodo is the long tail of DFT data; the large reusable corpora live elsewhere. The natural
-next source is **NOMAD** (Phase-0 already built — see `docs/NOMAD_HARVEST.md`), which offers
-far more scale and diversity; deduplication against this Zenodo set is the main risk to plan
-for.
+next source is **NOMAD** (see `docs/NOMAD_HARVEST.md`), which offers far more scale and
+diversity; deduplication against this Zenodo set is the main risk to plan for.
+
+**Update (2026-09-07): the NOMAD harvest is now COMPLETE** — 7,073,592 calcs / 52,459,065 frames,
+`verify` exact (see `docs/NOMAD_HARVEST_RESULT.md`). The two datasets are still separate
+(`.../zenodo/dataset` and `.../nomad/dataset`); fold them with `merge-datasets` when training
+wants a single corpus (mind the merge's metadata-materialisation RAM at NOMAD scale).

@@ -13,6 +13,11 @@ live, it is reproducible from the `curl` snippets given. Anything unverified is 
 
 ## 0. TL;DR
 
+> **STATUS — COMPLETE (2026-09-07).** The harvest ran and finished: **7,073,592 calcs /
+> 52,459,065 frames**, `verify` exact, ~59 GiB. See **`NOMAD_HARVEST_RESULT.md`** for the final
+> numbers, the three post-harvest recoveries (+20,012 calcs), the remaining-gap evaluation, and
+> the cleanup plan. The design below is retained as the build/reference record.
+
 | Question | Recommendation |
 |---|---|
 | Is NOMAD worth harvesting? | **Yes.** ~**14.7M** public VASP entries, CC BY 4.0, one well-documented paginated REST API. |
