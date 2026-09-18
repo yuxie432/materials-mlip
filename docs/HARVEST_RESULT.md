@@ -8,20 +8,53 @@ triage-kept records has been attempted, and the assembled training dataset is th
 > per-calc availability, net moment/charge + OUTCAR SCF convergence, and the vaspout net-charge
 > fix. `verify` still passes. The "Superseded" notes below record what the *original* harvest
 > stored; the **"Current dataset state"** section gives the authoritative post-recovery metrics.
+>
+> **Frame-recovery sweep applied + initial harvest CLOSED (2026-09-18)** — three targeted
+> recoveries added **+3,219 calcs / +115,489 frames / +7 records** (record 4272054 de-concatenated,
+> the RAR-archive bucket, and record 14773462 re-fetched). `verify` OK (bijection exact). The
+> headline below is the **final closed state**; see "Frame-recovery sweep" for the breakdown.
 
-## Headline
+## Headline (final, post 2026-09-18 sweep)
 
 | quantity | value |
 |---|---|
 | Discover candidates (all resource types, gates on) | **10,435** |
 | Triage keep-list (rank ≥ 3, post-peek) | **1,352** |
 | Records **attempted** | **1,352 / 1,352 (100%)** |
-| — fetched (yielded VASP) | **311** |
-| — fetch-rejected (no parseable VASP) | **1,041** |
-| Records **in the dataset** (≥1 stored calc) | **293** |
-| Calc units parsed | **176,739 / 195,233 (90.5%)** |
-| **Frames** (structures with energy±forces) | **11,870,529** |
-| Shards / dataset size | 1,212 × `shard-*.extxyz.gz` / **≈40 GiB** |
+| Records **in the dataset** (≥1 stored calc) | **300** (293 initial + 7 recovered) |
+| Calc units parsed | **179,958** |
+| **Frames** (structures with energy±forces) | **11,986,018** |
+| Shards / dataset size | ≈1,225 × `shard-*.extxyz.gz` / **≈41 GiB** |
+
+*(Original-run headline, for reference: 293 records / 176,739 calcs / 11,870,529 frames / 1,212
+shards; fetched 311, fetch-rejected 1,041; calc-unit parse ceiling 176,739 / 195,233 = 90.5%.)*
+
+## Frame-recovery sweep (September 2026) — initial harvest closed
+
+A gap investigation (logs + rejection manifests + code) drove three targeted recoveries that returned
+real, in-scope VASP data the first run had missed — **+3,219 calcs / +115,489 frames / +7 records** —
+all appended in the same schema (same `parse`/`store`; disjoint calc_ids; `verify` still exact).
+Scripts: `scripts/csd3/{48_split_reparse_4272054,49_rar_recover,50_refetch_14773462}.sh`.
+
+| # | recovery | +records | +calcs | +frames | what it was |
+|---|---|---|---|---|---|
+| 1 | de-concatenate `4272054` | 1 | 27 | 46,907 | `vasprun_re1_re26.xml` was 27 concatenated, individually-truncated AIMD restart segments of one superionic-PbF₂ run; pymatgen read only the first `<modeling>` root (499 frames). Split at `<?xml` boundaries → 27 segment vaspruns → 46,907 frames. (Correlated MD — subsample at training.) |
+| 2 | RAR-archive bucket | 6 | 2,980 | 36,968 | 14 records whose `.rar` archives failed extraction in the first run only because no `unrar` binary was on PATH (`RarCannotExec`); a static `unrar` in `~/bin` fixed it. 7 yielded VASP (led by `20404673` metal-insulator, ~2,411 calcs); the other 7 correctly had none — `17522462` = 17.3 GB **CP2K/DP-GEN, not VASP**, two inputs-only, four small processed-data. `13744522` was already partly in-dataset → its 274 committed calcs were skipped (no dupes) and its rar-derived calcs added. |
+| 3 | re-fetch `14773462` | 0 (augmented) | 212 | 31,614 | the record whose truncated vasprun once hung the pipeline; its files had been `rm`'d as the stopgap, leaving 221 `FileNotFoundError` calcs. Re-fetched + parsed with `--retry-rejected`; resume skipped the 58 already-stored (no dupes), recovered 212 of 221 (9 genuinely truncated). 58 → 270 calcs. |
+
+Every recovery wrote directly into the dataset via `parse`'s resume (skip-committed → **no duplicates**,
+proven live: the RAR job skipped exactly 274 of `13744522`, the re-fetch skipped exactly 58 of
+`14773462`) and `--retry-rejected` / a fresh manifest (→ **no missing**), with `verify` OK after each.
+The unrecoverable residue is now only genuinely-bad data: truncated/incomplete DFT runs (both vasprun
+and OUTCAR cut off), NEB/positionless OUTCARs, non-VASP deposits (CP2K / experimental), and inputs-only
+records — none carry an ingestable VASP energy+forces label. **The initial Zenodo harvest is closed.**
+
+### Parser split (final, 11,986,018 frames)
+`pymatgen.Vasprun` 8,829,912 · `ase.OUTCAR` 3,063,649 · `pymatgen.Vaspout` 92,457. Convergence
+(calc-level, final step): converged 178,824 / unconverged 842 / null 292; 20,451 individual frames
+SCF-unconverged (tagged per-frame). Forces on 100% of frames; stress on 4,947,934. Full field parity
+(run_type/functional/INCAR/POTCAR/k-points, per-calc availability, `electronic` net moment+charge,
+per-frame `scf_dE`/`electronic_converged`) preserved across the sweep.
 
 ## Yield vs. the pre-run estimate
 

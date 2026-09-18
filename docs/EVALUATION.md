@@ -1,5 +1,10 @@
 # Zenodo harvest — dataset evaluation (Aug 2026)
 
+> **Numbers below describe the original run** (293 records / 176,739 calcs / 11,870,529 frames).
+> The **frame-recovery sweep of 2026-09-18 closed the harvest at 300 records / 179,958 calcs /
+> 11,986,018 frames** (see `docs/HARVEST_RESULT.md` → "Frame-recovery sweep"); `verify` still exact.
+> The funnel reconciliation and quality assessment here remain valid for the original run.
+
 Quality evaluation of the completed first Zenodo harvest, complementing
 `docs/HARVEST_RESULT.md` (the result summary). This document assesses **completeness,
 accuracy, and coverage** of the assembled dataset + metadata, proves the pipeline funnels
