@@ -89,8 +89,15 @@ ATTEMPT="${ATTEMPT:-1}"
 
 mkdir -p logs
 MAN="$ZENODO_HARVEST_DATA/manifests"
-if [[ ! -s "$MAN/keep.jsonl" ]]; then
-    echo "ERROR: $MAN/keep.jsonl missing — run 10_discover.sh first." >&2
+# Overridable so this SAME tested pipeline+resubmit logic can drive a targeted sub-harvest
+# (e.g. the NC-licence expansion — see 53_submit_nc_pipeline.sh): set IN/RAW_DIR/DATASET_DIR in
+# the submit env and they ride the --export=ALL resubmit chain. Defaults = the main harvest,
+# byte-for-byte unchanged when they are not set.
+IN="${IN:-$MAN/keep.jsonl}"
+RAW_DIR="${RAW_DIR:-$ZENODO_HARVEST_DATA/raw}"
+DATASET_DIR="${DATASET_DIR:-$ZENODO_HARVEST_DATA/dataset}"
+if [[ ! -s "$IN" ]]; then
+    echo "ERROR: keep-list $IN missing — run the discover stage first." >&2
     exit 2
 fi
 
@@ -113,7 +120,7 @@ quota 2>/dev/null || lfs quota -u "$USER" "$ZENODO_HARVEST_DATA" 2>/dev/null \
 # is therefore provably stale, so remove it. NB: this is only safe BECAUSE the chain is
 # sequential — do NOT run a separate parse/array job against this SAME --dataset-dir at the
 # same time as the pipeline (the array flow uses per-task dirs + merge, so it never does).
-DATASET_DIR="$ZENODO_HARVEST_DATA/dataset"
+# (DATASET_DIR set above, overridable) — clear a provably-stale lock from a wallclock-killed predecessor.
 if [[ -e "$DATASET_DIR/.parse.lock" ]]; then
     echo "clearing leftover parse lock (sequential resubmit chain => stale): $(cat "$DATASET_DIR/.parse.lock" 2>/dev/null)"
     rm -f "$DATASET_DIR/.parse.lock"
@@ -150,7 +157,7 @@ trap 'submit_successor' USR1
 # stdout (the JSON summary) -> tee to $SUMMARY + the job .out; stderr (-v logs) -> job .err.
 rc=0
 python -m zenodo_harvest.cli -v pipeline \
-    --in "$MAN/keep.jsonl" \
+    --in "$IN" \
     --parts "$PARTS" --workers "$WORKERS" \
     --max-bytes "$MAX_BYTES" \
     --max-member-bytes "$MAX_MEMBER_BYTES" \
@@ -158,8 +165,8 @@ python -m zenodo_harvest.cli -v pipeline \
     --max-disk-files "$MAX_DISK_FILES" \
     --max-primary-bytes "$MAX_PRIMARY_BYTES" \
     --parse-timeout "$PARSE_TIMEOUT" \
-    --raw-dir "$ZENODO_HARVEST_DATA/raw" \
-    --dataset-dir "$ZENODO_HARVEST_DATA/dataset" \
+    --raw-dir "$RAW_DIR" \
+    --dataset-dir "$DATASET_DIR" \
     > >(tee "$SUMMARY") &
 PIPELINE_PID=$!
 # Wait for the pipeline. The USR1 trap interrupts `wait` (which then returns >128 while the
@@ -180,7 +187,7 @@ set -e
 
 echo "=== pipeline exit=$rc $(date -Is) ==="
 # Staged file count vs the 1M-inode quota on hpc-work (bytes are only half the limit).
-echo "staged files under raw/: $(find "$ZENODO_HARVEST_DATA/raw" -type f 2>/dev/null | wc -l)"
+echo "staged files under raw/: $(find "$RAW_DIR" -type f 2>/dev/null | wc -l)"
 
 # The USR1 trap covers the wallclock-timeout case. This covers a hard NON-ZERO EXIT before
 # the signal (a caught fetch/parse failure — pipeline reports it in the JSON summary): the

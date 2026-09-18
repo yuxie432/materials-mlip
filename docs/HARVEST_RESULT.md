@@ -56,6 +56,28 @@ SCF-unconverged (tagged per-frame). Forces on 100% of frames; stress on 4,947,93
 (run_type/functional/INCAR/POTCAR/k-points, per-calc availability, `electronic` net moment+charge,
 per-frame `scf_dE`/`electronic_converged`) preserved across the sweep.
 
+## Expansion beyond the initial harvest (licence relaxation + mentor record)
+
+The closed harvest above is licence-gated (CC0 / CC-BY / CC-BY-SA + permissive only). Two
+mentor-directed expansions add data outside that gate; both use the **identical** fetch→parse→store
+path, so every added record carries the same field-level detail (calc_parameters / quality /
+availability / electronic / per-frame convergence / REF_*), with the licence kept in provenance.
+
+- **Approach 2 — record 10579527 (DONE 2026-09-18).** Mentor's "ML structural reconstructions for
+  accelerated point-defect calculations" — access_right=open but **no licence**, so the gate had
+  dropped it. Harvested by-ID (`scripts/csd3/51_fetch_10579527.sh`): **+2,147 calcs / +102,502 frames
+  / +1 record** (3 of 2,150 calc-units unparseable — the authors' own "Difficult" / "High_Energy"
+  extreme bond-distortion vaspruns: `IndexError`, no OUTCAR to fall back to). `provenance.license` is
+  null (faithful; a deliberate no-licence inclusion). **Dataset after Approach 2: 301 records /
+  182,105 calcs / 12,088,520 frames** (`verify` OK).
+- **Approach 1 — NonCommercial licence expansion (scripts ready, pending run).** Re-discover with the
+  gate off, filter to **NC + NC-SA only** (`cc-by-nc` / `cc-by-nc-sa` — the ~606 records the first run
+  dropped; NOT NoDerivatives, NOT no-licence), diff out anything already held, triage → fetch+parse
+  **directly into the production dataset** (a metadata backup is taken first). Stage 0-1 is
+  `scripts/csd3/52_discover_nc.sh`; stages 2-4 reuse the shared, parameterised `20_pipeline.sh` via
+  `IN=nc_keep RAW_DIR=raw_nc` (isolated NC part-manifests + staging raw; rejections append to the
+  shared logs, filterable by recid). Est. ~15–25 new dataset records; frame count high-variance.
+
 ## Yield vs. the pre-run estimate
 
 Survey #4 projected **≈416** records with a parseable VASP primary (band ~255–571). The
