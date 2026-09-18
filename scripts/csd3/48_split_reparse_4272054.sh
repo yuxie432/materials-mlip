@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -J zh-split-4272054
 # Before sbatch:  export SBATCH_ACCOUNT=<MYGROUP>-SL3-CPU
-#SBATCH -p icelake                     # segments are small (~180 MB each) -> no himem needed
+#SBATCH -p icelake                     # segments are small (~180 MB uncompressed each) -> no himem
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4              # ~13.5 GiB: resume frame_id set (~2 GiB) + one small segment
@@ -16,24 +16,26 @@
 # `vasprun_re1_re26.xml` is 27 concatenated, individually-TRUNCATED vasprun segments
 # (probe: 27x `<?xml` / 27x `<modeling` / 0x `</modeling>`; 46,934 `<calculation>` vs 46,907
 # `</calculation>` = one unclosed final calc per segment). A valid vasprun has ONE `<modeling>`
-# root, so pymatgen (exception_on_bad_xml=False) parsed only the FIRST root -> 499 frames, silently
+# root, so pymatgen (exception_on_bad_xml=False) parses only the FIRST root -> 499 frames, silently
 # ignoring segments 2..27. An earlier plain uncapped re-parse therefore stored just 499 of ~46,907
 # (leaving metadata.jsonl.bak.pre_reparse_4272054, which step 1 below uses to revert those 499).
 #
-# This script (user chose REVERT + reparse for clean, consistent calc_ids):
-#   1. REVERT the 499-frame partial calc: delete the shard(s) it created (verified 4272054-only)
-#      and restore metadata.jsonl from the pre-reparse backup. Idempotent (guarded on the old
-#      concatenated-file calc_id still being present).
-#   2. SPLIT the file at `<?xml` boundaries into 27 segment vaspruns, gzip each into its own
-#      calc-unit dir under raw/4272054/extracted/split_re/reNN/vasprun.xml.gz. Each segment keeps
-#      the full header (<incar>/<parameters>/<atominfo>) so calc_parameters parse to full parity;
-#      the truncated tail is handled by exception_on_bad_xml=False (recovers the complete calcs).
+# This script does the whole thing (idempotent):
+#   1. REVERT the 499-frame partial calc: restore metadata from the pre-reparse backup FIRST
+#      (atomic os.replace), THEN delete the shard(s) that calc alone owned. Restore-before-delete is
+#      crash-safe: an interruption can only ever leave a harmless ORPHAN shard on disk, never a
+#      dangling metadata ref. Skipped automatically if already reverted (old calc_id absent).
+#   2. SPLIT the file at `<?xml` boundaries into 27 segment vaspruns, STREAMING gz->gz (no big
+#      intermediate), each into raw/4272054/extracted/split_re/reNN/vasprun.xml.gz. Each keeps the full
+#      header (<incar>/<parameters>/<atominfo>) so calc_parameters parse to parity; the truncated tail
+#      is handled by exception_on_bad_xml=False.
 #   3. PARSE the 27 units into the dataset (uncapped) -> ~46,907 frames as 27 calc_ids
 #      `zenodo:4272054:split_re/reNN/vasprun.xml.gz`. 4. VERIFY.
 # The old 1.28 GB concatenated file stays staged (harmless) until the next purge-raw.
 #
-# NOTE: 27 AIMD restart segments of ONE PbF2 system = HIGHLY correlated frames (deep but narrow);
-# subsample at training time. This is the biggest single-record lever in the recovery sweep.
+# ALL scratch/temp lives on /rds (never /tmp or /local) — the compute node's /tmp is small and filled
+# a prior run at ENOSPC. NOTE: 27 AIMD restart segments of ONE PbF2 system = HIGHLY correlated frames
+# (deep but narrow); subsample at training time.
 #
 # Run:
 #   export SBATCH_ACCOUNT=<...>
@@ -43,8 +45,8 @@
 set -euo pipefail
 
 export ZENODO_HARVEST_DATA="${ZENODO_HARVEST_DATA:-/rds/user/$USER/hpc-work/zenodo}"
-if [[ -d /local && -w /local ]]; then export TMPDIR="/local"; else export TMPDIR="$ZENODO_HARVEST_DATA/tmp"; fi
-mkdir -p "$TMPDIR"
+# Keep ALL temp on /rds (the node's /tmp is small; /local may be tiny/absent). ~826 GB free here.
+export TMPDIR="$ZENODO_HARVEST_DATA/tmp"; mkdir -p "$TMPDIR"
 cd "${SLURM_SUBMIT_DIR:-.}"
 
 RECID="4272054"
@@ -59,62 +61,72 @@ BAK="$DS/metadata.jsonl.bak.pre_reparse_${RECID}"
 OLD_CALC_ID="zenodo:${RECID}:vasprun_re1_re26.xml.gz"
 
 echo "=== split-reparse $RECID START $(date -Is) on $(hostname) ==="
+df -h "$ZH" 2>/dev/null | tail -1 || true
 [[ -f "$BIG" ]] || { echo "ERROR: source missing: $BIG" >&2; exit 2; }
-
 if [[ -e "$DS/.parse.lock" ]]; then echo "clearing stale lock"; rm -f "$DS/.parse.lock"; fi
 
-# ---- step 1: REVERT the 499-frame partial parse (idempotent) --------------------------------
+# ---- step 1: REVERT the 499-frame partial parse (idempotent, crash-safe, all on /rds) --------
 if grep -q "\"calc_id\": \"$OLD_CALC_ID\"" "$DS/metadata.jsonl"; then
     [[ -f "$BAK" ]] || { echo "ERROR: revert needs backup $BAK (from the earlier plain re-parse)" >&2; exit 2; }
     echo "reverting the 499-frame partial calc ($OLD_CALC_ID) ..."
-    DS="$DS" RECID="$RECID" python - <<'PY'
-import json, os
-ds = os.environ["DS"]; recid = os.environ["RECID"]
+    DS="$DS" RECID="$RECID" BAK="$BAK" python - <<'PY'
+import json, os, shutil
+ds, recid, bak = os.environ["DS"], os.environ["RECID"], os.environ["BAK"]
+meta = os.path.join(ds, "metadata.jsonl")
 mine, others = set(), set()
-for line in open(os.path.join(ds, "metadata.jsonl")):
+for line in open(meta):
     d = json.loads(line)
     (mine if d["provenance"]["record_id"] == recid else others).update(d.get("shards", []))
 overlap = mine & others
 assert not overlap, f"refusing to delete shards shared with other records: {sorted(overlap)}"
-with open("/tmp/_revert_shards.txt", "w") as fo:
-    for s in sorted(mine):
-        fo.write(s + "\n")
-print(f"  {recid} owns {len(mine)} shard(s) to delete (none shared): {sorted(mine)}")
+# (1) restore metadata FIRST (atomic replace) so a crash can only orphan a shard, never dangle a ref
+tmp = meta + ".revert.tmp"
+shutil.copy(bak, tmp)
+os.replace(tmp, meta)
+print(f"  restored metadata.jsonl from {os.path.basename(bak)}")
+# (2) delete the now-unreferenced shard(s) the 499-frame calc alone owned
+for s in sorted(mine):
+    p = os.path.join(ds, s)
+    if os.path.exists(p):
+        os.remove(p); print("  deleted orphaned shard", s)
+print(f"  reverted {recid}: {len(mine)} shard(s) removed")
 PY
-    while read -r s; do [[ -n "$s" ]] && rm -f "$DS/$s" && echo "  deleted shard $s"; done < /tmp/_revert_shards.txt
-    rm -f /tmp/_revert_shards.txt
-    cp "$BAK" "$DS/metadata.jsonl"
-    echo "  restored metadata.jsonl from $BAK"
     echo "=== verify (post-revert, should be the pre-reparse state) ==="
     python -m zenodo_harvest.cli verify --dataset-dir "$DS"
 else
     echo "revert already done ($OLD_CALC_ID absent from metadata); skipping."
 fi
 
-# ---- step 2: SPLIT the concatenated file into 27 segment vaspruns ---------------------------
-echo "=== splitting $BIG at <?xml boundaries $(date -Is) ==="
-SPLIT="$TMPDIR/${RECID}_split"; rm -rf "$SPLIT"; mkdir -p "$SPLIT"
-# each segment starts at a `<?xml` line; write each into re<NN>.xml
-zcat -f "$BIG" | awk -v out="$SPLIT" '
-    /<\?xml/ { n++; f=sprintf("%s/re%02d.xml", out, n) }
-    { if (f=="") { n=0; f=sprintf("%s/re00.xml", out) } print > f }'
-nseg=$(ls "$SPLIT"/re*.xml 2>/dev/null | wc -l)
-echo "  wrote $nseg segment files"
-[[ "$nseg" -ge 2 ]] || { echo "ERROR: expected >=2 segments, got $nseg" >&2; exit 3; }
-
+# ---- step 2: STREAM-split the concatenated file into 27 gz segment vaspruns (no big intermediate) --
+echo "=== stream-splitting $BIG at <?xml boundaries $(date -Is) ==="
 rm -rf "$DEST"; mkdir -p "$DEST"
-for x in "$SPLIT"/re*.xml; do
-    b=$(basename "$x" .xml)                     # re00, re01, ...
-    mkdir -p "$DEST/$b"
-    gzip -c "$x" > "$DEST/$b/vasprun.xml.gz"
-done
-rm -rf "$SPLIT"
-echo "  staged $nseg split calc-units under $DEST"
+BIG="$BIG" DEST="$DEST" python - <<'PY'
+import gzip, os
+big, dest = os.environ["BIG"], os.environ["DEST"]
+n, out = -1, None
+with gzip.open(big, "rt", errors="replace") as fh:
+    for line in fh:
+        if "<?xml" in line:
+            n += 1
+            if out is not None:
+                out.close()
+            d = os.path.join(dest, f"re{n:02d}"); os.makedirs(d, exist_ok=True)
+            out = gzip.open(os.path.join(d, "vasprun.xml.gz"), "wt")
+        if out is None:                      # content before the first <?xml (not expected)
+            n = 0; d = os.path.join(dest, "re00"); os.makedirs(d, exist_ok=True)
+            out = gzip.open(os.path.join(d, "vasprun.xml.gz"), "wt")
+        out.write(line)
+if out is not None:
+    out.close()
+print(f"wrote {n + 1} segment vaspruns to {dest}")
+if n + 1 < 2:
+    raise SystemExit(f"expected >=2 segments, got {n + 1}")
+PY
 
-# ---- step 3: build a fetched manifest (reuse the record's real provenance) ------------------
+# ---- step 3: build a fetched manifest (reuse the record's real provenance) -------------------
 RECID="$RECID" SRC="$SRC" RAW="$RAW" DEST="$DEST" FETCHED="$FETCHED" python - <<'PY'
 import json, os, glob
-recid, src, raw, dest, out = (os.environ[k] for k in ("RECID","SRC","RAW","DEST","FETCHED"))
+recid, src, raw, dest, out = (os.environ[k] for k in ("RECID", "SRC", "RAW", "DEST", "FETCHED"))
 orig = None
 for line in open(src):
     if json.loads(line).get("recid") == recid:
@@ -128,13 +140,13 @@ for d in sorted(glob.glob(os.path.join(dest, "re*"))):
 assert units, "no split units found"
 orig["calc_units"] = units
 orig["n_calc_units"] = len(units)
-orig.pop("availability_files", None)   # was aligned to the single old unit; drop (record-level availability kept)
+orig.pop("availability_files", None)   # was aligned to the single old unit; record-level availability kept
 with open(out, "w") as fo:
     fo.write(json.dumps(orig) + "\n")
 print(f"built {out} with {len(units)} split calc-units")
 PY
 
-# ---- step 4: parse the 27 segments into the dataset, then verify ----------------------------
+# ---- step 4: parse the 27 segments into the dataset, then verify -----------------------------
 echo "=== parse (uncapped) $(date -Is) ==="
 python -m zenodo_harvest.cli parse \
     --in "$FETCHED" \
@@ -148,11 +160,13 @@ echo "=== verify $(date -Is) ==="
 python -m zenodo_harvest.cli verify --dataset-dir "$DS"
 
 echo "=== split-reparse $RECID DONE $(date -Is) ==="
-echo "4272054 frames now in dataset:"
-python - <<PY
-import json
-n=sum((json.loads(l)['quality'].get('n_frames') or 0) for l in open("$DS/metadata.jsonl")
-      if json.loads(l)['provenance']['record_id']=="$RECID")
-c=sum(1 for l in open("$DS/metadata.jsonl") if json.loads(l)['provenance']['record_id']=="$RECID")
-print(f"  {c} calcs / {n} frames")
+RECID="$RECID" DS="$DS" python - <<'PY'
+import json, os
+recid = os.environ["RECID"]
+n = c = 0
+for line in open(os.path.join(os.environ["DS"], "metadata.jsonl")):
+    d = json.loads(line)
+    if d["provenance"]["record_id"] == recid:
+        c += 1; n += (d.get("quality", {}) or {}).get("n_frames") or len(d.get("frame_ids", []))
+print(f"  {recid} now in dataset: {c} calcs / {n} frames")
 PY

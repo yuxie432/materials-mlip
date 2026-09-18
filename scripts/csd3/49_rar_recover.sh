@@ -43,8 +43,9 @@ set -euo pipefail
 # ---- ENV SETUP (edit me) --------------------------------------------------------
 export PATH="$HOME/bin:$PATH"          # so the compute job sees the static unrar in ~/bin
 export ZENODO_HARVEST_DATA="${ZENODO_HARVEST_DATA:-/rds/user/$USER/hpc-work/zenodo}"
-if [[ -d /local && -w /local ]]; then export TMPDIR="/local"; else export TMPDIR="$ZENODO_HARVEST_DATA/tmp"; fi
-mkdir -p "$TMPDIR"
+# Keep temp on /rds (the compute node's /tmp is small; /local size varies) — recovery is small, so the
+# Lustre-temp slowdown is irrelevant and this avoids any ENOSPC on a tiny node-local scratch.
+export TMPDIR="$ZENODO_HARVEST_DATA/tmp"; mkdir -p "$TMPDIR"
 cd "${SLURM_SUBMIT_DIR:-.}"
 # --------------------------------------------------------------------------------
 
