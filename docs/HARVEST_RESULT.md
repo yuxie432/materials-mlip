@@ -70,13 +70,75 @@ availability / electronic / per-frame convergence / REF_*), with the licence kep
   extreme bond-distortion vaspruns: `IndexError`, no OUTCAR to fall back to). `provenance.license` is
   null (faithful; a deliberate no-licence inclusion). **Dataset after Approach 2: 301 records /
   182,105 calcs / 12,088,520 frames** (`verify` OK).
-- **Approach 1 — NonCommercial licence expansion (scripts ready, pending run).** Re-discover with the
-  gate off, filter to **NC + NC-SA only** (`cc-by-nc` / `cc-by-nc-sa` — the ~606 records the first run
-  dropped; NOT NoDerivatives, NOT no-licence), diff out anything already held, triage → fetch+parse
-  **directly into the production dataset** (a metadata backup is taken first). Stage 0-1 is
-  `scripts/csd3/52_discover_nc.sh`; stages 2-4 reuse the shared, parameterised `20_pipeline.sh` via
-  `IN=nc_keep RAW_DIR=raw_nc` (isolated NC part-manifests + staging raw; rejections append to the
-  shared logs, filterable by recid). Est. ~15–25 new dataset records; frame count high-variance.
+- **Approach 1 — NonCommercial licence expansion (DONE 2026-09-19; LOW YIELD).** Re-discovered with the
+  gate off (22,505 scanned → 12,535 candidates), filtered to **NC + NC-SA** (378 candidates: 298
+  cc-by-nc-4.0, 62 cc-by-nc-sa-4.0, +tail), triaged → **25 kept**, fetched+parsed **directly into the
+  production dataset** (`52_discover_nc.sh` → parameterised `20_pipeline.sh` with `IN=nc_keep
+  RAW_DIR=raw_nc`). **Result: +2 records / +6 calcs / +202 frames** (both `cc-by-nc-4.0`: `10821289`,
+  `7643292`). Of the 25 kept, only 6 were genuinely VASP (peek-confirmed); 2 yielded, 4 hit
+  `no_calc_units_after_extract` (likely false-positive filename matches). The other 19 were
+  non-materials false positives (music / weather / AI / cryo-EM / ORCA) kept fail-safe (unpeekable
+  archives) that fetch rejected. **Finding: the NC-licensed subset of Zenodo matching these queries is
+  overwhelmingly non-materials — the open CC-BY set had already captured essentially all the materials
+  VASP data, so licence relaxation adds little.**
+
+### Dataset after both expansions (2026-09-19)
+**~303 records / 182,111 calcs / 12,088,722 frames**, `verify` exact (bijection 0 missing/dup/orphan).
+Parser split: pymatgen.Vasprun 8,932,614 / ase.OUTCAR 3,063,651 / pymatgen.Vaspout 92,457 frames.
+Licence spread (frames): cc-by-4.0 11.73M, cc-zero 128k, null 102,502 (record 10579527), cc-by-sa-4.0
+63k, other-open 57k, mit 5.5k, cc-by-nc-4.0 202, + permissive tail.
+
+## First harvest stage — COMPLETE (2026-09-19)
+
+The Zenodo harvest (initial run + recovery sweep + the two expansions) is **marked done**. Final
+dataset: **~303 records / 182,111 calcs / 12,088,722 frames**, `verify` exact. What follows documents
+the method's limitations and the complementary work that could extend it later — none of which is an
+easy, high-gain fix, which is why the stage is closed here.
+
+### Limitations of the current approach (be aware when using / extending the dataset)
+
+- **Metadata-only discovery — the main recall gap.** Zenodo's search (`q`) indexes metadata *text*
+  (title/description/keywords/creators) **and top-level filenames**, but **nothing inside archives**.
+  Since nearly all VASP data is packed in `.zip`/`.tar.gz`, a record is found only if its description
+  or keywords carry a DFT/VASP signal. Records with rich data but bare metadata are **invisible** —
+  proven live: Sean Kavanagh's `13888307` (19.6 GB of VASP) has `keywords: null` and a description of
+  just *"Accompanying data … article link"*, so no keyword query matched it. A creator/ORCID census of
+  his uploads found **15 of 30 missing**, ~4 of them real VASP defect datasets, lost to this gap (+ the
+  licence gate). This is systematic and dataset-wide, affecting an unknown number of other records.
+- **Filename search does not help.** Only ~8 records Zenodo-wide expose a bare top-level
+  `vasprun.xml`/`OUTCAR` (measured); the rest are archived, and Zenodo cannot see inside archives — so a
+  dedicated filename search adds ≈0 beyond what the keyword queries already catch.
+- **Licence gate (intentional).** Keeps CC0 / CC-BY / CC-BY-SA + permissive; drops NonCommercial (NC),
+  NoDerivatives (ND), and no-licence records — to keep the assembled set redistributable. The NC
+  expansion confirmed this costs little real materials data (mostly non-materials). Specific no-licence
+  records can still be added by ID with permission (e.g. `10579527`).
+- **Access gate.** Embargoed/restricted/closed records are dropped (they 403 at fetch regardless).
+- **VASP-only scope (intentional).** Only VASP outputs (`vasprun.xml`/`vaspout.h5`/`OUTCAR`) are parsed.
+  Other DFT/QC codes are **not** ingested — e.g. CP2K/DP-GEN (`17522462`), ORCA, and by extension
+  Quantum ESPRESSO, CASTEP, FHI-aims, GPAW, etc. Processed/ML-relaxed data (ASE `.db`, extxyz, `.npy`,
+  MACE-relaxed supercells such as `15830542`) is not ingested — only raw VASP.
+- **Archive/parse edges.** Multipart/split archives (`.z01`) aren't reassembled; encrypted archives are
+  skipped; `.rar` needs an `unrar` binary (now installed). Truncated/incomplete vaspruns/OUTCARs, NEB/
+  positionless OUTCARs (tangent-projected forces), and RPA/GW energyless steps are unrecoverable/dropped
+  by design. Concatenated multi-root vaspruns need a manual split (done for `4272054`; no general
+  detector was run).
+- **Storage scope.** Heavy files (CHGCAR/WAVECAR/DOSCAR/…) are recorded as *availability* only, not stored.
+- **Point-in-time freshness.** Discovery is a dated `created`-window scan; records published after a run
+  need a re-discover. Dedup is by `conceptrecid` (newest version wins).
+
+### Potential further work (roughly best-first)
+
+- **Literature-graph discovery** — OpenAlex/Crossref/Semantic Scholar → DFT/VASP papers → their
+  data-availability Zenodo DOIs. Uses the paper's rich metadata to bypass sparse Zenodo metadata (would
+  have caught `13888307`). The most promising systemic complement; partial recall; free APIs.
+- **Bounded archive-peek pass** over a paper-linked / materials-journal-linked net (the only way to see
+  inside archives, made feasible by narrowing the net under the 30 req/min cap).
+- **Cross-platform sources** — Materials Cloud Archive, OPTIMADE, MPContribs (curated materials data,
+  no metadata blind spot).
+- **Multi-code parsing** — add Quantum ESPRESSO / CP2K / CASTEP / FHI-aims readers to widen beyond VASP.
+- **Author/ORCID- or community-seeded discovery** — effective but manual (last resort).
+- **Systematic completeness comes from elsewhere** — NOMAD (done, 7.1 M) + Materials Project (mp-api,
+  planned) are the structured corpora without this blind spot; Zenodo is deliberately the long tail.
 
 ## Yield vs. the pre-run estimate
 
