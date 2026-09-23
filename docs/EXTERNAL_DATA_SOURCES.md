@@ -6,6 +6,10 @@ training set beyond the completed Zenodo + NOMAD harvests, a concrete **harvest 
 Materials Cloud**, and an analysis of **non-VASP computational codes**. It is written for the
 next building phase (another agent may implement from it).
 
+> **Update 2026-09-23:** the Materials Cloud harvest (§5) is now BUILT — `materials_cloud_harvest/`,
+> designed from a full live census that corrected several §5 numbers; see
+> **`docs/MATERIALS_CLOUD_HARVEST.md`** (authoritative; §5 below is kept as the original plan).
+>
 > Status: evaluation complete; nothing new harvested yet. Numbers marked *measured* were
 > obtained live from the databases' APIs during this survey (2026-09-20/21); a few are flagged
 > as estimates. The multi-code section (§6) is being finalised with in-progress research.
@@ -132,6 +136,12 @@ per-repo file adapters, rather than bespoke harvesters. Cheap first wins: Materi
 ---
 
 ## 5. Materials Cloud — harvest plan (for the building phase)
+
+> **Superseded by `docs/MATERIALS_CLOUD_HARVEST.md` (2026-09-23).** A full census of all 1,241 records
+> corrected this plan: VASP-mentioning records are ~84 GB (+ Bosoni's 3.1 GB VASP AiiDA exports), not
+> 160 GB; `.aiida` is NOT a skippable sidecar (Bosoni's VASP lives only in legacy AiiDA exports, which
+> are now extracted); discovery enumerates every record instead of relying on `q=VASP`; downloads are a
+> 302 to presigned S3; `mcloud-ne-1.0`/`asl` must be gated explicitly; Bosoni's VASP subset is included.
 
 Materials Cloud Archive runs **InvenioRDM — the same platform family as Zenodo** — which is why ~80%
 of the pipeline reuses.

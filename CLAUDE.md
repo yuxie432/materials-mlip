@@ -9,8 +9,8 @@ a machine learning interatomic potential (MLIP) using openly accessible DFT data
 
 1. **Harvest** — programmatically pull DFT calculation data (energy, structure, forces, etc.) from open
    databases via REST APIs. Primary targets: Zenodo (https://developers.zenodo.org/#rest-api) and
-   Materials Project (`mp-api` package, https://next-gen.materialsproject.org/api). Materials Cloud and
-   institutional repositories are likely future sources.
+   Materials Project (`mp-api` package, https://next-gen.materialsproject.org/api). NOMAD and the
+   Materials Cloud Archive are now harvested too, by their own source adapters (see below).
 2. **Parse & store** — extract structured data from raw DFT output files and store it in a compact,
    interoperable format.
 3. **Train** — train an MLIP (e.g. MACE architecture) on the assembled dataset, then use it for
@@ -437,6 +437,19 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
   `calc_parameters.potcar_set_hash` (a hash of the ordered POTCAR TITEL strings; works on both
   parser paths) fingerprints the pseudopotential set — a real cross-record consistency key, since
   absolute VASP energies are only comparable within an identical POTCAR set + functional + settings.
+
+## Other source adapters
+
+Each extra data source is a separate package that reuses the shared `zenodo_harvest` stages and
+writes the same schema into its OWN data tree (calc_ids namespaced by `provenance.source`); each
+has its own `CLAUDE.md` with the details:
+
+- `nomad_harvest/` — NOMAD direct-upload VASP (7.07M calcs; `docs/NOMAD_HARVEST.md`).
+- `materials_cloud_harvest/` — Materials Cloud Archive: full census of all ~1.2k records, zip +
+  AiiDA-export peeks, the shared fetch with an anonymous session (`docs/MATERIALS_CLOUD_HARVEST.md`).
+  It added backward-compatible hooks to `zenodo_harvest/fetch.py` (source-supplied `provenance`
+  passthrough, per-file `archive_kind`, `session_factory`; the Zenodo token is now attached only to
+  `zenodo.org` hosts) and a record-join to `status.py` — Zenodo/NOMAD behaviour is unchanged.
 
 ## Scope and starting point
 
