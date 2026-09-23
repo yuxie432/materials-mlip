@@ -118,6 +118,11 @@ def status_report(
     # Record ids on the keep-list, so record-level progress can be counted against the
     # SAME set the fetch works over (and never exceed 100% from a stale rejection recid).
     keep_recids: set[str] = set()
+    # Fetch unit -> the source RECORD it belongs to. Identity for Zenodo/NOMAD (one keep-list
+    # line per record); a source that splits one record into several fetch units (Materials
+    # Cloud: ``<record_id>~<tag>``) carries the record id in ``record_id``, which is what the
+    # dataset's ``provenance.record_id`` — and so ``parsed_recids`` below — is keyed by.
+    unit_record: dict[str, str] = {}
     if keep.is_file():
         for rec in read_jsonl(keep):
             # Zenodo keep-lists key the record as ``recid``; NOMAD's key it as ``entry_id``
@@ -125,6 +130,7 @@ def status_report(
             rid = rec.get("recid") or rec.get("entry_id")
             if rid:
                 keep_recids.add(str(rid))
+                unit_record[str(rid)] = str(rec.get("record_id") or rid)
 
     # FETCH — aggregate across every fetched manifest. The pipeline writes one per part
     # (``part-NNN.fetched.jsonl``, matched by ``*.fetched.jsonl``); a standalone ``fetch``
@@ -151,7 +157,9 @@ def status_report(
             cu = int(rec.get("n_calc_units", 0) or 0)
             n_calc_units += cu
             if recid:
-                fetched_cu_by_recid[recid] = cu
+                # keyed by the RECORD (sums a split record's units; identity when unit == record)
+                rkey = str((rec.get("provenance") or {}).get("record_id") or recid)
+                fetched_cu_by_recid[rkey] = fetched_cu_by_recid.get(rkey, 0) + cu
 
     # PARSE — one metadata line per parsed calc; frames come from each calc's quality block.
     meta = dataset_dir / "metadata.jsonl"
@@ -220,7 +228,15 @@ def status_report(
     # (parts dir cleared) resets those per-part sidecars — so it must be counted done from the
     # dataset, not the manifest. Without this, a resume that keeps the dataset reports the whole
     # dataset as "untouched". In a single continuous run parsed_recids ⊆ seen_recids (a no-op).
-    done_recids = seen_recids | parsed_recids
+    # A split fetch unit (unit id != record id) whose record has stored calcs counts as done via
+    # its record ONLY when no unit of that record is in this run's fetched manifests (i.e. it was
+    # fetched in an earlier run whose parts dir has since been cleared). While a split record is
+    # being fetched, exact per-unit manifest membership decides, so a not-yet-fetched sibling unit
+    # is never reported done. Identity mapping (Zenodo/NOMAD): this adds nothing.
+    records_in_manifests = {unit_record[u] for u in seen_recids if u in unit_record}
+    done_recids = (seen_recids | parsed_recids
+                   | {u for u, r in unit_record.items()
+                      if r != u and r in parsed_recids and r not in records_in_manifests})
     attempted_recids = done_recids | fetch_reject_recids
     if keep_recids:  # count only records actually on the keep-list (no stale-recid overshoot)
         attempted_recids &= keep_recids
