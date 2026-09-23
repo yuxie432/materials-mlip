@@ -39,9 +39,11 @@ import zipfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from hashlib import md5
 from pathlib import Path
-from typing import Any
+from urllib.parse import urlparse
+from typing import Any, Callable
 
 import requests
+import requests.auth
 
 from . import config, zipstream
 from .client import _parse_retry_after
@@ -233,11 +235,30 @@ _BARE_COMPRESS_SUFFIXES = (".gz", ".bz2", ".xz")
 _MULTIPART_RE = re.compile(r"\.(z\d{2}|r\d{2}|part\d+\.rar)$", re.IGNORECASE)
 
 
+class _ZenodoOnlyBearer(requests.auth.AuthBase):
+    """Attach the Zenodo token ONLY to requests addressed to Zenodo (``zenodo.org`` or a
+    subdomain such as ``sandbox.zenodo.org``).
+
+    The fetch downloads whatever URL a keep-list names; a session-wide ``Authorization`` header
+    would hand ``$ZENODO_TOKEN`` to any other host a keep-list pointed at (e.g. a Materials Cloud
+    keep-list run through the Zenodo CLI by mistake). Zenodo requests get exactly the header they
+    always had; redirects keep ``requests``' usual strip-on-host-change behaviour."""
+
+    def __init__(self, token: str):
+        self.token = token
+
+    def __call__(self, r: requests.PreparedRequest) -> requests.PreparedRequest:
+        host = (urlparse(r.url or "").hostname or "").lower()
+        if host == "zenodo.org" or host.endswith(".zenodo.org"):
+            r.headers["Authorization"] = f"Bearer {self.token}"
+        return r
+
+
 def _session(token: str | None) -> requests.Session:
     s = requests.Session()
     s.headers["User-Agent"] = "zenodo-harvest/0.1 (fetch)"
     if token:
-        s.headers["Authorization"] = f"Bearer {token}"
+        s.auth = _ZenodoOnlyBearer(token)
     return s
 
 
@@ -1519,7 +1540,12 @@ def _stage_record_files(
         # VASP file or archive — skip before it is classified/downloaded.
         if _is_junk_member(key or ""):
             continue
-        kind = _is_archive(base)
+        # A source adapter may DECLARE a file's archive kind when the name alone cannot tell
+        # (Materials Cloud's legacy-format AiiDA exports: ``*.aiida`` files that are plain zips
+        # with real member names, confirmed by a triage peek). Absent or unknown -> sniff the
+        # name exactly as before, so Zenodo keep-lists (which never carry it) are unaffected.
+        declared = f.get("archive_kind")
+        kind = declared if declared in _EXTRACTORS else _is_archive(base)
 
         # A split/spanned archive part (foo.z01, foo.r01, foo.partN.rar) cannot be
         # reassembled by the stdlib. Surface it explicitly instead of letting it fall
@@ -1690,6 +1716,34 @@ def _calc_availability(units: list[dict], dest: Path,
     return out
 
 
+def _record_provenance(rec: dict, recid: str) -> dict:
+    """The provenance block for a staged record's fetched-manifest entry.
+
+    A keep-list record from ANOTHER source adapter carries its own ready-made ``provenance``
+    dict (with its ``source`` and the source's own ``record_id`` — e.g. Materials Cloud, whose
+    fetch units split one archive record into several ``recid``s that must all map back to the
+    same record id). That block is passed through unchanged, so the shared parser namespaces the
+    calc_ids by it (``parse._source_of``/``_calc_id``). Zenodo keep-lists never carry the key, so
+    their provenance is derived exactly as before (byte-identical)."""
+    prov = rec.get("provenance")
+    if isinstance(prov, dict) and prov.get("source"):
+        return {**prov, "record_id": prov.get("record_id") or recid}
+    return {
+        "source": "zenodo",
+        "record_id": recid,
+        "conceptrecid": rec.get("conceptrecid"),
+        "doi": rec.get("doi"),
+        "conceptdoi": rec.get("conceptdoi"),
+        "url": rec.get("zenodo_url"),
+        "title": rec.get("title"),
+        "creators": rec.get("creators"),
+        "license": rec.get("license"),
+        "resource_type": rec.get("resource_type"),  # source-quality tag for late filtering
+        "publication_date": rec.get("publication_date"),
+        "keywords": rec.get("keywords"),
+    }
+
+
 def _fetched_entry(rec: dict, recid: str, dest: Path, raw_dir: Path, units: list[dict],
                    heavy: list[tuple[str, str]]) -> dict:
     """Build the fetched-manifest entry for a staged record."""
@@ -1712,20 +1766,7 @@ def _fetched_entry(rec: dict, recid: str, dest: Path, raw_dir: Path, units: list
 
     return {
         "recid": recid,
-        "provenance": {
-            "source": "zenodo",
-            "record_id": recid,
-            "conceptrecid": rec.get("conceptrecid"),
-            "doi": rec.get("doi"),
-            "conceptdoi": rec.get("conceptdoi"),
-            "url": rec.get("zenodo_url"),
-            "title": rec.get("title"),
-            "creators": rec.get("creators"),
-            "license": rec.get("license"),
-            "resource_type": rec.get("resource_type"),  # source-quality tag for late filtering
-            "publication_date": rec.get("publication_date"),
-            "keywords": rec.get("keywords"),
-        },
+        "provenance": _record_provenance(rec, recid),
         "local_dir": str(dest.relative_to(raw_dir)),
         "n_calc_units": len(units),
         "calc_units": rel_units,
@@ -1960,6 +2001,7 @@ def _fetch_parallel(
     max_records: int | None, budget: StagingBudget, out: JsonlWriter, stats: dict,
     workers: int, zip_stream: bool = True,
     zip_stream_max_files: int = DEFAULT_ZIP_STREAM_MAX_FILES,
+    session_factory: "Callable[[], requests.Session] | None" = None,
 ) -> None:
     """Record-level parallel fetch. Records are independent (each stages into its own
     ``raw_dir/<recid>/``), so a thread pool of ``workers`` overlaps their downloads.
@@ -1973,7 +2015,7 @@ def _fetch_parallel(
     def _session_for_thread() -> requests.Session:
         s = getattr(tls, "s", None)
         if s is None:
-            s = _session(token)
+            s = session_factory() if session_factory is not None else _session(token)
             tls.s = s
             with sess_lock:
                 sessions.append(s)
@@ -2055,6 +2097,7 @@ def fetch(
     workers: int = 1,
     zip_stream: bool = True,
     zip_stream_max_files: int = DEFAULT_ZIP_STREAM_MAX_FILES,
+    session_factory: "Callable[[], requests.Session] | None" = None,
 ) -> dict:
     """Fetch all records in ``in_path`` (a triaged keep-list).
 
@@ -2116,6 +2159,11 @@ def fetch(
     ``peak_staged_files`` — plus ``staged_bytes_now``/``staged_files_now`` and
     ``items_over_whole_budget``. Cluster scratch is inode-limited as well as byte-limited
     (CSD3 ``hpc-work``: 1 TB **and 1M files**), so both are reported.
+
+    ``session_factory`` (default None = the Zenodo session: ``token``, else ``$ZENODO_TOKEN``,
+    as a Bearer header) supplies every HTTP session instead — one per worker thread. A second
+    source adapter (Materials Cloud) passes an anonymous factory so the Zenodo token is never
+    sent to another host, and its own User-Agent is used.
     """
     out_path, raw_dir = Path(out_path), Path(raw_dir)
     rejections_path = Path(rejections_path)
@@ -2127,6 +2175,9 @@ def fetch(
                              "calc_units": 0, "stopped_disk_budget": False,
                              "stopped_on": ""}
     token = token or os.environ.get("ZENODO_TOKEN")
+
+    def _new_session() -> requests.Session:
+        return session_factory() if session_factory is not None else _session(token)
 
     # ONE walk of the staging tree seeds the budget with whatever a previous, not-yet-purged
     # run left behind (resume-aware). From here on the accounting is incremental and exact:
@@ -2141,7 +2192,7 @@ def fetch(
     budget = StagingBudget(max_disk_bytes, max_disk_files, base_bytes, base_files)
 
     def _serial(count_records: bool) -> None:
-        with _session(token) as session, JsonlWriter(out_path) as out:
+        with _new_session() as session, JsonlWriter(out_path) as out:
             for rec in read_jsonl(in_path):
                 if count_records:
                     stats["records"] += 1
@@ -2174,7 +2225,8 @@ def fetch(
         with JsonlWriter(out_path) as out:
             _fetch_parallel(read_jsonl(in_path), done, raw_dir, max_bytes, rej,
                             max_member_bytes, token, max_records, budget, out, stats,
-                            workers, zip_stream, zip_stream_max_files)
+                            workers, zip_stream, zip_stream_max_files,
+                            session_factory=session_factory)
         # Guaranteed forward progress. If a whole parallel pass staged NOTHING and stopped
         # on the budget, then the records in flight each fitted individually but filled the
         # budget between them, and every one of them was rolled back. Handing the same
