@@ -105,3 +105,11 @@ manifests_nomad/
 # Anchored to the repo root (leading slash) so it ignores ONLY a top-level nomad/ data dir —
 # NOT the scripts/csd3/nomad/ code dir or the nomad_harvest/ package.
 /nomad/
+
+# Materials Cloud harvest: SLURM logs (logs_mc/) + any MC artifacts pulled down for offline evaluation.
+# On the cluster the MC tree lives on scratch ($MC_HARVEST_DATA, e.g. /rds/.../hpc-work/materials_cloud);
+# locally it defaults under data/ (already ignored). Anchored like /nomad/ above.
+logs_mc/
+dataset_mc/
+manifests_mc/
+/materials_cloud/

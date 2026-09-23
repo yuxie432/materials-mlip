@@ -21,12 +21,19 @@ scripts/csd3/20_pipeline.sh        # stage 2-4 overlapped (fetch || parse+purge)
 scripts/csd3/30_parse_array.sh     # OPTIONAL: many-core array parse of a fetched manifest
 scripts/csd3/31_merge_verify.sh    #   ...then merge the per-task dirs + verify + purge
 scripts/csd3/nomad/                # SECOND SOURCE: NOMAD harvest templates (see its README)
+scripts/csd3/materials_cloud/      # THIRD SOURCE: Materials Cloud templates + probe (see its README)
 ```
 
 **NOMAD** (the second data source) has its own templates in `scripts/csd3/nomad/`
 (`10_discover.sh` + `20_pipeline.sh`) — same conventions, same scratch root, same shared
 parse/verify/merge. See `scripts/csd3/nomad/README.md`. It writes to `dataset/nomad/`, which
 `merge-datasets` later folds into the combined `dataset/`.
+
+**Materials Cloud** (the third source) has its own templates + a probe in
+`scripts/csd3/materials_cloud/` (`10_discover.sh` census+triage, `15_bench.sh` speed/parse
+sizing, `20_pipeline.sh`, `30_bigparse.sh` for deferred big primaries), writing to its own
+`$MC_HARVEST_DATA` tree (`logs_mc/` for SLURM logs). See
+`scripts/csd3/materials_cloud/README.md`.
 
 ## CSD3 facts these scripts are built around
 
