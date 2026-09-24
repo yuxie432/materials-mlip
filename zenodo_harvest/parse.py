@@ -1535,6 +1535,76 @@ def _parse_one(unit: dict, base_meta: dict, availability: dict, rej: RejectionLo
     return result
 
 
+# --- RAM-aware admission for concurrent parses ---------------------------------------------
+# pymatgen's peak RSS is ~10-12x the uncompressed primary, so a fixed ``parse_workers`` has to be
+# sized for the WORST file (workers x ratio x cap <= RAM) — which forces either few workers (slow
+# on the many small calcs) or a low --max-primary-bytes (big files deferred to a re-run). With a
+# memory budget each parse instead reserves its OWN estimate before it starts, so small calcs run
+# N-way while a multi-GB primary waits its turn and then runs alone.
+DEFAULT_PARSE_RSS_RATIO = 12.0          # peak RSS / uncompressed primary (CSD3: 3.7-10.5x measured)
+PARSE_RSS_BASE_BYTES = 512 << 20        # a parse child's interpreter + pymatgen/ASE footprint
+
+
+class _MemBudget:
+    """FIFO memory admission (thread-safe): ``acquire(n)`` blocks until ``n`` bytes are free AND
+    every earlier request has been served — strict order, so a big parse cannot be starved by a
+    stream of small ones. A request above the whole budget is clamped to it (it runs alone)."""
+
+    def __init__(self, total: int) -> None:
+        self.total = max(1, int(total))
+        self._free = self.total
+        self._cv = threading.Condition()
+        self._queue: list[object] = []
+        self.peak_reserved = 0
+        self.waits = 0
+
+    def acquire(self, amount: int) -> int:
+        amount = max(0, min(int(amount), self.total))
+        ticket = object()
+        with self._cv:
+            self._queue.append(ticket)
+            waited = False
+            while self._queue[0] is not ticket or self._free < amount:
+                waited = True
+                self._cv.wait()
+            self._queue.pop(0)
+            self._free -= amount
+            self.peak_reserved = max(self.peak_reserved, self.total - self._free)
+            self.waits += waited
+            self._cv.notify_all()        # the next request in line may fit as well
+        return amount
+
+    def release(self, amount: int) -> None:
+        with self._cv:
+            self._free += amount
+            self._cv.notify_all()
+
+
+def _estimated_parse_rss(unit: dict, max_primary_bytes: int, ratio: float) -> int:
+    """Peak-RSS estimate for parsing ``unit``: the child's base footprint + ``ratio`` x the largest
+    primary it will actually parse (uncompressed; a primary over ``max_primary_bytes`` is refused
+    before parsing, so it costs nothing)."""
+    sizes = [_effective_primary_size(unit[role], max_primary_bytes)
+             for role in _PRIMARY_ROLES_ORDER if unit.get(role)]
+    parsed = [s for s in sizes if not max_primary_bytes or s <= max_primary_bytes]
+    return int(PARSE_RSS_BASE_BYTES + ratio * max(parsed, default=0))
+
+
+def _parse_one_admitted(mem: _MemBudget | None, ratio: float, unit: dict, base_meta: dict,
+                        availability: dict, rej: RejectionLogger, max_primary_bytes: int,
+                        timeout_s: float, calc_id: str) -> tuple[list[Atoms], dict] | None:
+    """:func:`_parse_one` behind the memory budget (``mem`` None = no admission control)."""
+    if mem is None:
+        return _parse_one(unit, base_meta, availability, rej, max_primary_bytes, timeout_s,
+                          calc_id)
+    need = mem.acquire(_estimated_parse_rss(unit, max_primary_bytes, ratio))
+    try:
+        return _parse_one(unit, base_meta, availability, rej, max_primary_bytes, timeout_s,
+                          calc_id)
+    finally:
+        mem.release(need)
+
+
 def parse(
     in_path: str | Path,
     dataset_dir: str | Path = config.DATASET_DIR,
@@ -1547,6 +1617,8 @@ def parse(
     parse_timeout_s: float = 0,
     retry_rejected: bool = False,
     parse_workers: int = 1,
+    parse_mem_budget: int = 0,
+    parse_rss_ratio: float = DEFAULT_PARSE_RSS_RATIO,
 ) -> dict:
     """Parse every fetched record into extxyz shards + a metadata JSONL.
 
@@ -1599,6 +1671,13 @@ def parse(
     small enough that ``parse_workers × per-parse RSS`` fits the node RAM (NOMAD vaspruns are
     tiny, so a high worker count is safe — size against ``--max-primary-bytes``). Default 1 keeps
     the historical serial behaviour (unchanged for the Zenodo harvest / the offline tests).
+
+    ``parse_mem_budget`` (bytes, 0 = off; only with ``parse_workers > 1``) adds RAM-aware admission:
+    each parse first reserves ~``parse_rss_ratio`` x its largest uncompressed primary (+ the child's
+    base footprint) from this budget, FIFO, so the workers run in parallel on small calcs while a
+    multi-GB primary waits for room and then runs alone. That makes ``max_primary_bytes`` a per-FILE
+    bound (``parse_rss_ratio x cap <= budget``) instead of ``workers x ratio x cap <= RAM`` — the
+    cap can be several times higher without cutting the worker count.
     """
     dataset_dir = Path(dataset_dir)
     raw_dir = Path(raw_dir)
@@ -1693,6 +1772,10 @@ def parse(
                 units = _iter_units()
                 inflight: set = set()
                 exhausted = False
+                mem = _MemBudget(parse_mem_budget) if parse_mem_budget > 0 else None
+                if mem is not None:
+                    logger.info("parse: %d workers under a %.1f GiB memory budget (RSS ~%.1fx the "
+                                "primary)", parse_workers, mem.total / 2**30, parse_rss_ratio)
                 with ThreadPoolExecutor(max_workers=parse_workers) as pool:
                     def _submit_one() -> None:
                         nonlocal exhausted
@@ -1702,8 +1785,9 @@ def parse(
                             exhausted = True
                             return
                         logger.debug("parsing %s", cid)
-                        inflight.add(pool.submit(_parse_one, u, bm, av, rej,
-                                                 max_primary_bytes, parse_timeout_s, cid))
+                        inflight.add(pool.submit(_parse_one_admitted, mem, parse_rss_ratio, u,
+                                                 bm, av, rej, max_primary_bytes,
+                                                 parse_timeout_s, cid))
 
                     while not exhausted and len(inflight) < parse_workers * 2:
                         _submit_one()
@@ -1717,6 +1801,9 @@ def parse(
                             _maybe_log_progress()
                             if not exhausted:
                                 _submit_one()
+                if mem is not None:
+                    stats["mem_budget_peak_GiB"] = round(mem.peak_reserved / 2**30, 2)
+                    stats["mem_budget_waits"] = mem.waits
             else:
                 for unit, base_meta, availability, calc_id in _iter_units():
                     logger.debug("parsing %s", calc_id)
