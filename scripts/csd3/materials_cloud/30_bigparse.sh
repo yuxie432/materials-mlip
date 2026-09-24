@@ -10,17 +10,18 @@
 #SBATCH -e logs_mc/mc-bigparse-%j.err
 #SBATCH --mail-type=END,FAIL
 #
-# Phase B of the Materials Cloud harvest (run AFTER 20_pipeline.sh has finished — never alongside
-# it: both write the same dataset dir). The pipeline parses with several workers under a moderate
-# --max-primary-bytes; any bigger vasprun/OUTCAR (long AIMD) was logged `primary_too_large` and KEPT
-# staged (purge-raw never deletes an unparsed unit). This job re-runs the shared parse over every
-# part's fetched manifest ONE worker at a time with a much larger cap: the parser's resume logic
-# skips everything already parsed or deterministically failed, and re-attempts exactly the
-# deferred calcs because the cap is now higher than the one they were refused under
-# (parse._rejected_calc_ids). Then purge-raw reclaims their staging, and verify gates the result.
+# OPTIONAL phase B of the Materials Cloud harvest — needed ONLY if 20_pipeline.sh left calcs as
+# `primary_too_large` (its summary / `status` shows them; with the memory budget its cap is ~10 GB,
+# far above the largest pilot primary, 1.04 GB, so this is expected to be unnecessary). Run it AFTER
+# the pipeline has finished — never alongside it: both write the same dataset dir. Deferred units
+# stay staged (purge-raw never deletes an unparsed unit). This job re-runs the shared parse over
+# every part's fetched manifest ONE parse at a time with a larger cap: the resume logic skips
+# everything already parsed or deterministically failed and re-attempts exactly the deferred calcs,
+# because the cap is now higher than the one they were refused under (parse._rejected_calc_ids).
+# Then purge-raw reclaims their staging, and verify gates the result.
 #
-# RAM rule (pymatgen ~10-12x the uncompressed file; check mc_bench.json's worst_rss_ratio):
-#   cpus x 6760 MiB >= ratio x MAX_PRIMARY_BYTES + ~8 GiB   ->  32 cpus: ~16 GB at 12x.
+# RAM rule (pymatgen ~10-12x the uncompressed file): cpus x 6760 MiB >= 12 x MAX_PRIMARY_BYTES + ~8 GiB
+#   -> 32 cpus: ~16 GB. At 20 cpus it could not exceed the pipeline's own cap, hence 32 here.
 # Anything still above the cap stays staged + logged; rerun with more cpus and a higher cap.
 set -euo pipefail
 

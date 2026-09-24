@@ -5,13 +5,11 @@
 #SBATCH -p icelake-himem               # 6760 MiB/core: parse (pymatgen) needs the RAM
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16             # bought mostly for RAM (~106 GiB): 3 parse workers x ~12x RSS
-                                       # x a 2.5 GB cap = 90 GiB + ~8 GiB overhead. Rule (check
-                                       # mc_bench.json's worst_rss_ratio / suggested_caps first):
-                                       # cpus x 6760 MiB >= PARSE_WORKERS x ratio x MAX_PRIMARY_BYTES + ~8 GiB
-                                       # Primaries above the cap (long-AIMD vaspruns) are deferred, kept
-                                       # staged, and parsed afterwards by 30_bigparse.sh on a fat node.
-#SBATCH --time=12:00:00                # SL3 max; the MC harvest is expected to fit ONE job
+#SBATCH --cpus-per-task=20             # ~132 GiB. 8 fetch workers (download + tar/bz2 decompression)
+                                       # + 6 parse children + the main process fit 20 cores; the RAM
+                                       # is shared by the parses through a MEMORY BUDGET (below), so
+                                       # the primary cap can be ~10 GB without cutting parse workers.
+#SBATCH --time=12:00:00                # SL3 max; ~1.1 TB fetch (~3-4 h at the measured S3 rate)
 #SBATCH --signal=B:USR1@600            # SIGUSR1 10 min before wallclock -> RESUBMIT=1 queues a resume
 #SBATCH -o logs_mc/mc-pipeline-%j.out
 #SBATCH -e logs_mc/mc-pipeline-%j.err
@@ -20,14 +18,17 @@
 # Materials Cloud stages 2-4 in ONE overlapped, disk-paced command: fetch(part i+1) runs while
 # parse+purge(part i) runs. The fetch is the SHARED zenodo_harvest fetch driven with an anonymous
 # MC session (files come from CSCS S3 via MC's 302 redirect; md5-verified, Range-resumable, targeted
-# zip members where worthwhile, legacy AiiDA exports extracted as zips); parse/store/verify are the
-# shared, unmodified code. Ends with `verify`. Everything is resumable: re-submit by hand or set
-# RESUBMIT=1 to self-chain across wallclock kills (MAX_ATTEMPTS bounds the rounds).
+# zip members where worthwhile, AiiDA archives — legacy zip/tar and sqlite_zip — extracted by the
+# shared AiiDA extractor); parse/store/verify are the shared code. Ends with `verify`. Everything is
+# resumable: re-submit by hand or set RESUBMIT=1 to self-chain across wallclock kills.
 #
 # STANDALONE MC TREE ($MC_HARVEST_DATA, a sibling of the Zenodo/NOMAD roots) — the disk valve walks
 # only its own raw dir, so it never counts the other harvests' files. The /rds quota itself is
-# SHARED: the defaults below assume ~800 GB / ~900k inodes are free for THIS job (check `quota`).
-# Run 15_bench.sh first: its mc_speed.json / mc_bench.json set WORKERS, PARSE_WORKERS and the cap.
+# SHARED: the defaults below assume ~880 GB / ~990k inodes free and NO other job (2026-09-24:
+# 115 GB / 6.6k files used of 1 TB / 1M).
+# Sized from the 2026-09-24 CSD3 bench (mc_speed.json / mc_bench.json): S3 gives 52 MB/s on one
+# stream and 96 MB/s over 8 (WORKERS=8); a small calc parses in 0.19 s (x3.8 with 4 workers);
+# the largest pilot primaries peaked at 3.7-5.4x their size (trajectories: ~10x) -> ratio 12.
 #
 # NB: `mkdir -p logs_mc` BEFORE you submit (SLURM opens -o/-e before the body runs).
 set -euo pipefail
@@ -41,30 +42,41 @@ export MC_HARVEST_DATA="${MC_HARVEST_DATA:-/rds/user/$USER/hpc-work/materials_cl
 # RAM budget (tmpfs /tmp) and off the /rds quota. Fall back to MC-root scratch.
 if [[ -d /local && -w /local ]]; then export TMPDIR="/local"; else export TMPDIR="$MC_HARVEST_DATA/tmp"; fi
 mkdir -p "$TMPDIR"
+# The blind-fetched archives include .7z / .rar (and nested ones): py7zr/rarfile come from the
+# `archives` extra; rarfile also needs an unrar binary — the static RARLAB one in ~/bin (as for the
+# Zenodo rar recovery, scripts/csd3/49_rar_recover.sh).
+export PATH="$HOME/bin:$PATH"
 cd "${SLURM_SUBMIT_DIR:-.}"
 # --------------------------------------------------------------------------------
 
 # ---- HARVEST PARAMETERS ---------------------------------------------------------
-PARTS="${PARTS:-8}"                    # batches of fetch units (multi-archive records are split per
-                                       # archive by triage, so a part never has to hold a whole 44 GB record)
-WORKERS="${WORKERS:-4}"                # concurrent fetch units; set from mc_speed.json's
-                                       # recommended_fetch_workers (S3 stream scaling). MC: 500 req/min.
+PARTS="${PARTS:-24}"                   # batches of fetch units (~1.2k units / ~1.1 TB -> ~45 GB each;
+                                       # records are split per archive by triage, so a part never has
+                                       # to hold a whole multi-archive record)
+WORKERS="${WORKERS:-8}"                # concurrent fetch units: 8 S3 streams gave the best aggregate
+                                       # (96 MB/s vs 57 at 4); MC's 500 req/min is never approached
 MAX_BYTES="${MAX_BYTES:-0}"            # 0 = uncapped per-file download (the disk valve is the bound)
 MAX_MEMBER_BYTES="${MAX_MEMBER_BYTES:-0}"   # 0 = uncapped extracted member (the valve is the bomb guard)
-# Staging budget for the WHOLE MC raw dir (both concurrently-staged parts + deferred big primaries).
-# Sized for a DEDICATED ~800 GB / ~900k-inode slice of /rds (no other job running): ~85% of each,
-# leaving room for the MC dataset + manifests (a few GB, not valve-tracked) and Lustre overhead.
-# Charged per byte/inode as written and refunded on delete, so `staged <= this` holds exactly.
-# If other jobs share the quota again, lower both to what `quota` shows free.
-MAX_DISK_BYTES="${MAX_DISK_BYTES:-680000000000}"
-MAX_DISK_FILES="${MAX_DISK_FILES:-765000}"
-# Parse: many small calcs (e.g. ~8k Bosoni EOS points) are PARSE-THROUGHPUT-bound -> parallel
-# workers; a few huge AIMD vaspruns are RAM-bound -> deferred above the cap to 30_bigparse.sh.
-# RAM guard is on the UNCOMPRESSED primary size (pymatgen peaks ~10-12x). A deferred
-# (primary_too_large) calc stays staged; purge-raw never deletes it.
-MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-2500000000}"
-PARSE_WORKERS="${PARSE_WORKERS:-3}"
-PARSE_TIMEOUT="${PARSE_TIMEOUT:-1800}" # hard-kill a single non-terminating parse after 30 min
+# Staging budget for the WHOLE MC raw dir: both concurrently-staged parts, the archives being
+# downloaded + extracted (the blind-fetched ones are deleted right after, keeping only VASP files),
+# and any deferred primaries. ~88% / ~91% of the free space: the rest is for the MC dataset shards
+# + manifests (tens of GB, not valve-tracked) and Lustre overhead. Charged per byte/inode as written
+# and refunded on delete, so `staged <= this` holds exactly. Lower both if other jobs share the quota.
+MAX_DISK_BYTES="${MAX_DISK_BYTES:-780000000000}"
+MAX_DISK_FILES="${MAX_DISK_FILES:-900000}"
+# Parse. Tens of thousands of small calcs are PARSE-THROUGHPUT-bound -> 6 workers. RAM is shared
+# through a MEMORY BUDGET: each parse first reserves ~RSS_RATIO x its (uncompressed) primary, FIFO,
+# so small calcs run 6-way while a multi-GB AIMD vasprun waits, then runs alone — the cap is then a
+# per-FILE bound (RSS_RATIO x cap <= budget), not workers x ratio x cap <= RAM. Budget = the job's
+# RAM minus 20 GiB for the main process + 8 fetch workers (a blind-fetched zip with ~10M members,
+# e.g. SSSP's 13 GB AiiDA exports, holds ~7 GB of zipfile directory; big tars hold member lists).
+# Anything over the cap stays staged as primary_too_large for the optional 30_bigparse.sh.
+RSS_RATIO="${RSS_RATIO:-12}"           # INTEGER: pymatgen peak / primary (bench 3.7-5.4x; trajectories ~10x)
+PARSE_WORKERS="${PARSE_WORKERS:-6}"
+PARSE_MEM_BUDGET="${PARSE_MEM_BUDGET:-$(( ${SLURM_CPUS_PER_TASK:-20} * 6760 * 1048576 - 20 * 1073741824 ))}"
+MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-$(( (PARSE_MEM_BUDGET - 536870912) / RSS_RATIO ))}"   # ~10 GB at 20 cpus
+PARSE_TIMEOUT="${PARSE_TIMEOUT:-3600}" # hard-kill one non-terminating parse after 1 h (a 10 GB
+                                       # vasprun parses in minutes; the bench saw 8-19 s/GB)
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-4}"
 ATTEMPT="${ATTEMPT:-1}"
 # --------------------------------------------------------------------------------
@@ -80,7 +92,20 @@ if [[ ! -s "$IN" ]]; then
 fi
 
 echo "=== mc pipeline attempt $ATTEMPT/$MAX_ATTEMPTS $(date -Is) on $(hostname) ==="
+echo "    parts=$PARTS fetch_workers=$WORKERS parse_workers=$PARSE_WORKERS" \
+     "mem_budget=$(( PARSE_MEM_BUDGET / 1073741824 )) GiB max_primary=$MAX_PRIMARY_BYTES B" \
+     "(ratio $RSS_RATIO) valve=${MAX_DISK_BYTES} B/${MAX_DISK_FILES} inodes timeout=${PARSE_TIMEOUT}s"
 quota 2>/dev/null || lfs quota -u "$USER" "$MC_HARVEST_DATA" 2>/dev/null || true
+# Archive backends (a missing one only turns those archives into logged `archive_unsupported` /
+# `extract_error` rejections — warn loudly, do not abort the harvest):
+python - <<'PY' || true
+import importlib.util, shutil
+mods = {m: bool(importlib.util.find_spec(m)) for m in ("py7zr", "rarfile", "zstandard")}
+tool = next((t for t in ("unrar", "unar", "bsdtar", "7z") if shutil.which(t)), None)
+ok = all(mods.values()) and tool
+print(f"    archive backends: {mods}, rar tool: {tool or 'NONE'}" + ("" if ok else
+      "  <-- WARNING: install the 'archives' extra / put unrar in ~/bin, or .7z/.rar are skipped"))
+PY
 
 # The RESUBMIT chain is strictly sequential (afterany), so a .parse.lock present at startup can only
 # be a SIGKILLed predecessor's (untrappable) lock on another node — provably stale. Do NOT run a
@@ -108,6 +133,7 @@ python -m materials_cloud_harvest.cli -v pipeline \
     --max-bytes "$MAX_BYTES" --max-member-bytes "$MAX_MEMBER_BYTES" \
     --max-disk-bytes "$MAX_DISK_BYTES" --max-disk-files "$MAX_DISK_FILES" \
     --max-primary-bytes "$MAX_PRIMARY_BYTES" --parse-workers "$PARSE_WORKERS" \
+    --parse-mem-budget "$PARSE_MEM_BUDGET" --parse-rss-ratio "$RSS_RATIO" \
     --parse-timeout "$PARSE_TIMEOUT" \
     --raw-dir "$RAW_DIR" --dataset-dir "$DATASET_DIR" \
     > >(tee "$SUMMARY") &
