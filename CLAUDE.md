@@ -446,10 +446,17 @@ has its own `CLAUDE.md` with the details:
 
 - `nomad_harvest/` — NOMAD direct-upload VASP (7.07M calcs; `docs/NOMAD_HARVEST.md`).
 - `materials_cloud_harvest/` — Materials Cloud Archive: full census of all ~1.2k records, zip +
-  AiiDA-export peeks, the shared fetch with an anonymous session (`docs/MATERIALS_CLOUD_HARVEST.md`).
-  It added backward-compatible hooks to `zenodo_harvest/fetch.py` (source-supplied `provenance`
-  passthrough, per-file `archive_kind`, `session_factory`; the Zenodo token is now attached only to
-  `zenodo.org` hosts) and a record-join to `status.py` — Zenodo/NOMAD behaviour is unchanged.
+  AiiDA-archive peeks (sqlite_zip ones through their `db.sqlite3`), archives no peek can settle
+  fetched too, the shared fetch with an anonymous session (`docs/MATERIALS_CLOUD_HARVEST.md`).
+  It added backward-compatible pieces to the shared code: fetch hooks (source-supplied
+  `provenance` passthrough, per-file `archive_kind`, `session_factory`; the Zenodo token is now
+  attached only to `zenodo.org` hosts), an **AiiDA extractor** (`zenodo_harvest/aiida_archive.py` +
+  `fetch._extract_aiida`, `archive_kind="aiida"`: legacy zip/tar + sqlite_zip; nested `.aiida` in
+  any archive is recursed), a **parse RAM budget** (`parse(parse_mem_budget=…)`: FIFO per-parse
+  reservations of ~12× the primary, so N workers and a large `--max-primary-bytes` coexist), and a
+  record-join to `status.py`. Two shared recall fixes (2026-09-24): `zipstream`/Zenodo `triage`
+  walk a zip's central directory by its bytes, not the EOCD count (a 16-bit-truncated count made
+  targeted fetch able to "prove" an archive VASP-free).
 
 ## Scope and starting point
 

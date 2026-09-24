@@ -9,11 +9,12 @@ Everything under "measured" was obtained live from the MC API on **2026-09-23** 
 every record). It supersedes the raw plan in `EXTERNAL_DATA_SOURCES.md` §5, several of whose
 numbers turned out wrong (see §9).
 
-> **Status (2026-09-24): BUILT, offline-tested, not yet run on CSD3.** 76 offline tests (incl. a
-> full triage → shared fetch → shared pymatgen parse → verify run on a legacy-AiiDA-export-shaped
-> zip); the live path (302→S3 redirect, md5, tar/zip extraction) validated from WSL on four real
-> records. Next: the CSD3 probe + `10_discover.sh` census, review the report, then `20_pipeline.sh`
-> (runbook: `scripts/csd3/materials_cloud/README.md`).
+> **Status (2026-09-24): census + sizing bench RUN on CSD3 (§11); code revised from the results;
+> pipeline not yet run.** The first CSD3 census exposed a ZIP64 reader bug (25 archives unreadable)
+> and two policy questions, both now decided: **fetch every archive no peek can settle** (the
+> residual blind spot, ~1.1 TB) and **extract sqlite_zip AiiDA archives** (aiida-vasp calcs found in
+> one record). Parse now runs under a RAM budget (§5). Next: re-run `10_discover.sh`, then
+> `20_pipeline.sh` (runbook: `scripts/csd3/materials_cloud/README.md`).
 
 ---
 
@@ -25,10 +26,10 @@ numbers turned out wrong (see §9).
 | How big is MC? (measured) | **1,241 records / 2.55 TB** in total (latest versions; 1,535 incl. superseded). All public, no embargoes. |
 | How much VASP? (measured) | **44 records mention VASP** (43 in their own text + the Bosoni ACWF record via an author affiliation); ~84 GB + Bosoni 75.5 GB (of which only its **3.1 GB of VASP AiiDA exports** are harvested). **No bare `vasprun.xml`/`OUTCAR` anywhere** — all VASP sits in archives. |
 | Discovery | **Full census** — enumerate every record (13 paged requests), no keyword recall limit. Keywords only decide how fail-safe triage is. |
-| Triage | Range-peek every `.zip` and `.aiida` central directory (ZIP64-aware). VASP-mentioning records kept fail-safe; **any other record kept on positive evidence** (a peek found `vasprun`/`OUTCAR`/`vaspout`). |
-| AiiDA exports (894 GB, 35% of MC bytes) | **Legacy-format exports are extracted** (real member names — verified: Bosoni's VASP export holds per-calc `vasprun.xml` + `OUTCAR`); new sqlite_zip exports are detected + probed on CSD3, extraction deferred until VASP is found in one. |
-| Code | `materials_cloud_harvest/` (stages 0-1, retrying fetch glue, CLI) + small backward-compatible hooks in the shared `zenodo_harvest/fetch.py` (+ a status join); fetch/parse/store/verify/merge are the shared code, **unmodified in behaviour** for Zenodo/NOMAD. calc_ids `materials_cloud:<record_id>:<path>`. |
-| Cost | One ~1-2 h discover/triage job + one ≤12 h pipeline job (transfer ~90 GB + positives; exact figure is in the triage report). |
+| Triage | Range-peek every `.zip` and `.aiida` central directory (ZIP64-aware; a sqlite_zip AiiDA archive's `db.sqlite3` is pulled and queried). VASP-mentioning records kept fail-safe; others kept on **positive evidence** (a peek found `vasprun`/`OUTCAR`/`vaspout`) **or when an archive cannot be settled by a peek** (tars, unreadable/nested zips — `unresolved_fetch`, decided 2026-09-24). |
+| AiiDA exports (894 GB, 35% of MC bytes) | **Both formats extracted**: legacy exports keep real member names (Bosoni's VASP exports); sqlite_zip archives are mapped through their database by the shared `_extract_aiida` (aiida-vasp calcs found in the AMaRaNTA 2D-magnets record). A database proving an export VASP-free prunes it. |
+| Code | `materials_cloud_harvest/` (stages 0-1, retrying fetch glue, CLI) + backward-compatible additions to the shared code: fetch hooks, an AiiDA extractor (`zenodo_harvest/aiida_archive.py`), the zip-count fix, a parse RAM budget. calc_ids `materials_cloud:<record_id>:<path>`. |
+| Cost | One ~30 min discover/triage job + one ≤12 h pipeline job: **~1.2k fetch units / ~1.2 TB** transfer (1.1 TB of it blind-fetched archives, ~3.5 h at the measured 96 MB/s). |
 
 ---
 
@@ -107,7 +108,7 @@ md5, Range, archives), which is why the shared fetch is reused with three small 
 
 ---
 
-## 4. Decisions (user, 2026-09-23)
+## 4. Decisions (user, 2026-09-23 and 2026-09-24)
 
 | # | Decision | Chosen | Alternatives considered |
 |---|---|---|---|
@@ -115,8 +116,16 @@ md5, Range, archives), which is why the shared fetch is reused with three small 
 | 2 | AiiDA exports | **Extract legacy-format exports now**; sqlite_zip detected + probed (db.sqlite3) on CSD3, extraction built only if aiida-vasp calcs are found | skip all `.aiida` (the raw plan — would lose Bosoni's VASP); full sqlite_zip support now |
 | 3 | Bosoni ACWF record | **Include only its two `*_results_vasp.aiida`** (file allowlist) | exclude by ID (the raw plan) |
 | 4 | Licence | **Admit NC / NC-SA** (matches the Zenodo dataset after its NC expansion); drop ND, no-licence, `mcloud-ne-1.0`, `asl` | strict Zenodo default (drop NC); no gate |
+| 5 | Residual blind spot (2026-09-24, after the CSD3 census) | **Fetch every unresolved archive** (`--unresolved all`): records that never mention VASP and show none in any peek, but hold archives a peek cannot settle — 530 records, ~1.1 TB | DFT-worded records only (~323 GB); README scan only; keep evidence-only (the 2026-09-23 policy) |
+| 6 | sqlite_zip AiiDA (2026-09-24) | **Build the extractor now** (the probe found aiida-vasp calcs) | defer to a follow-up job; skip |
 
 Also decided by evidence (not a user question): **overlap is flagged, never auto-dropped** (§6).
+Decision 5 rests on the census's measured hit rate: where a non-mentioning record's zips could be
+peeked, **7.8%** held VASP outputs (12% with DFT words in the metadata, 1.8% naming another code),
+so ~35-40 of the 477 tar-only records are expected to hide VASP — e.g. `ervm4-pn188` (ACE-GCN),
+whose README says "OUTCARs" but whose data are tar.bz2 in a record with no VASP keyword. CSD3 pulls
+S3 at 52 MB/s on one stream / 96 MB/s on 8, and fetch keeps only VASP files, so the ~1 TB costs
+~3 h of transfer and nothing persistent.
 
 ---
 
@@ -131,23 +140,35 @@ Also decided by evidence (not a user question): **overlap is flagged, never auto
 | pipeline | **shared** `zenodo_harvest.pipeline.run_pipeline` | fetch part i+1 ∥ parse+purge part i, disk-paced, then `verify` |
 | status / verify / merge | **shared** `status_report` / `verify_dataset` / `merge-datasets` | MC manifest names passed in; the MC dataset lives in its own tree until merged |
 
-**The evidence policy** (`triage._decide`). Per file: `.zip`/`.aiida` → peeked; tar-family →
-unpeekable. A VASP-mentioning record is dropped only if every archive was peeked OK and none holds
-a VASP primary or a nested archive (`peek_proved_no_vasp`) — exactly Zenodo's fail-safe rule. Any
-other record needs a peek to show a `vasprun`/`OUTCAR`/`vaspout` member (`vasp_evidence`). Proven-
-empty zips are removed from the fetch list; a legacy AiiDA export with VASP members is kept with
-`archive_kind="zip"`; sqlite_zip / unreadable exports are dropped from the fetch list and listed
-as **evidence gaps** in the report; so are nested-archive-only zips of non-mentioning records. The
-report also totals the deliberately-skipped unpeekable tars of non-mentioning records.
+**The evidence policy** (`triage._decide`). Per file: `.zip`/`.aiida` → peeked (a sqlite_zip
+archive through its database); tar-family / 7z / rar → unpeekable. A VASP-mentioning record is
+dropped only if every archive was peeked OK and none holds a VASP primary or a nested archive
+(`peek_proved_no_vasp`) — exactly Zenodo's fail-safe rule. Any other record is kept on a peeked
+`vasprun`/`OUTCAR`/`vaspout` member (`vasp_evidence`) or, under `--unresolved all` (decision 5),
+when some archive could not be settled by a peek (`unresolved_fetch`: a tar, an unreadable or
+too-big zip/AiiDA archive, a zip holding sub-archives); `--unresolved dft|none` narrow that.
+Proven-empty zips and AiiDA archives are removed from the fetch list; a legacy AiiDA export with
+VASP members is kept with `archive_kind="zip"` (real names → the zip path, targeted member fetch
+included); a sqlite_zip one — and any AiiDA archive a peek could not resolve (legacy tar exports,
+unreadable ones) — with `archive_kind="aiida"`. A **single compressed data file**
+(`optimade.jsonl.gz`, `*.json.bz2`, `*.xyz.gz`) is not treated as a misnamed tarball (the shared
+fetch's bare-`.gz` heuristic, right for Zenodo's `…-vasp-raw.gz`), which keeps ~10 GB of JSON dumps
+out of the blind fetch. Gaps (what a peek could not see) are listed per record in the report.
 
 **Evidence uses fetch's own name rules.** A peeked member counts as a VASP output iff the shared
 fetch would extract it (`_PARSE_RE`) and seed a calc unit from it (`_unit_role` ∈ vasprun/vaspout/
-outcar — `OUTCAR1`, `vasprun_1.xml`, `OUTCAR.gz` all count). Triage only ever prunes what fetch
-would have found nothing in. The central-directory reader validates what it read (EOCD found by
-its comment length, the member count vs the end record, the first header signature, `zipfile`-style
-correction for data prepended to the archive), so a misparse is a *failed* peek — retried once,
-never cached, and recorded as a gap — rather than "proven empty". The peek cache is versioned and
-never stores transient or cap-dependent verdicts.
+outcar — `OUTCAR1`, `vasprun_1.xml`, `OUTCAR.gz` all count); for a sqlite_zip archive the SAME rules
+run over the database's file trees (`zenodo_harvest.aiida_archive.vasp_nodes`), so triage lists
+exactly the calcs the extractor will write. Triage only ever prunes what fetch would have found
+nothing in. The central-directory reader validates what it read (EOCD found by its comment length,
+the member count vs the end record, the first header signature, `zipfile`-style correction for
+data prepended to the archive), so a misparse is a *failed* peek — retried once, never cached, and
+recorded as a gap — rather than "proven empty". Two real-world shapes it now reads (CSD3 census,
+§11): **ZIP64 end records whose 32-bit EOCD fields are NOT sentinels** (CPython's zipfile writes
+them once the directory starts past 2 GiB; the old sentinel-only test misplaced the directory by
+76 bytes → 25 failed peeks) and **a 16-bit-truncated entry count** without ZIP64 records (132,202
+members, count 1,130). The peek cache is versioned (`EVIDENCE_RULES_VERSION` 3) and never stores
+transient or cap-dependent verdicts.
 
 **Fetch units.** A kept record becomes one keep-list entry per archive (`recid =
 <record_id>~<tag>`, the tag derived from the archive's KEY so that re-running triage can never
@@ -159,7 +180,8 @@ the path under `extracted/`, the calc units and calc_ids are **identical to a wh
 4.4 GB Kristoffersen tarballs never have to fit the staging budget at once.
 
 **Shared-code changes** (all backward-compatible; Zenodo keep-lists never carry the new keys, so
-Zenodo behaviour is unchanged — the 444 pre-existing tests pass untouched). In `zenodo_harvest/fetch.py`:
+Zenodo behaviour is unchanged except where noted — the pre-existing tests pass untouched). In
+`zenodo_harvest/fetch.py`:
 
 1. `_record_provenance` — a keep-list record may carry its own `provenance` (with `source`); it is
    passed through (keeping the source's `record_id` for split fetch units). Else the Zenodo block
@@ -171,6 +193,28 @@ Zenodo behaviour is unchanged — the 444 pre-existing tests pass untouched). In
    `$ZENODO_TOKEN` and **send the Zenodo token to Materials Cloud** (verified-by-test never).
 4. token scoping — the Zenodo token session attaches `Bearer $ZENODO_TOKEN` only to `zenodo.org`
    hosts (`_ZenodoOnlyBearer`), so even a Zenodo CLI run pointed at an MC keep-list cannot leak it.
+5. **AiiDA extractor** (`archive_kind="aiida"`, `_extract_aiida` + the pure-stdlib
+   `zenodo_harvest/aiida_archive.py`): a legacy zip → the zip extractor, a legacy tar export → the
+   tar extractor, a **sqlite_zip** archive → its `db.sqlite3` copied out (charged + refunded),
+   every node holding a VASP primary listed (`vasp_nodes`, opened read-only + immutable so it works
+   on lock-less Lustre), and each such node's VASP-named files streamed from their `repo/<sha256>`
+   blobs to the node's **legacy path** (`nodes/<uu>/<id>/<rest>/path/<file>`) — calc units,
+   calc_ids and per-calc availability are then identical in shape to a legacy export's. Also, an
+   `.aiida` file INSIDE another archive is now a nested archive (recursed) — a Zenodo-side
+   behaviour change only for archives that bundle AiiDA exports (recall gain).
+
+In `zenodo_harvest/zipstream.py` + `zenodo_harvest/triage.py` (a correctness fix for Zenodo too): the
+central directory is walked by its BYTES, not the EOCD entry count. The old loops stopped after
+`total` headers, so a 16-bit-truncated count could make targeted zip fetch's "enumeration proves
+no VASP" shortcut (and Zenodo triage's peek) silently skip an archive whose VASP members sit past
+the truncated count; any other count mismatch now counts as unpeekable (whole download / kept).
+
+In `zenodo_harvest/parse.py`: **RAM-aware admission** for `parse_workers > 1`
+(`parse_mem_budget`, default off): each parse reserves ~`parse_rss_ratio` × its largest
+uncompressed primary (+ a 0.5 GiB child footprint) first, FIFO, so small calcs run N-way while a
+multi-GB AIMD vasprun waits for room and runs alone — the primary cap becomes a per-FILE bound
+(`ratio × cap ≤ budget`) instead of `workers × ratio × cap ≤ RAM`. On 20 `icelake-himem` cores:
+6 parse workers AND a ~10 GB cap (previously 3 workers and 2.5 GB on 16 cores).
 
 And in `zenodo_harvest/status.py`: fetch units are joined to their record (`record_id` /
 `provenance.record_id`) for the parse-progress figures — the identity for Zenodo and NOMAD.
@@ -191,15 +235,27 @@ present — plus, for AiiDA-sourced calcs, the node UUID in the calc_id path (fu
 
 ## 6. Overlap with Zenodo / NOMAD — flag, don't drop
 
-All 60 MC→Zenodo links are `IsSupplementTo`, mostly pointing at code releases. The one
-VASP-mentioning case (`hmdsb-k3h43` → `zenodo.4683140`) is Kavanagh's own Zenodo deposit
-(structures, notebooks, NEB results) which the 3.3 GB MC record **supplements with the heavy raw
-data** — dropping it at record level would lose real data (the NOMAD harvest learnt the same:
-citing ≠ duplicating). So discover **flags** instead: `zenodo_linked_in_dataset` (a linked DOI is
-in the harvested Zenodo dataset), `zenodo_title_similar` (token-Jaccard ≥ 0.6 against Zenodo
-dataset titles), `nomad_calcs_citing` (NOMAD calcs whose references cite the MC record, counted
-once per calc). The flags travel in `provenance.linked_harvested` for the planned training-time
-physics-level dedup; `--drop-linked` exists if a hard drop is ever wanted.
+All 60 MC→Zenodo links are `IsSupplementTo`, mostly pointing at code releases. So discover
+**flags** instead of dropping: `zenodo_linked_in_dataset` (a linked DOI is in the harvested Zenodo
+dataset), `zenodo_title_similar` (token-Jaccard ≥ 0.6 against Zenodo dataset titles),
+`nomad_calcs_citing` (NOMAD calcs whose references cite the MC record, counted once per calc). The
+flags travel in `provenance.linked_harvested` for the planned training-time physics-level dedup;
+`--drop-linked` exists if a hard drop is ever wanted.
+
+**The CSD3 census flagged 2 records** (0 NOMAD citations); both were inspected (2026-09-24) and
+neither is a record-level duplicate:
+
+| MC record | Zenodo record | What each holds | Verdict |
+|---|---|---|---|
+| `hmdsb-k3h43` — *Hidden spontaneous polarisation in … Sn₂SbS₂I₃* (Kavanagh, Savory, Scanlon, Walsh; 3.3 GB) | `4683140` (Kavanagh, Scanlon, Walsh; 32 files, 2.5 GB; linked by DOI, title 0.75) | **MC**: ONE `Sn2SbS2I3_AiiDA_Archive.zip` — the project's **AiiDA archive** (aiida-core 1.6.3 + aiida-vasp ≥ 2, i.e. a legacy export): relaxations with PBEsol/PBE-TS/HSE06/optB86b-vdW, phonons, HSE06+SOC electronic structure, optics, Born charges/dielectric, polarisation, misc. **Zenodo**: the same project as raw calc folders (`Structures`, `NEB_Results`, `MD` (AIMD), `Miscellaneous`, `Cmcm/Cmc2_1` phonons, `Cmc2_1_Lobster`, `BS_DOSs`, `ELFCARs`, `IsoSurfaces`, …) + 8 notebooks + videos. | **Partial overlap at most**: same project, different packaging and partly different calc sets (NEB and AIMD appear only on Zenodo; the functional-comparison relaxations, BEC/dielectric and polarisation runs only in the AiiDA archive; phonons / band structures likely in both, possibly as the same runs). Kept; calc-level check below. |
+| `ervm4-pn188` — *Adsorbate chemical environment-based ML framework for heterogeneous catalysis* (Ghanekar, Deshpande, Greeley; 1.9 GB; MIT) | `7023990` (same authors; title 1.0) | **MC**: `Pt3Sn_NO.tar.bz2` + `Pt_OH.tar.bz2` — the **full DFT data**: POSCAR/CONTCAR/**OUTCAR** trajectories (nested `raw_files/*.tar.bz2`) for 1-6 NO* on Pt₃Sn(111) and OH* on Pt(100)/Pt(221), plus pickled graph objects and figure CSVs. **Zenodo**: one `ace_gcn-main.tar.gz` (31 MB) — the ACE-GCN **code** snapshot, with whatever small example outputs it ships (enough to be in the Zenodo dataset). | **Not a duplicate** — the Zenodo copy is the code (+ at most a small example subset); MC has the real dataset. It was DROPPED by the first triage (tar.bz2, no VASP keyword) and is recovered by decision 5. |
+
+Whether any individual *calc* appears on both sides is settled after the MC pipeline by
+`scripts/csd3/materials_cloud/csd3_mc_overlap.py`: every calc of each flagged pair is fingerprinted
+from its frames (exact key = formula, n_atoms, n_frames, first + final `REF_energy` to 1e-6 eV,
+POTCAR set hash; near key = formula, n_atoms, final energy/atom to 1e-4 eV) → exact duplicates (the
+same run published twice — dedupe at training time), near-only matches (same system re-run),
+per-side uniques → `mc_overlap.json`.
 
 ---
 
@@ -210,37 +266,38 @@ Full runbook: `scripts/csd3/materials_cloud/README.md`. In short:
 ```bash
 export MC_HARVEST_DATA=/rds/user/$USER/hpc-work/materials_cloud
 mkdir -p logs_mc
-DISC=$(sbatch --parsable scripts/csd3/materials_cloud/10_discover.sh)   # census + triage
-sbatch --dependency=afterok:$DISC scripts/csd3/materials_cloud/15_bench.sh   # sizing pilot
-# review mc_keep.report.json + mc_speed.json + mc_bench.json, then:
-RESUBMIT=1 sbatch scripts/csd3/materials_cloud/20_pipeline.sh
-sbatch scripts/csd3/materials_cloud/30_bigparse.sh    # after the pipeline: deferred big primaries
-python -m materials_cloud_harvest.cli status
+DISC=$(sbatch --parsable scripts/csd3/materials_cloud/10_discover.sh)   # census + triage (v3 rules)
+RESUBMIT=1 sbatch --dependency=afterok:$DISC scripts/csd3/materials_cloud/20_pipeline.sh
+python -m materials_cloud_harvest.cli status --max-disk-bytes 780000000000 --max-disk-files 900000
+# afterwards: the overlap check, and 30_bigparse.sh ONLY if primaries were deferred
+python scripts/csd3/materials_cloud/csd3_mc_overlap.py --mc-root $MC_HARVEST_DATA \
+    --zenodo-dataset /rds/user/$USER/hpc-work/zenodo/dataset
 ```
 
-**What bounds each stage** (confirmed per run by `15_bench.sh`): triage peeks are
-*request-latency*-bound (1-3 small Range reads each through the ~0.3-2 s API redirect → run 4-way
-in parallel, paced under MC's 500 req/60 s); the fetch bulk is *S3-bandwidth*-bound (a few
-multi-GB AIMD tarballs carry most of the ~90 GB → `--workers` from the stream-scaling probe); the
-parse is expected to be the longest stage — ~10⁴ small calcs are *parse-throughput*-bound (one
-forkserver child each → `--parse-workers`), and long-AIMD primaries are *RAM*-bound (pymatgen
-~10-12× the file → a moderate cap in the pipeline, the rest deferred to `30_bigparse.sh` on a fat
-allocation). No API token is needed: every record is public, the request limit is never
-approached, and the bytes come from presigned S3 URLs a token would not speed up.
+**What bounds each stage** (measured on CSD3 2026-09-24, §11): triage peeks are
+*request-latency*-bound (~0.1 s per small Range read; 1,434 peeks in 10 min 4-way, paced under
+MC's 500 req/60 s); the fetch is *S3-bandwidth*-bound (52 MB/s on one stream, 96 MB/s on 8 →
+`--workers 8`; ~1.2 TB ≈ 3.5 h); the parse of the many small calcs is *parse-throughput*-bound
+(0.19 s/calc serial, ×3.8 with 4 workers → `--parse-workers 6`), and multi-GB primaries are
+*RAM*-bound → the parse memory budget (§5) with a ~10 GB cap; anything bigger stays staged for the
+optional `30_bigparse.sh`. No API token is needed: every record is public, the request limit is
+never approached, and the bytes come from presigned S3 URLs a token would not speed up.
 
 ---
 
-## 8. Expected cost & yield (estimates — the triage report gives the exact bytes)
+## 8. Expected cost & yield
 
-* **Transfer**: ≤ ~90 GB (the 44 VASP-mentioning records minus peek-pruned zips, + Bosoni's 3.1 GB)
-  + whatever the census recovers from non-mentioning records. At CSD3 speeds (to be measured by the
-  probe) this is under an hour.
-* **Yield**: of the 44, perhaps ~20–30 hold VASP outputs (the small ones are often inputs only);
-  ~10⁴ calcs (Bosoni alone ~7k EOS points) and **10⁵–10⁶ frames**, dominated by the AIMD records.
-* **Parse RAM**: long-AIMD vaspruns may be multi-GB → `20_pipeline.sh` runs 3 parse workers on 16
-  `icelake-himem` cores (~106 GiB) with a 2.5 GB (uncompressed) cap; anything bigger stays staged
-  and `30_bigparse.sh` parses it one at a time on 32 cores (~211 GiB, 16 GB cap).
-* **Disk** (dedicated ~800 GB / ~900k inodes): staging valve 680 GB / 765k inodes.
+* **Transfer**: ~1.2k fetch units / **~1.2 TB** (simulated from the CSD3 census with the v3 rules:
+  ~105 GB for the 83 records with a VASP mention or VASP evidence + ~1.09 TB of unresolved
+  archives in 530 records); ≈ 3.5 h at 96 MB/s. The blind-fetched archives are deleted right after
+  extraction, so only VASP files persist.
+* **Yield**: the 83 evidenced records ≈ **4-5×10⁴ calcs** (the pilot: 437 calc units per GB
+  downloaded; Bosoni alone ~7k EOS points), plus whatever the ~35-40 expected hidden-VASP records
+  among the blind-fetched ones hold; frames dominated by the AIMD records.
+* **Parse**: ~2-4 h of parse work, overlapped with the fetch (6 workers under a ~112 GiB budget,
+  cap ~10 GB; the pilot's largest primary was 1.04 GB, so deferrals are not expected).
+* **Disk** (dedicated ~880 GB / ~990k inodes free): staging valve 780 GB / 900k inodes; the pilot
+  staged 4.3 bytes per downloaded byte for evidenced units (extracted vaspruns), 5.4 inodes/calc.
 
 ---
 
@@ -262,16 +319,53 @@ approached, and the bytes come from presigned S3 URLs a token would not speed up
 
 ## 10. Limitations & future work
 
-* **sqlite_zip AiiDA exports** are an evidence gap until the CSD3 probe (`csd3_mc_probe.py --aiida`)
-  has queried their `db.sqlite3`s; if it finds aiida-vasp calcs, add extraction (map
-  `repository_metadata` names → `repo/<sha256>` members, then the ordinary unit/parse path).
-* **Unpeekable tars in non-mentioning records** (~971 GB, overwhelmingly QE) are deliberately not
-  downloaded; a bounded tar head-peek (stream the first ~64 MB, read member names) is the cheap
-  follow-up if the census suggests hidden VASP is non-negligible.
-* **Tar-format `.aiida`**, `.tar.lzma` (one 3 KB record) and split archives are not handled.
-* **Nested archives inside zips of non-mentioning records** are listed as gaps, not fetched.
+* **AiiDA archives whose peek cannot be completed** (a central directory > 1 GiB — SSSP's two 13 GB
+  exports — or a database > 2 GB) are blind-fetched under decision 5 and resolved by the extractor
+  after download; nothing is skipped, it only costs transfer.
+* **Non-VASP formats holding VASP-derived data are not parsed**: VASP's own MLFF training database
+  `ML_AB` (seen in `e1dwv-nvh07`), CONTCAR+OSZICAR-only sets (energies without forces, e.g. a
+  cluster-expansion `DFT_training_data.zip` of 14k files), processed `.extxyz`/JSON (e.g. the
+  Alexandria JSON dumps — an institutional product anyway). Records mentioning VASP whose peeks show
+  only inputs/structures are dropped as `peek_proved_no_vasp` (11 in the census; spot-checked: all
+  POSCAR/CONTCAR/INCAR-only).
+* **Split archives** are not reassembled (logged `archive_multipart_unsupported`); `.rar`/`.7z` need
+  the `archives` extra + an `unrar` on PATH (the pipeline script checks and warns).
 * **Point-in-time**: a re-run of `10_discover.sh` picks up new records (the census is cheap).
 * The same full-census + evidence idea **does not scale verbatim to Zenodo** (7.3M records, 30
   req/min search, ~5k req/h file endpoint): a filtered variant (paper-graph via OpenAlex +
   depositor/ORCID snowball, then peeks of the survivors) is the realistic analogue — see the
   discussion recorded alongside `HARVEST_RESULT.md`'s "Limitations".
+
+---
+
+## 11. CSD3 census + sizing bench (2026-09-24, jobs 36221072 / 36221079)
+
+**Census + triage (rules v2).** 1,241 records → 1,226 candidates (15 licence drops) → 101 below the
+rank gate → 1,434 archives peeked in 10 min (4 workers; 26 in-run retries) → 83 records kept / 206
+fetch units / 105.4 GB: 31 `vasp_mention`, **52 `vasp_evidence`** (the blind spot recovered by
+peeks — more than the mention records), 10 `peek_proved_no_vasp`, 917 `no_vasp_evidence`, 115
+`evidence_gap_only`. Left unfetched: 1,033 tar-family files / 957 GB in non-mentioning records.
+Overlap flags: 2 (§6), NOMAD citations: 0.
+
+**What the logs showed was wrong, and the fixes**:
+* 25 peeks failed "central directory does not start with a file header" — ZIP64 end records with
+  real 32-bit EOCD fields (all 0.09-4 GiB; 14 were AiiDA exports, incl. two of AMaRaNTA's), + 1
+  "132202 of 1130 entries" (16-bit-truncated count) → reader fixed (§5); the same count bug could
+  silently skip archives in the SHARED zipstream/Zenodo peek → fixed there too.
+* the sqlite_zip census (130 readable databases) found aiida-vasp CalcJobs in exactly one record,
+  `wygeh-jrc57` (AMaRaNTA, 2D-magnet exchange parameters): 931 retrieved folders with
+  `vasprun.xml` + `OUTCAR` in 8 exports (+ the 2 unreadable ones) → decision 6, extractor built.
+* 477 tar-only non-mentioning records (945 GB) vs a 7.8% peek hit rate → decision 5.
+* a `.tar.lzma` (tarfile reads it) was ranked "unlikely" → now declared a tar.
+
+**Speed probe** (`mc_speed.json`): API record GET 0.11 s, search page (100) 3.3 s, redirect hop
+0.04 s, 64 KiB Range read 0.09 s (p90 0.30 s); S3 throughput 52.3 MB/s on 1 stream, 30.4 on 2,
+56.6 on 4, **96.3 on 8** (per-stream falls to 19 MB/s) → 8 fetch workers.
+
+**Pilot** (`mc_bench.json`, 12 GB stratified sample, 16 cores): 11.3 GB downloaded in 473 s
+(23.8 MB/s incl. extraction, 4 workers), 4.3× extraction ratio (48.6 GB staged, 26.8k inodes),
+4,928 calc units (437 per GB); primaries median 0.85 MB, p90 3.1 MB, max 1.04 GB; small-calc parse
+0.19 s serial → 0.05 s with 4 workers (×3.79); the largest primaries (single-frame DOS-heavy
+vaspruns, 0.65-1.04 GB) parsed in 8-12 s at 3.5-3.8 GiB peak (net RSS ratio 3.7-5.4). Projection
+for the 105 GB keep-list: fetch 1.2 h vs parse 1.7 h (workers) / 3.5 h (serial) — parse-bound,
+which the new parse memory budget + 6 workers address.
