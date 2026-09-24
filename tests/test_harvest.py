@@ -2574,6 +2574,60 @@ def test_remote_central_directory_matches_stdlib_offsets():
         assert e.method == zi.compress_type
 
 
+import functools  # noqa: E402
+import struct  # noqa: E402
+
+
+@functools.lru_cache(maxsize=1)
+def _truncated_count_zip() -> bytes:
+    """65,537 members as a pre-ZIP64 writer leaves them: NO ZIP64 end records and the EOCD entry
+    counts truncated to 16 bits (65,537 mod 65,536 = 1) — real on Materials Cloud (132,202
+    members, count 1,130). The only VASP member is the LAST one, so a reader that trusts the count
+    sees just ``d/f0`` and would "prove" the archive VASP-free."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for i in range(65_536):
+            zf.writestr(f"d/f{i}", b"")
+        zf.writestr("late/OUTCAR", b"outcar")
+    data = buf.getvalue()
+    i = data.rfind(b"PK\x05\x06")
+    assert data[i - 20:i - 16] == b"PK\x06\x07"        # zipfile wrote ZIP64 end records ...
+    eocd = bytearray(data[i:])
+    eocd[8:12] = struct.pack("<HH", 1, 1)               # ... strip them, truncate the count
+    return data[:i - 76] + bytes(eocd)
+
+
+def test_truncated_entry_count_zip_is_fully_enumerated():
+    blob = _truncated_count_zip()
+    url = "http://x/t.zip"
+    entries = zipstream_mod.remote_central_directory(url, _ZipRangeSession({url: blob}))
+    assert entries is not None and len(entries) == 65_537 and entries[-1].name == "late/OUTCAR"
+    names = peek_zip_filenames(url, _FakeRangeSession(blob))
+    assert names is not None and len(names) == 65_537 and "late/OUTCAR" in names
+
+
+def test_central_directory_shorter_than_its_count_is_not_trusted():
+    blob = bytearray(_zip_with([("a/OUTCAR", b"o"), ("b/OUTCAR", b"o")]))
+    i = blob.rfind(b"PK\x05\x06")
+    blob[i + 8:i + 12] = struct.pack("<HH", 5, 5)            # claims 5 entries, has 2
+    url = "http://x/c.zip"
+    assert zipstream_mod.remote_central_directory(url, _ZipRangeSession({url: bytes(blob)})) is None
+    assert peek_zip_filenames(url, _FakeRangeSession(bytes(blob))) is None
+
+
+def test_zip64_end_records_with_real_32bit_fields_are_read(monkeypatch):
+    # CPython's zipfile writes ZIP64 end records once the directory starts past 2 GiB while the
+    # 32-bit EOCD still holds the real offset; forced here with a tiny file-count limit.
+    monkeypatch.setattr(zipfile, "ZIP_FILECOUNT_LIMIT", 1)
+    blob = _zip_with([("calc/vasprun.xml", b"<x/>"), ("calc/OUTCAR", b"o")])
+    i = blob.rfind(b"PK\x05\x06")
+    assert blob[i - 20:i - 16] == b"PK\x06\x07"
+    assert struct.unpack("<I", blob[i + 16:i + 20])[0] != 0xFFFFFFFF      # not a sentinel
+    url = "http://x/p.zip"
+    entries = zipstream_mod.remote_central_directory(url, _ZipRangeSession({url: blob}))
+    assert entries is not None and {e.name for e in entries} == {"calc/vasprun.xml", "calc/OUTCAR"}
+
+
 def test_remote_central_directory_none_when_range_ignored():
     blob = _zip_with([("calc/OUTCAR", b"o" * 100)])
     sess = _ZipRangeSession({"http://x/a.zip": blob}, honor_range=False)

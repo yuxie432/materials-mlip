@@ -147,15 +147,19 @@ def peek_zip_filenames(url: str, session: requests.Session | None = None, tail: 
             cd = _range_get(session, url, cd_off, cd_off + cd_size - 1)
         if not cd:
             return None
+        # Walk the directory by its BYTES, not the EOCD count: a writer without ZIP64 end records
+        # may keep only the low 16 bits of a >65,535 entry count (seen on Materials Cloud:
+        # 132,202 members, count 1,130), and a listing cut at that count could "prove" an
+        # archive VASP-free. Any other disagreement = a partial listing -> unpeekable (kept).
         names: list[str] = []
         p = 0
-        for _ in range(total):
-            if p + 46 > len(cd) or struct.unpack("<I", cd[p:p + 4])[0] != CDH_SIG:
-                break
+        while p + 46 <= len(cd) and struct.unpack("<I", cd[p:p + 4])[0] == CDH_SIG:
             n_len, m_len, k_len = struct.unpack("<HHH", cd[p + 28:p + 34])
             name = cd[p + 46:p + 46 + n_len].decode("utf-8", "replace")
             names.append(name)
             p += 46 + n_len + m_len + k_len
+        if len(names) != total and len(names) % 65536 != total % 65536:
+            return None
         return names
     except (requests.RequestException, struct.error, ValueError) as exc:
         logger.debug("zip peek failed for %s: %s", url, exc)

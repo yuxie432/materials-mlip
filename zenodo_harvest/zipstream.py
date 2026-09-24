@@ -148,10 +148,19 @@ def _range_bytes(session: requests.Session, url: str, start: int, end: int) -> b
 # Central-directory enumeration                                               #
 # --------------------------------------------------------------------------- #
 
-def _parse_central_directory(cd: bytes, total: int) -> list[ZipEntry]:
+def _parse_central_directory(cd: bytes, total: int) -> list[ZipEntry] | None:
+    """Every member header in the central-directory bytes ``cd``, or None if they disagree with
+    the end record's entry count ``total``.
+
+    The directory is walked by its BYTES, not by ``total``: a writer without ZIP64 end records may
+    store only the low 16 bits of a >65,535 entry count (non-compliant but real — seen on Materials
+    Cloud: 132,202 members, EOCD count 1,130), and stopping after ``total`` headers would make the
+    "enumeration proves no VASP" shortcut in fetch skip an archive whose VASP files sit past the
+    truncated count. Any other mismatch (a directory that ends early / is corrupt) returns None, so
+    the caller falls back to the whole-archive download instead of trusting a partial listing."""
     entries: list[ZipEntry] = []
     p = 0
-    for _ in range(total):
+    while True:
         if p + 46 > len(cd) or struct.unpack("<I", cd[p:p + 4])[0] != CDH_SIG:
             break
         flag, method = struct.unpack("<HH", cd[p + 8:p + 12])
@@ -161,6 +170,8 @@ def _parse_central_directory(cd: bytes, total: int) -> list[ZipEntry]:
         name = cd[p + 46:p + 46 + n_len].decode("utf-8", "replace")
         entries.append(ZipEntry(name, method, csize, usize, crc, lho, flag))
         p += 46 + n_len + m_len + k_len
+    if len(entries) != total and len(entries) % 65536 != total % 65536:
+        return None
     return entries
 
 
