@@ -213,8 +213,10 @@ In `zenodo_harvest/parse.py`: **RAM-aware admission** for `parse_workers > 1`
 (`parse_mem_budget`, default off): each parse reserves ~`parse_rss_ratio` × its largest
 uncompressed primary (+ a 0.5 GiB child footprint) first, FIFO, so small calcs run N-way while a
 multi-GB AIMD vasprun waits for room and runs alone — the primary cap becomes a per-FILE bound
-(`ratio × cap ≤ budget`) instead of `workers × ratio × cap ≤ RAM`. On 20 `icelake-himem` cores:
-6 parse workers AND a ~10 GB cap (previously 3 workers and 2.5 GB on 16 cores).
+(`ratio × cap ≤ budget`) instead of `workers × ratio × cap ≤ RAM`. The pipeline runs 8
+`icelake-himem` cores: 4 parse workers AND a ~3.2 GB cap (a 20-core, ~10 GB-cap configuration was
+dropped 2026-09-25: no primary that large exists in the evidenced data, and the big block queued for
+hours).
 
 And in `zenodo_harvest/status.py`: fetch units are joined to their record (`record_id` /
 `provenance.record_id`) for the parse-progress figures — the identity for Zenodo and NOMAD.
@@ -277,9 +279,9 @@ python scripts/csd3/materials_cloud/csd3_mc_overlap.py --mc-root $MC_HARVEST_DAT
 **What bounds each stage** (measured on CSD3 2026-09-24, §11): triage peeks are
 *request-latency*-bound (~0.1 s per small Range read; 1,434 peeks in 10 min 4-way, paced under
 MC's 500 req/60 s); the fetch is *S3-bandwidth*-bound (52 MB/s on one stream, 96 MB/s on 8 →
-`--workers 8`; ~1.2 TB ≈ 3.5 h); the parse of the many small calcs is *parse-throughput*-bound
-(0.19 s/calc serial, ×3.8 with 4 workers → `--parse-workers 6`), and multi-GB primaries are
-*RAM*-bound → the parse memory budget (§5) with a ~10 GB cap; anything bigger stays staged for the
+`--workers 6`; ~1.2 TB ≈ 4-5 h); the parse of the many small calcs is *parse-throughput*-bound
+(0.19 s/calc serial, ×3.8 with 4 workers → `--parse-workers 4`), and multi-GB primaries are
+*RAM*-bound → the parse memory budget (§5) with a ~3.2 GB cap; anything bigger stays staged for the
 optional `30_bigparse.sh`. No API token is needed: every record is public, the request limit is
 never approached, and the bytes come from presigned S3 URLs a token would not speed up.
 
@@ -294,8 +296,9 @@ never approached, and the bytes come from presigned S3 URLs a token would not sp
 * **Yield**: the 83 evidenced records ≈ **4-5×10⁴ calcs** (the pilot: 437 calc units per GB
   downloaded; Bosoni alone ~7k EOS points), plus whatever the ~35-40 expected hidden-VASP records
   among the blind-fetched ones hold; frames dominated by the AIMD records.
-* **Parse**: ~2-4 h of parse work, overlapped with the fetch (6 workers under a ~112 GiB budget,
-  cap ~10 GB; the pilot's largest primary was 1.04 GB, so deferrals are not expected).
+* **Parse**: ~2-4 h of parse work, overlapped with the fetch (4 workers under a ~37 GiB budget,
+  cap ~3.2 GB; the pilot's largest primary was 1.04 GB and the evidenced set has none over 2.5 GB,
+  so deferrals are not expected).
 * **Disk** (dedicated ~880 GB / ~990k inodes free): staging valve 780 GB / 900k inodes; the pilot
   staged 4.3 bytes per downloaded byte for evidenced units (extracted vaspruns), 5.4 inodes/calc.
 

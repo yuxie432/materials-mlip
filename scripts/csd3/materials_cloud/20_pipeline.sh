@@ -5,11 +5,16 @@
 #SBATCH -p icelake-himem               # 6760 MiB/core: parse (pymatgen) needs the RAM
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=20             # ~132 GiB. 8 fetch workers (download + tar/bz2 decompression)
-                                       # + 6 parse children + the main process fit 20 cores; the RAM
-                                       # is shared by the parses through a MEMORY BUDGET (below), so
-                                       # the primary cap can be ~10 GB without cutting parse workers.
-#SBATCH --time=12:00:00                # SL3 max; ~1.1 TB fetch (~3-4 h at the measured S3 rate)
+#SBATCH --cpus-per-task=8              # ~53 GiB — sized from the DATA (2026-09-25), not for headroom:
+                                       # the run is fetch(network)-bound, and every primary seen is small
+                                       # (bench: median 0.85 MB, max 1.04 GB; the 2026-09-24 run parsed the
+                                       # whole 105 GB evidenced set with ZERO primary_too_large under a
+                                       # 2.5 GB cap) -> 4 parse + 6 fetch workers and a ~3 GB cap are
+                                       # enough. A small block also queues far faster on icelake-himem than
+                                       # 20 cores x 12 h. The budget/cap below follow whatever you ask for:
+                                       # `sbatch -c 12 …` or `sbatch -p icelake -c 16 …` (3380 MiB/core)
+                                       # just work, and RESUBMIT successors keep the same shape.
+#SBATCH --time=12:00:00                # SL3 max; ~1.2 TB fetch (~4-5 h at ~70-96 MB/s)
 #SBATCH --signal=B:USR1@600            # SIGUSR1 10 min before wallclock -> RESUBMIT=1 queues a resume
 #SBATCH -o logs_mc/mc-pipeline-%j.out
 #SBATCH -e logs_mc/mc-pipeline-%j.err
@@ -27,8 +32,8 @@
 # SHARED: the defaults below assume ~880 GB / ~990k inodes free and NO other job (2026-09-24:
 # 115 GB / 6.6k files used of 1 TB / 1M).
 # Sized from the 2026-09-24 CSD3 bench (mc_speed.json / mc_bench.json): S3 gives 52 MB/s on one
-# stream and 96 MB/s over 8 (WORKERS=8); a small calc parses in 0.19 s (x3.8 with 4 workers);
-# the largest pilot primaries peaked at 3.7-5.4x their size (trajectories: ~10x) -> ratio 12.
+# stream, 57 over 4 and 96 over 8; a small calc parses in 0.19 s (x3.8 with 4 workers); the largest
+# pilot primaries peaked at 3.7-5.4x their size (trajectories: ~10x) -> ratio 12.
 #
 # NB: `mkdir -p logs_mc` BEFORE you submit (SLURM opens -o/-e before the body runs).
 set -euo pipefail
@@ -53,8 +58,9 @@ cd "${SLURM_SUBMIT_DIR:-.}"
 PARTS="${PARTS:-24}"                   # batches of fetch units (~1.2k units / ~1.1 TB -> ~45 GB each;
                                        # records are split per archive by triage, so a part never has
                                        # to hold a whole multi-archive record)
-WORKERS="${WORKERS:-8}"                # concurrent fetch units: 8 S3 streams gave the best aggregate
-                                       # (96 MB/s vs 57 at 4); MC's 500 req/min is never approached
+WORKERS="${WORKERS:-6}"                # concurrent fetch units (S3: 57 MB/s over 4 streams, 96 over 8);
+                                       # 6 leaves the 8 cores room for decompression + parse. Raise to 8
+                                       # with more cores. MC's 500 req/min is never approached
 MAX_BYTES="${MAX_BYTES:-0}"            # 0 = uncapped per-file download (the disk valve is the bound)
 MAX_MEMBER_BYTES="${MAX_MEMBER_BYTES:-0}"   # 0 = uncapped extracted member (the valve is the bomb guard)
 # Staging budget for the WHOLE MC raw dir: both concurrently-staged parts, the archives being
@@ -64,17 +70,29 @@ MAX_MEMBER_BYTES="${MAX_MEMBER_BYTES:-0}"   # 0 = uncapped extracted member (the
 # and refunded on delete, so `staged <= this` holds exactly. Lower both if other jobs share the quota.
 MAX_DISK_BYTES="${MAX_DISK_BYTES:-780000000000}"
 MAX_DISK_FILES="${MAX_DISK_FILES:-900000}"
-# Parse. Tens of thousands of small calcs are PARSE-THROUGHPUT-bound -> 6 workers. RAM is shared
-# through a MEMORY BUDGET: each parse first reserves ~RSS_RATIO x its (uncompressed) primary, FIFO,
-# so small calcs run 6-way while a multi-GB AIMD vasprun waits, then runs alone — the cap is then a
+# Parse. Tens of thousands of small calcs are parse-throughput-bound -> parallel workers. RAM is
+# shared through a MEMORY BUDGET: each parse first reserves ~RSS_RATIO x its (uncompressed) primary,
+# FIFO, so small calcs run N-way while a multi-GB vasprun waits, then runs alone — the cap is a
 # per-FILE bound (RSS_RATIO x cap <= budget), not workers x ratio x cap <= RAM. Budget = the job's
-# RAM minus 20 GiB for the main process + 8 fetch workers (a blind-fetched zip with ~10M members,
-# e.g. SSSP's 13 GB AiiDA exports, holds ~7 GB of zipfile directory; big tars hold member lists).
+# RAM (cpus x SLURM_MEM_PER_CPU, so any partition is safe) minus FETCH_RESERVE_GIB for the main
+# process + fetch workers (a blind-fetched zip with ~10M members — SSSP's 13 GB AiiDA exports —
+# holds ~7 GB of zipfile directory; big tars hold member lists). At 8 himem cores: ~37 GiB budget,
+# ~3.2 GB cap — above the largest primary the evidenced data holds (<= 2.5 GB, see above).
 # Anything over the cap stays staged as primary_too_large for the optional 30_bigparse.sh.
 RSS_RATIO="${RSS_RATIO:-12}"           # INTEGER: pymatgen peak / primary (bench 3.7-5.4x; trajectories ~10x)
-PARSE_WORKERS="${PARSE_WORKERS:-6}"
-PARSE_MEM_BUDGET="${PARSE_MEM_BUDGET:-$(( ${SLURM_CPUS_PER_TASK:-20} * 6760 * 1048576 - 20 * 1073741824 ))}"
-MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-$(( (PARSE_MEM_BUDGET - 536870912) / RSS_RATIO ))}"   # ~10 GB at 20 cpus
+PARSE_WORKERS="${PARSE_WORKERS:-4}"
+FETCH_RESERVE_GIB="${FETCH_RESERVE_GIB:-16}"
+# the job's RAM as Slurm granted it: --mem (per node) if given, else cpus x the partition's per-cpu
+# default (CSD3: 6760 MiB on icelake-himem, 3380 on icelake)
+if [[ -n "${SLURM_MEM_PER_NODE:-}" ]]; then JOB_RAM_MIB="$SLURM_MEM_PER_NODE"
+else JOB_RAM_MIB=$(( ${SLURM_CPUS_PER_TASK:-8} * ${SLURM_MEM_PER_CPU:-6760} )); fi
+PARSE_MEM_BUDGET="${PARSE_MEM_BUDGET:-$(( JOB_RAM_MIB * 1048576 - FETCH_RESERVE_GIB * 1073741824 ))}"
+if (( PARSE_MEM_BUDGET <= 1073741824 )); then
+    echo "ERROR: ${JOB_RAM_MIB} MiB of RAM leaves no parse budget after the ${FETCH_RESERVE_GIB} GiB fetch" \
+         "reserve — ask for more cores / icelake-himem" >&2
+    exit 2
+fi
+MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-$(( (PARSE_MEM_BUDGET - 536870912) / RSS_RATIO ))}"   # ~3.2 GB at 8 himem cpus
 PARSE_TIMEOUT="${PARSE_TIMEOUT:-3600}" # hard-kill one non-terminating parse after 1 h (a 10 GB
                                        # vasprun parses in minutes; the bench saw 8-19 s/GB)
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-4}"
@@ -95,6 +113,10 @@ echo "=== mc pipeline attempt $ATTEMPT/$MAX_ATTEMPTS $(date -Is) on $(hostname) 
 echo "    parts=$PARTS fetch_workers=$WORKERS parse_workers=$PARSE_WORKERS" \
      "mem_budget=$(( PARSE_MEM_BUDGET / 1073741824 )) GiB max_primary=$MAX_PRIMARY_BYTES B" \
      "(ratio $RSS_RATIO) valve=${MAX_DISK_BYTES} B/${MAX_DISK_FILES} inodes timeout=${PARSE_TIMEOUT}s"
+if (( MAX_PRIMARY_BYTES < 2500000000 )); then
+    echo "    WARNING: max_primary < 2.5 GB — the evidenced data holds primaries up to ~2.5 GB, which would" \
+         "be deferred (primary_too_large); ask for more RAM (-c / icelake-himem) or set MAX_PRIMARY_BYTES"
+fi
 quota 2>/dev/null || lfs quota -u "$USER" "$MC_HARVEST_DATA" 2>/dev/null || true
 # Archive backends (a missing one only turns those archives into logged `archive_unsupported` /
 # `extract_error` rejections — warn loudly, do not abort the harvest):
@@ -120,7 +142,12 @@ NEXT_JOBID=""
 submit_successor() {
     if [[ "${RESUBMIT:-0}" != "0" && -z "$NEXT_JOBID" && "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]]; then
         echo "=== queueing resume job (attempt $((ATTEMPT + 1))/$MAX_ATTEMPTS) $(date -Is) ==="
-        NEXT_JOBID=$(sbatch --parsable --dependency="afterany:${SLURM_JOB_ID}" \
+        # keep THIS job's shape (a `sbatch -p … -c … -t …` override must survive the chain — the
+        # spooled script's own #SBATCH lines would otherwise win)
+        local shape=(--partition="${SLURM_JOB_PARTITION}" --cpus-per-task="${SLURM_CPUS_PER_TASK}")
+        local tl; tl=$(squeue -h -j "${SLURM_JOB_ID}" -o %l 2>/dev/null || true)
+        [[ -n "$tl" && "$tl" != "UNLIMITED" ]] && shape+=(--time="$tl")
+        NEXT_JOBID=$(sbatch --parsable --dependency="afterany:${SLURM_JOB_ID}" "${shape[@]}" \
             --export="ALL,ATTEMPT=$((ATTEMPT + 1)),RESUBMIT=1" "$0") || NEXT_JOBID=""
         echo "  -> successor job: ${NEXT_JOBID:-<sbatch failed; resubmit by hand>}"
     fi

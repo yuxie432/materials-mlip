@@ -10,7 +10,7 @@ account once with `export SBATCH_ACCOUNT=<MYGROUP>-SL3-CPU`, activate the env be
 scripts/csd3/materials_cloud/10_discover.sh     # stage 0-1: full census + gates + overlap flags + peeks
 scripts/csd3/materials_cloud/15_bench.sh        # sizing: speed probe + AiiDA census + fetch/parse pilot (RUN 2026-09-24)
 scripts/csd3/materials_cloud/20_pipeline.sh     # stage 2-4 overlapped (fetch || parse+purge) + verify
-scripts/csd3/materials_cloud/30_bigparse.sh     # OPTIONAL phase B: primaries above the pipeline's ~10 GB cap
+scripts/csd3/materials_cloud/30_bigparse.sh     # OPTIONAL phase B: primaries above the pipeline's cap (~3.2 GB)
 scripts/csd3/materials_cloud/csd3_mc_overlap.py # after the pipeline: are the Zenodo-flagged records duplicates?
 scripts/csd3/materials_cloud/csd3_mc_probe.py   # --speed / --aiida probes (run by 15_bench.sh)
 scripts/csd3/materials_cloud/csd3_mc_bench.py   # real-data fetch+parse pilot (run by 15_bench.sh)
@@ -50,8 +50,9 @@ python -m materials_cloud_harvest.cli smoke          # expect "9/9 checks passed
 DISC=$(sbatch --parsable scripts/csd3/materials_cloud/10_discover.sh)
 
 # 2. the harvest, queued behind 1 (defaults sized from the 2026-09-24 bench for a DEDICATED
-#    ~880 GB / ~990k-inode slice: 20 cpus, 8 fetch + 6 parse workers, parse memory budget
-#    ~112 GiB, primary cap ~10 GB, valve 780 GB / 900k inodes, 24 parts):
+#    ~880 GB / ~990k-inode slice: 8 icelake-himem cpus, 6 fetch + 4 parse workers, parse memory
+#    budget ~37 GiB, primary cap ~3.2 GB, valve 780 GB / 900k inodes, 24 parts — the budget and cap
+#    follow the allocation, e.g. `sbatch -c 12 …` or `sbatch -p icelake -c 16 …`):
 RESUBMIT=1 sbatch --dependency=afterok:$DISC scripts/csd3/materials_cloud/20_pipeline.sh
 #    before it starts you can sanity-check the new keep-list (expect ~1.2k units / ~1.2 TB):
 python -c "import json;print(json.dumps(json.load(open('$MAN/mc_keep.report.json'))['summary'],indent=1))"
@@ -65,7 +66,7 @@ python -m zenodo_harvest.cli verify --dataset-dir $MC_HARVEST_DATA/dataset
 python scripts/csd3/materials_cloud/csd3_mc_overlap.py --mc-root $MC_HARVEST_DATA \
     --zenodo-dataset $ZENODO_HARVEST_DATA/dataset        # -> $MAN/mc_overlap.json
 
-# 5. ONLY if the pipeline deferred primaries above its ~10 GB cap (status shows primary_too_large):
+# 5. ONLY if the pipeline deferred primaries above its ~3.2 GB cap (status shows primary_too_large):
 sbatch scripts/csd3/materials_cloud/30_bigparse.sh        # 32 cpus, one parse at a time, 16 GB cap
 ```
 
@@ -74,11 +75,11 @@ sbatch scripts/csd3/materials_cloud/30_bigparse.sh        # 32 cpus, one parse a
 | stage | what bounds it | measured | knob (20_pipeline.sh / 10_discover.sh) |
 |---|---|---|---|
 | triage peeks (~1.4k + ~130 AiiDA databases) | **request latency** — each is 1-3 small Range reads through MC's API 302 hop | 64 KiB Range read 0.09 s, redirect 0.04 s; 1,434 peeks in 10 min | `PEEK_WORKERS=4` (paced 0.4 s apart: well under 500 req/60 s) |
-| fetch (~1.2k units / ~1.2 TB, ~1.1 TB blind) | **S3 bandwidth** | 52 MB/s on 1 stream, 57 on 4, **96 on 8** | `WORKERS=8` → ≈ 3.5 h |
+| fetch (~1.2k units / ~1.2 TB, ~1.1 TB blind) | **S3 bandwidth** | 52 MB/s on 1 stream, 57 on 4, **96 on 8** | `WORKERS=6` → ≈ 4-5 h (8 with more cores) |
 | many small calcs (~10⁴-10⁵) | **parse throughput** — one forkserver child per calc | 0.19 s/calc serial, ×3.8 with 4 workers | `PARSE_WORKERS=6` |
-| multi-GB primaries | **RAM** — pymatgen peaks ~4-12× the uncompressed file | pilot max 1.04 GB → 3.8 GiB peak | `PARSE_MEM_BUDGET` (= cpus × 6760 MiB − 20 GiB) + `MAX_PRIMARY_BYTES` (= budget/12 ≈ 10 GB) |
+| multi-GB primaries | **RAM** — pymatgen peaks ~4-12× the uncompressed file | pilot max 1.04 GB → 3.8 GiB peak; the 2026-09-24 run: none over 2.5 GB | `PARSE_MEM_BUDGET` (= job RAM − 16 GiB) + `MAX_PRIMARY_BYTES` (= budget/12 ≈ 3.2 GB at 8 himem cores) |
 
-The **parse memory budget** is what lets 6 workers and a ~10 GB cap coexist on 20 cores: every parse
+The **parse memory budget** is what lets 4 workers and a ~3.2 GB cap coexist on 8 cores: every parse
 first reserves ~12 × its primary (+0.5 GiB) from the budget, FIFO — small calcs run 6-way, a big
 AIMD vasprun waits for room and then runs alone. Without it the rule would be
 `workers × 12 × cap ≤ RAM` (3 workers → 2.5 GB cap on 16 cores, as first planned). All four knobs
@@ -113,9 +114,12 @@ like) harvested Zenodo records, or cited by NOMAD calcs. They are **kept** (all 
   blind-fetched archives are deleted right after extraction, so the peak is the in-flight archives
   (≤ 8 at once, the largest 44 GB) plus two parts' extracted VASP files. Lower both if other jobs
   share the quota again.
-* **RAM**: 20 `icelake-himem` cores = ~132 GiB: ~112 GiB parse memory budget + 20 GiB for the main
-  process and the 8 fetch workers (a blind-fetched zip with ~10M members holds ~7 GB of zipfile
-  directory). Anything above the ~10 GB cap stays staged for `30_bigparse.sh` (32 cores, 16 GB).
+* **RAM**: 8 `icelake-himem` cores = ~53 GiB: ~37 GiB parse memory budget + 16 GiB for the main
+  process and the 6 fetch workers (a blind-fetched zip with ~10M members holds ~7 GB of zipfile
+  directory). The ~3.2 GB cap is above every primary seen so far (the 2026-09-24 run parsed the
+  whole evidenced set with none over 2.5 GB; the bench's largest was 1.04 GB); anything bigger stays
+  staged for `30_bigparse.sh` (32 cores, 16 GB). Why not 20 cores: that bought a ~10 GB cap nobody
+  needs and a 20-core × 12 h block that waits hours on the small himem partition.
 * **Time**: fetch ≈ 3.5 h at 96 MB/s, parse overlapped → one 12 h SL3 job expected; `RESUBMIT=1`
   covers an overrun and retries any unit still failing transiently (the pipeline exits non-zero).
 * **Archives**: `.7z`/`.rar` need the `archives` extra and an `unrar` (the script prepends `~/bin`,

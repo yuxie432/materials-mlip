@@ -102,8 +102,8 @@ two flagged records were inspected: not record-level duplicates — `docs/MATERI
   REAL fetch + per-calc parse path on a stratified ~12 GB sample → MB/s incl. extraction, s/calc
   serial vs N workers, net RSS ratio + s/GB of the largest primaries, fetch-vs-parse projection).
 - Stage bounds (measured on CSD3 2026-09-24): triage peeks request-latency-bound (0.1 s reads;
-  `--peek-workers 4`); fetch S3-bandwidth-bound (52 MB/s/stream, 96 MB/s over 8 → `--workers 8`,
-  ~1.2 TB ≈ 3.5 h); small calcs parse-throughput-bound (0.19 s each, ×3.8 at 4 workers →
-  `--parse-workers 6`); big primaries RAM-bound → `--parse-mem-budget` (cpus × 6760 MiB − 20 GiB)
-  with `--max-primary-bytes` ≈ budget/12 (~10 GB on 20 cores); `30_bigparse.sh` only for anything
-  above. No API token needed (all public; bytes come from presigned S3).
+  `--peek-workers 4`); fetch S3-bandwidth-bound (52 MB/s/stream, 57 over 4, 96 over 8 → `--workers 6`,
+  ~1.2 TB ≈ 4-5 h); small calcs parse-throughput-bound (0.19 s each, ×3.8 at 4 workers →
+  `--parse-workers 4`); big primaries RAM-bound → `--parse-mem-budget` (job RAM from Slurm − 16 GiB)
+  with `--max-primary-bytes` ≈ budget/12 (~3.2 GB on 8 himem cores — above every primary seen: the
+  2026-09-24 run had none over 2.5 GB); `30_bigparse.sh` only for anything above. No API token needed (all public; bytes come from presigned S3).
