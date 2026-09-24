@@ -45,7 +45,7 @@ from typing import Any, Callable
 import requests
 import requests.auth
 
-from . import config, zipstream
+from . import aiida_archive, config, zipstream
 from .client import _parse_retry_after
 from .manifest import JsonlWriter, RejectionLogger, read_jsonl
 
@@ -1001,8 +1001,98 @@ def _extract_tar_zst(path: Path, dest: Path, member_cap: int,
     return names, extracted
 
 
+def _is_primary_name(base: str) -> bool:
+    """Whether a filename would seed a calc unit (vasprun/vaspout/OUTCAR) — fetch's own rule."""
+    return _unit_role(base) in _PRIMARY_ROLES
+
+
+def _extract_aiida(path: Path, dest: Path, member_cap: int,
+                   budget: "StagingBudget | None" = None) -> tuple[list[str], list[str]]:
+    """Extract VASP files from an AiiDA archive (``*.aiida``) in any of its on-disk shapes.
+
+    A **legacy** export keeps real member names, so a zip one goes to :func:`_extract_zip` and a
+    tar(.gz) one (``verdi export -F tar.gz``; not a zip at all) to :func:`_extract_tar`. A
+    **sqlite_zip** archive (aiida-core >= 2.0) hides names in its ``db.sqlite3``: the database is
+    copied out (transient staging, charged and refunded like any bytes), every node holding a VASP
+    primary is listed from it (:func:`aiida_archive.vasp_nodes`), and each such node's VASP-named
+    files are streamed out of their ``repo/<key>`` blobs to the node's LEGACY path
+    (``nodes/<uu>/<id>/<rest>/path/<file>``) — so calc units, calc_ids (the node UUID path) and
+    per-calc availability come out exactly as for a legacy export. Returns ``(names, extracted)``
+    like every extractor; ``names`` lists each VASP node's files at those paths (heavy outputs
+    included, for availability)."""
+    if not zipfile.is_zipfile(path):
+        return _extract_tar(path, dest, member_cap, budget)
+    if _zip_aiida_format(path) == "sqlite_zip":
+        return _extract_aiida_sqlite(path, dest, member_cap, budget)
+    return _extract_zip(path, dest, member_cap, budget)
+
+
+def _zip_aiida_format(path: Path) -> str | None:
+    """The AiiDA format of a zip on disk. Its own function so the directory it reads is freed
+    before an extractor reads it again (a 13 GB export can list ~10M members, ~7 GB in zipfile)."""
+    with zipfile.ZipFile(path) as zf:
+        return aiida_archive.archive_format(zf.namelist())
+
+
+def _extract_aiida_sqlite(path: Path, dest: Path, member_cap: int,
+                          budget: "StagingBudget | None") -> tuple[list[str], list[str]]:
+    """The sqlite_zip branch of :func:`_extract_aiida` (see there)."""
+    with zipfile.ZipFile(path) as zf:
+        by_name = {i.filename: i for i in zf.infolist()}
+        return _extract_aiida_sqlite_members(zf, by_name, path, dest, member_cap, budget)
+
+
+def _extract_aiida_sqlite_members(zf: zipfile.ZipFile, by_name: dict[str, zipfile.ZipInfo],
+                                  path: Path, dest: Path, member_cap: int,
+                                  budget: "StagingBudget | None") -> tuple[list[str], list[str]]:
+    db_name = aiida_archive.db_member(by_name)
+    if db_name is None:
+        raise ValueError("sqlite_zip AiiDA archive without a db.sqlite3")
+    prefix = aiida_archive.repo_prefix(db_name)
+    tmp = dest.parent / f".{dest.name}.{aiida_archive.DB_NAME}.tmp"
+    with zf.open(by_name[db_name]) as src:
+        got = _copy_capped(src, tmp, 1 << 62, budget)
+    try:
+        if got != _COPY_OK:              # the budget refused even the database: nothing to map
+            return [], []
+        nodes = aiida_archive.vasp_nodes(tmp, _is_primary_name)
+    finally:
+        _delete_refund(tmp, budget)
+    names = [f"{aiida_archive.legacy_node_dir(n['uuid'])}/{rel}"
+             for n in nodes for rel, _ in n["files"]]
+    extracted: list[str] = []
+    for node in nodes:
+        ndir = aiida_archive.legacy_node_dir(node["uuid"])
+        for rel, key in node["files"]:
+            base = rel.rsplit("/", 1)[-1]
+            if not _want_member(base):
+                continue                     # heavy / other outputs: availability only
+            info = by_name.get(f"{prefix}repo/{key}")
+            if info is None:
+                logger.warning("AiiDA blob %s (%s) missing from %s", key, rel, path.name)
+                continue
+            name = f"{ndir}/{rel}"
+            out = dest / name
+            if not _is_within(dest, out):
+                continue
+            cap = _member_cap_for(base, member_cap)
+            if info.file_size > cap:
+                logger.warning("skip oversized member %s (%d B) in %s", base, info.file_size,
+                               path.name)
+                continue
+            if budget is not None and not budget.check(info.file_size, 1):
+                return names, extracted      # a disk/inode limit: stop, like the extractors
+            with zf.open(info) as src:
+                outcome = _copy_capped(src, out, cap, budget)
+            if outcome == _COPY_OK:
+                extracted.append(name)
+            elif outcome == _COPY_NO_BUDGET:
+                return names, extracted
+    return names, extracted
+
+
 _EXTRACTORS = {"zip": _extract_zip, "tar": _extract_tar, "rar": _extract_rar,
-               "sevenzip": _extract_7z, "tarzst": _extract_tar_zst}
+               "sevenzip": _extract_7z, "tarzst": _extract_tar_zst, "aiida": _extract_aiida}
 
 # Exceptions a bad/truncated archive can raise across all backends — caught per
 # archive so one corrupt file rejects just that file, not the whole run. The optional
@@ -1087,6 +1177,10 @@ def _nested_archive_kind(name: str) -> str | None:
         return "sevenzip"
     if low.endswith(_ZST_TAR_SUFFIXES):
         return "tarzst"
+    if low.endswith(".aiida"):
+        # an AiiDA archive bundled inside another archive (seen on Materials Cloud: zips of
+        # per-project exports) — extracted by :func:`_extract_aiida` in whatever format it is
+        return "aiida"
     return None
 
 

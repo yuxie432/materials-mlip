@@ -8,20 +8,22 @@ downloading the archive — the same trick as ``zenodo_harvest.zipstream`` / ``t
   Bosoni VASP export has 359,272) use the ZIP64 end-of-central-directory, which the Zenodo
   32-bit peek reports as "unpeekable". The member parser is NOMAD's tested ZIP64 one
   (``nomad_harvest.upload_zip._parse_central_directory``), reused, not copied.
-* **AiiDA-aware.** An ``*.aiida`` file is an AiiDA export. Two on-disk formats occur on MC
+* **AiiDA-aware.** An ``*.aiida`` file is an AiiDA archive. Two on-disk formats occur on MC
   (live-verified 2026-09-23): the **legacy** export (aiida-core 1.x, export_version 0.x) is a zip
   whose members keep their REAL names — ``nodes/<uuid-shards>/path/vasprun.xml`` — so VASP outputs
   inside are visible to the peek and extractable by the ordinary zip machinery; the **sqlite_zip**
   archive (aiida-core ≥2.0) stores files as content-addressed ``repo/<sha256>`` blobs whose names
-  live only in its ``db.sqlite3``, so a peek can only report the format (an evidence gap; the CSD3
-  probe inspects the db). :func:`aiida_format` tells them apart from the member names.
+  live only in its ``db.sqlite3`` — so the peek pulls that one member over Range and queries it
+  (:func:`sqlite_evidence`, the shared ``zenodo_harvest.aiida_archive`` rules the fetch extractor
+  uses too). :func:`aiida_format` tells the formats apart from the member names.
 """
 
 from __future__ import annotations
 
 import logging
-import re
+import os
 import struct
+import tempfile
 import time
 import zlib
 from dataclasses import dataclass, field
@@ -30,10 +32,13 @@ from pathlib import Path
 import requests
 
 from nomad_harvest.upload_zip import ZipMember, _parse_central_directory
+from zenodo_harvest import aiida_archive
+from zenodo_harvest.aiida_archive import archive_format
 from zenodo_harvest.fetch import (
     _PARSE_RE,
     _PRIMARY_ROLES,
     _is_junk_member,
+    _is_primary_name,
     _nested_archive_kind,
     _unit_role,
 )
@@ -47,6 +52,8 @@ _LFH_SIG = b"PK\x03\x04"
 _SENTINEL32 = 0xFFFFFFFF
 DEFAULT_TAIL = 1 << 20              # the EOCD (+ZIP64 locator/record) is always in the last ~64 KiB
 DEFAULT_MAX_CD_BYTES = 1 << 30      # refuse to pull a central directory bigger than this (1 GiB)
+# Largest sqlite_zip database a peek pulls (the CSD3 census: 4 MB - 1.14 GB; the whole set ~7 min).
+DEFAULT_MAX_DB_BYTES = 2 << 30
 _RETRY_STATUS = {429, 500, 502, 503, 504}
 
 
@@ -139,14 +146,19 @@ def read_central_directory(session: requests.Session, url: str, tail: int = DEFA
         raise RemoteZipError("no end-of-central-directory record (not a zip?)")
     eocd_abs = blob_start + idx
     n_entries, cd_size, cd_off = struct.unpack("<HII", blob[idx + 10:idx + 20])
-    zip64 = cd_off == _SENTINEL32 or cd_size == _SENTINEL32 or n_entries == 0xFFFF
-    if zip64:
-        loc = blob[idx - 20:idx] if idx >= 20 else b""
-        if loc[:4] != _EOCD64_LOC_SIG:
-            raise RemoteZipError("ZIP64 locator missing")
-        # Like zipfile: take the ZIP64 record immediately BEFORE the locator (robust to prepended
-        # data); fall back to the locator's recorded offset if extensible data sits between them.
-        z = b""
+    sentinel = cd_off == _SENTINEL32 or cd_size == _SENTINEL32 or n_entries == 0xFFFF
+    # Like zipfile, the ZIP64 end records are used whenever their LOCATOR sits right before the
+    # EOCD — not only when a 32-bit field holds a sentinel. CPython's own zipfile writes ZIP64 end
+    # records as soon as the central directory starts past 2 GiB (its ZIP64_LIMIT) yet keeps the
+    # real, still-32-bit offset in the EOCD, and some writers always emit them: ignoring the locator
+    # there misplaces the central directory by the 76 bytes of ZIP64 records (CSD3 census
+    # 2026-09-24: 25 MC archives of 0.09-4 GiB failed exactly so, incl. 14 AiiDA exports).
+    loc = blob[idx - 20:idx] if idx >= 20 else b""
+    zip64 = False
+    end_of_cd_abs = eocd_abs              # where the central directory must end (+ any shift)
+    if loc[:4] == _EOCD64_LOC_SIG:
+        # the ZIP64 record normally sits immediately BEFORE the locator (robust to prepended
+        # data); else at the locator's recorded offset (extensible data in between)
         for z64_abs in (eocd_abs - 20 - 56, struct.unpack("<Q", loc[8:16])[0]):
             if z64_abs < 0:
                 continue
@@ -155,12 +167,14 @@ def read_central_directory(session: requests.Session, url: str, tail: int = DEFA
             else:
                 z = _range_bytes(session, url, z64_abs, z64_abs + 55)
             if z[:4] == _EOCD64_SIG and len(z) >= 56:
+                n_entries, cd_size, cd_off = struct.unpack("<QQQ", z[32:56])
+                zip64, end_of_cd_abs = True, z64_abs
                 break
-        if z[:4] != _EOCD64_SIG or len(z) < 56:
-            raise RemoteZipError("ZIP64 end-of-central-directory record missing")
-        n_entries, cd_size, cd_off = struct.unpack("<QQQ", z[32:56])
-    # Offset shift of the whole archive within the file (0 for a normal zip).
-    concat = eocd_abs - cd_size - cd_off - ((56 + 20) if zip64 else 0)
+    if sentinel and not zip64:
+        raise RemoteZipError("ZIP64 end-of-central-directory record missing")
+    # Offset shift of the whole archive within the file (0 for a normal zip): the central
+    # directory ends where the (ZIP64) end record begins.
+    concat = end_of_cd_abs - cd_size - cd_off
     if concat < 0:
         raise RemoteZipError("inconsistent end-of-central-directory offsets")
     if cd_size > max_cd_bytes:
@@ -175,7 +189,10 @@ def read_central_directory(session: requests.Session, url: str, tail: int = DEFA
     if n_entries and cd[:4] != b"PK\x01\x02":
         raise RemoteZipError("central directory does not start with a file header")
     members = _parse_central_directory(cd)
-    if len(members) != n_entries:
+    # A writer without ZIP64 end records that stores only the LOW 16 bits of a >65,535 entry count
+    # is non-compliant but real (CSD3 census: a zip with 132,202 members whose EOCD says 1,130 =
+    # 132,202 mod 65,536); zipfile reads such archives by walking the directory bytes, as we do.
+    if len(members) != n_entries and (zip64 or len(members) % 65536 != n_entries % 65536):
         raise RemoteZipError(f"central directory lists {len(members)} of {n_entries} entries")
     if concat:
         members = [ZipMember(m.name, m.method, m.comp_size, m.uncomp_size, m.crc,
@@ -183,46 +200,39 @@ def read_central_directory(session: requests.Session, url: str, tail: int = DEFA
     return members, total
 
 
-_LEGACY_NODE_RE = re.compile(r"(?:^|/)nodes/[0-9a-f]{2}/[0-9a-f]{2}/[^/]+/(?:path|raw_input)/")
-_SQLITE_REPO_RE = re.compile(r"(?:^|/)repo/[0-9a-f]{32,}$")
-
-
-def aiida_format(names: list[str]) -> str | None:
-    """``"legacy"`` (aiida-core 1.x export: real names under ``nodes/<shards>/<uuid>/path/``),
-    ``"sqlite_zip"`` (aiida-core ≥2.0: ``repo/<sha256>`` blobs + ``db.sqlite3``), or None.
-    Tolerates a top-level folder around the export (``export/nodes/…``)."""
-    legacy = sqlite = False
-    for n in names:
-        base = n.rsplit("/", 1)[-1]
-        if base == "data.json" or _LEGACY_NODE_RE.search(n):
-            legacy = True
-        elif base == "db.sqlite3" or _SQLITE_REPO_RE.search(n):
-            sqlite = True
-    if legacy:
-        return "legacy"
-    if sqlite:
-        return "sqlite_zip"
-    return None
+# The format rules live in the shared ``zenodo_harvest.aiida_archive`` (the fetch extractor uses
+# the same ones); re-exported under the historical name.
+aiida_format = archive_format
 
 
 @dataclass
 class ZipEvidence:
-    """What a central-directory peek reveals about one archive."""
+    """What a central-directory peek reveals about one archive.
+
+    For a sqlite_zip AiiDA archive the member NAMES are opaque blobs, so ``primary``/``vasp_any``
+    come from its database instead (:func:`sqlite_evidence`): ``db_status`` is then ``"ok"`` (the
+    counts are authoritative), ``"db_too_large"`` or ``"db_failed: …"`` (unknown — an evidence
+    gap); it is None for every other archive."""
 
     n_members: int = 0
     primary: list[str] = field(default_factory=list)      # members fetch would seed a calc from
     vasp_any: int = 0                                      # members fetch would extract (VASP-named)
     nested: list[str] = field(default_factory=list)       # sub-archives (contents invisible)
-    nested_aiida: list[str] = field(default_factory=list)  # AiiDA exports inside (not extracted)
+    nested_aiida: list[str] = field(default_factory=list)  # AiiDA archives inside (extractable)
     aiida_format: str | None = None
     primary_bytes: int = 0                                 # uncompressed bytes of the primaries
+    db_status: str | None = None                           # sqlite_zip only (see above)
+    db_bytes: int = 0
 
     def to_dict(self, max_names: int = 5) -> dict:
-        return {"n_members": self.n_members, "n_primary": len(self.primary),
-                "primary_sample": self.primary[:max_names], "n_vasp_named": self.vasp_any,
-                "n_nested": len(self.nested), "nested_sample": self.nested[:max_names],
-                "n_nested_aiida": len(self.nested_aiida), "aiida_format": self.aiida_format,
-                "primary_bytes": self.primary_bytes}
+        d = {"n_members": self.n_members, "n_primary": len(self.primary),
+             "primary_sample": self.primary[:max_names], "n_vasp_named": self.vasp_any,
+             "n_nested": len(self.nested), "nested_sample": self.nested[:max_names],
+             "n_nested_aiida": len(self.nested_aiida), "aiida_format": self.aiida_format,
+             "primary_bytes": self.primary_bytes}
+        if self.db_status is not None:
+            d["db_status"], d["db_bytes"] = self.db_status, self.db_bytes
+        return d
 
 
 def zip_evidence(members: list[ZipMember]) -> ZipEvidence:
@@ -246,17 +256,68 @@ def zip_evidence(members: list[ZipMember]) -> ZipEvidence:
             if _unit_role(base) in _PRIMARY_ROLES:
                 ev.primary.append(n)
                 ev.primary_bytes += int(m.uncomp_size or 0)
-        if _nested_archive_kind(base) is not None:
-            ev.nested.append(n)
-        elif base.lower().endswith(".aiida"):
+        if base.lower().endswith(".aiida"):
             ev.nested_aiida.append(n)
+        elif _nested_archive_kind(base) is not None:
+            ev.nested.append(n)
     return ev
 
 
-def peek_archive(session: requests.Session, url: str, max_cd_bytes: int = DEFAULT_MAX_CD_BYTES
-                 ) -> tuple[ZipEvidence | None, str]:
+def sqlite_evidence(session: requests.Session, url: str, members: list[ZipMember],
+                    ev: ZipEvidence, max_db_bytes: int = DEFAULT_MAX_DB_BYTES) -> ZipEvidence:
+    """Fill ``ev`` for a sqlite_zip AiiDA archive from its ``db.sqlite3``, pulled over Range.
+
+    The database (MB to ~1 GB on MC) is streamed to a temp file under ``$TMPDIR`` and queried
+    with the SHARED rule set (:func:`zenodo_harvest.aiida_archive.vasp_nodes` + fetch's
+    ``_unit_role``), so triage sees exactly the calcs the fetch extractor will write: ``primary``
+    lists them at their legacy-layout paths, ``primary_bytes`` sums their ``repo/<key>`` blobs."""
+    names = [m.name for m in members]
+    db_name = aiida_archive.db_member(names)
+    db = next((m for m in members if m.name == db_name), None) if db_name else None
+    if db is None:
+        ev.db_status = "db_failed: no db.sqlite3 member"
+        return ev
+    ev.db_bytes = int(db.uncomp_size or 0)
+    if ev.db_bytes > max_db_bytes:
+        ev.db_status = "db_too_large"
+        return ev
+    fd, tmp_name = tempfile.mkstemp(prefix="mc_aiida_", suffix=".sqlite3")
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        if not fetch_member(session, url, db, tmp):
+            ev.db_status = "db_failed: database transfer failed"
+            return ev
+        try:
+            nodes = aiida_archive.vasp_nodes(tmp, _is_primary_name)
+        except ValueError as exc:
+            ev.db_status = f"db_failed: {exc}"[:160]
+            return ev
+    finally:
+        tmp.unlink(missing_ok=True)
+    prefix = aiida_archive.repo_prefix(db_name or "")
+    sizes = {m.name: int(m.uncomp_size or 0) for m in members}
+    for node in nodes:
+        ndir = aiida_archive.legacy_node_dir(node["uuid"])
+        for rel, key in node["files"]:
+            base = rel.rsplit("/", 1)[-1]
+            if _is_junk_member(base) or not _PARSE_RE.search(base):
+                continue
+            ev.vasp_any += 1
+            if _is_primary_name(base):
+                ev.primary.append(f"{ndir}/{rel}")
+                ev.primary_bytes += sizes.get(f"{prefix}repo/{key}", 0)
+    ev.db_status = "ok"
+    return ev
+
+
+def peek_archive(session: requests.Session, url: str, max_cd_bytes: int = DEFAULT_MAX_CD_BYTES,
+                 max_db_bytes: int = DEFAULT_MAX_DB_BYTES) -> tuple[ZipEvidence | None, str]:
     """Peek one remote zip/AiiDA export: ``(evidence, status)`` with status ``"ok"`` or a short
-    failure reason (``"not_zip"``, ``"cd_too_large"``, ``"peek_failed: …"``)."""
+    failure reason (``"not_zip"``, ``"cd_too_large"``, ``"peek_failed: …"``). A sqlite_zip AiiDA
+    archive is resolved through its database (:func:`sqlite_evidence`): a database over
+    ``max_db_bytes`` (0 = never read one) makes the status ``"db_too_large"``, a failed transfer
+    or query ``"peek_failed: db …"`` (retried in-run, never cached)."""
     try:
         members, _total = read_central_directory(session, url, max_cd_bytes=max_cd_bytes)
     except RemoteZipError as exc:
@@ -268,7 +329,14 @@ def peek_archive(session: requests.Session, url: str, max_cd_bytes: int = DEFAUL
         return None, f"peek_failed: {msg[:160]}"
     except (struct.error, ValueError) as exc:
         return None, f"peek_failed: {type(exc).__name__}: {exc}"
-    return zip_evidence(members), "ok"
+    ev = zip_evidence(members)
+    if ev.aiida_format == "sqlite_zip" and max_db_bytes:
+        ev = sqlite_evidence(session, url, members, ev, max_db_bytes)
+        if ev.db_status == "db_too_large":
+            return ev, "db_too_large"
+        if ev.db_status != "ok":
+            return ev, f"peek_failed: {ev.db_status}"
+    return ev, "ok"
 
 
 def fetch_member(session: requests.Session, url: str, m: ZipMember, dest: Path) -> bool:

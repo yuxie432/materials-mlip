@@ -249,7 +249,9 @@ def discover(client: MaterialsCloudClient, out_path: str | Path, *,
                              for c in kept if c.get("overlap")][:25],
         "licence_policy": licence_policy,
         "zenodo_index_records": len((zindex or {}).get("titles") or {}),
-        "nomad_calcs_citing_mc": len(set().union(*nrefs.values())) if nrefs else None,
+        # None = the NOMAD metadata was not scanned; 0 = scanned, no NOMAD calc cites MC
+        "nomad_calcs_citing_mc": (len(set().union(*nrefs.values())) if nrefs else 0)
+        if nrefs is not None else None,
     }
     logger.info("mc discover: %s", {k: v for k, v in summary.items() if k != "overlap_examples"})
     return summary

@@ -35,15 +35,15 @@ from zenodo_harvest.fetch import (
     DEFAULT_ZIP_STREAM_MAX_FILES,
     fetch as shared_fetch,
 )
-from zenodo_harvest.parse import parse
+from zenodo_harvest.parse import DEFAULT_PARSE_RSS_RATIO, parse
 from zenodo_harvest.store import DatasetLockError
 
 from .client import MaterialsCloudClient, new_session
 from .discover import discover
 from .fetching import TRANSIENT_RETRIES, fetch_with_retries
 from .records import LICENCE_POLICIES
-from .remote_zip import DEFAULT_MAX_CD_BYTES
-from .triage import DEFAULT_FILE_ALLOWLIST, triage
+from .remote_zip import DEFAULT_MAX_CD_BYTES, DEFAULT_MAX_DB_BYTES
+from .triage import DEFAULT_FILE_ALLOWLIST, UNRESOLVED_POLICIES, triage
 
 CANDIDATES = "mc_candidates.jsonl"
 KEEP = "mc_keep.jsonl"
@@ -195,6 +195,14 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--peek-workers", type=int, default=4,
                    help="concurrent central-directory peeks (they are request-latency-bound, "
                         "~1-3 small Range reads each through MC's API redirect)")
+    t.add_argument("--unresolved", choices=UNRESOLVED_POLICIES, default="all",
+                   help="records that never mention VASP and show no VASP in any peek, but hold "
+                        "archives no peek can settle (tars, unreadable/nested zips): all (default, "
+                        "2026-09-24 decision) = fetch those archives anyway; dft = only for "
+                        "DFT-worded records naming no other code; none = drop them")
+    t.add_argument("--max-db-bytes", type=int, default=DEFAULT_MAX_DB_BYTES,
+                   help="largest sqlite_zip AiiDA database a peek pulls to list its VASP calcs "
+                        "(0 = never; such archives then count as unresolved)")
     t.add_argument("--max-records", type=int, default=None)
 
     f = sub.add_parser("fetch", help="stage 2: shared fetch of the keep-list (anonymous MC session)")
@@ -218,6 +226,15 @@ def main(argv: list[str] | None = None) -> int:
                          "UNCOMPRESSED size (0 = off); pymatgen peak RSS ~10-12x the file")
     pi.add_argument("--parse-timeout", type=float, default=1200)
     pi.add_argument("--parse-workers", type=int, default=1)
+    pi.add_argument("--parse-mem-budget", type=int, default=0,
+                    help="RAM (bytes) the concurrent parses may reserve between them (0 = off): "
+                         "each parse reserves ~--parse-rss-ratio x its largest uncompressed "
+                         "primary first, FIFO, so small calcs run --parse-workers-way while a "
+                         "multi-GB primary waits and runs alone — size --max-primary-bytes to "
+                         "~budget/ratio instead of RAM/(workers x ratio)")
+    pi.add_argument("--parse-rss-ratio", type=float, default=DEFAULT_PARSE_RSS_RATIO,
+                    help="peak parse RSS per uncompressed primary byte assumed by the budget "
+                         f"(default {DEFAULT_PARSE_RSS_RATIO}; CSD3 measured 3.7-10.5)")
     _add_fetch_opts(pi)
 
     st = sub.add_parser("status", help="read-only progress snapshot of the MC harvest")
@@ -265,7 +282,8 @@ def main(argv: list[str] | None = None) -> int:
                          peek=args.peek, max_cd_bytes=args.max_cd_bytes,
                          file_allowlist=_parse_allow(args.allow, not args.no_default_allowlist),
                          split=args.split, interval=args.interval, max_records=args.max_records,
-                         peek_workers=args.peek_workers)
+                         peek_workers=args.peek_workers, unresolved_policy=args.unresolved,
+                         max_db_bytes=args.max_db_bytes)
     elif args.cmd == "fetch":
         summary = _fetch(args, args.in_path, args.out, args.raw_dir, args.rejections,
                          args.max_records)
@@ -333,7 +351,8 @@ def _run_pipeline(args: argparse.Namespace) -> int:
             return                        # nothing fetched for this part (all rejected)
         parse(fetched, dataset_dir=str(ds_dir), rejections_path=parse_rej, raw_dir=str(raw_dir),
               max_primary_bytes=args.max_primary_bytes, parse_timeout_s=args.parse_timeout,
-              parse_workers=args.parse_workers)
+              parse_workers=args.parse_workers, parse_mem_budget=args.parse_mem_budget,
+              parse_rss_ratio=args.parse_rss_ratio)
         purge_raw(str(raw_dir), str(ds_dir), fetched=fetched)
 
     fetch_error: str | None = None

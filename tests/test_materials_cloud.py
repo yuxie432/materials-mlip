@@ -15,10 +15,12 @@ Run: ``python -m pytest tests/test_materials_cloud.py -q`` from the repo root.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import io
 import json
 import struct
+import tarfile
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -197,6 +199,49 @@ def make_zip64(members: dict[str, bytes], monkeypatch: pytest.MonkeyPatch) -> by
     return bytes(data)
 
 
+UUID_A = "fb16c207-aaaa-4bbb-8ccc-000000000001"
+UUID_B = "598e207e-bbbb-4ccc-8ddd-000000000002"
+UUID_Q = "0a0b0c0d-cccc-4ddd-8eee-000000000003"
+
+
+def make_sqlite_aiida(nodes: dict[str, dict[str, bytes]], drop_blobs: tuple[str, ...] = ()) -> bytes:
+    """A minimal aiida-core >= 2.0 **sqlite_zip** archive: content-addressed ``repo/<sha256>``
+    blobs + a ``db.sqlite3`` whose ``db_dbnode.repository_metadata`` maps each node's file tree
+    (``{"o": {name: {"k": key} | {"o": {...}}}}``) to blob keys — the real on-disk shape, so the
+    triage database query and the fetch extractor both run against a genuine SQLite file."""
+    import sqlite3
+    import tempfile
+    blobs: dict[str, bytes] = {}
+    rows = []
+    for uuid, files in nodes.items():
+        tree: dict[str, Any] = {}
+        for rel, data in files.items():
+            key = hashlib.sha256(data).hexdigest()
+            if rel not in drop_blobs:
+                blobs[key] = data
+            *dirs, leaf = rel.split("/")
+            d = tree
+            for part in dirs:
+                d = d.setdefault(part, {"o": {}})["o"]
+            d[leaf] = {"k": key}
+        rows.append((uuid, "data.core.folder.FolderData.", json.dumps({"o": tree})))
+    rows.append(("99999999-0000-4000-8000-000000000000", "process.calculation.calcjob.CalcJobNode.",
+                 json.dumps({"o": {"_aiidasubmit.sh": {"k": "f" * 64}}})))
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "db.sqlite3"
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE db_dbnode (id INTEGER PRIMARY KEY, uuid TEXT, node_type TEXT, "
+                    "process_type TEXT, repository_metadata TEXT)")
+        con.executemany("INSERT INTO db_dbnode (uuid, node_type, repository_metadata) "
+                        "VALUES (?, ?, ?)", rows)
+        con.commit()
+        con.close()
+        raw = db.read_bytes()
+    members = {"metadata.json": b'{"export_version": "main_0001"}', "db.sqlite3": raw}
+    members.update({f"repo/{k}": v for k, v in blobs.items()})
+    return make_zip(members)
+
+
 # --------------------------------------------------------------------------- #
 # records: normalisation, licence policy, identifiers                          #
 # --------------------------------------------------------------------------- #
@@ -366,6 +411,44 @@ def test_read_central_directory_follows_zip64_records(monkeypatch):
     assert len(members) == 3 and all(m.name.endswith("vasprun.xml") for m in members)
 
 
+def test_read_central_directory_zip64_records_with_real_32bit_fields(monkeypatch):
+    # the CSD3 census's 25 failed peeks: ZIP64 end records present, EOCD fields NOT sentinels
+    # (CPython zipfile past 2 GiB, some other writers always) -> follow the locator anyway
+    monkeypatch.setattr(zipfile, "ZIP_FILECOUNT_LIMIT", 1)
+    z = make_zip({"nodes/aa/bb/u/path/vasprun.xml": b"<x/>", "nodes/aa/bb/u/path/OUTCAR": b"o"})
+    i = z.rfind(b"PK\x05\x06")
+    assert z[i - 20:i - 16] == b"PK\x06\x07" and struct.unpack("<I", z[i + 16:i + 20])[0] != 0xFFFFFFFF
+    for blob in (z, b"#!stub\n" + b"x" * 3000 + z):          # also behind prepended data
+        members, _ = read_central_directory(FakeFileSession({"u": blob}), "u")  # type: ignore[arg-type]
+        assert {m.name for m in members} == {"nodes/aa/bb/u/path/vasprun.xml",
+                                             "nodes/aa/bb/u/path/OUTCAR"}
+        assert all(blob[m.local_offset:m.local_offset + 4] == b"PK\x03\x04" for m in members)
+
+
+@functools.lru_cache(maxsize=1)
+def _truncated_count_zip() -> bytes:
+    """65,537 members, no ZIP64 end records, EOCD counts truncated to 16 bits (= 1); the only VASP
+    member last (same shape as the shared-code test in test_harvest.py)."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for i in range(65_536):
+            zf.writestr(f"d/f{i}", b"")
+        zf.writestr("late/OUTCAR", b"outcar")
+    data = buf.getvalue()
+    i = data.rfind(b"PK\x05\x06")
+    eocd = bytearray(data[i:])
+    eocd[8:12] = struct.pack("<HH", 1, 1)
+    return data[:i - 76] + bytes(eocd)
+
+
+def test_read_central_directory_accepts_a_16bit_truncated_count():
+    blob = _truncated_count_zip()
+    members, _ = read_central_directory(FakeFileSession({"u": blob}), "u")   # type: ignore[arg-type]
+    assert len(members) == 65_537 and members[-1].name == "late/OUTCAR"
+    ev, st = peek_archive(FakeFileSession({"u": blob}), "u")                # type: ignore[arg-type]
+    assert st == "ok" and ev is not None and ev.primary == ["late/OUTCAR"]
+
+
 def test_read_central_directory_rejects_non_zip_and_huge_cd():
     s = FakeFileSession({"tar": b"\x1f\x8b" + b"\0" * 5000, "z": make_zip({"a": b"1"})})
     with pytest.raises(RemoteZipError, match="not a zip"):
@@ -445,6 +528,14 @@ def test_discover_gates_and_order(tmp_path):
     assert rej["r-nd"] == "non_redistributable_license:no_derivatives"
 
 
+def test_discover_reports_zero_not_null_when_nomad_scanned(tmp_path):
+    nmeta = _write_jsonl(tmp_path / "n" / "metadata.jsonl", [{"calc_id": "nomad:x", "provenance": {}}])
+    rec = [mc_record("r")]
+    s0 = discover(MaterialsCloudClient(), tmp_path / "a.jsonl", records=rec)
+    s1 = discover(MaterialsCloudClient(), tmp_path / "b.jsonl", records=rec, nomad_metadata=nmeta)
+    assert s0["nomad_calcs_citing_mc"] is None and s1["nomad_calcs_citing_mc"] == 0
+
+
 def test_discover_strict_policy_drops_nc(tmp_path):
     out = tmp_path / "c.jsonl"
     discover(MaterialsCloudClient(), out, records=[mc_record("r-nc", rights=[{"id": "cc-by-nc-4.0"}])],
@@ -516,7 +607,7 @@ def test_triage_mention_and_evidence_policy(tmp_path):
     ]
     blobs = {("m-yes", "a.zip"): vz, ("m-empty", "a.zip"): empty, ("q-hidden", "a.zip"): vz,
              ("q-empty", "a.zip"): empty}
-    s, keep, report = _triage_case(tmp_path, recs, blobs)
+    s, keep, report = _triage_case(tmp_path, recs, blobs, unresolved_policy="none")
     by = {u["unit"]["record_id"]: u for u in keep}
     assert set(by) == {"m-yes", "m-tar", "q-hidden"}
     assert by["q-hidden"]["triage_reason"] == "vasp_evidence"
@@ -545,21 +636,53 @@ def test_triage_prunes_proven_empty_zips_and_keeps_unpeekables(tmp_path):
     assert [f["key"] for f in u["files"]] == ["README.md", "a.zip", "c.tar.gz"]  # b.zip pruned
 
 
-def test_triage_aiida_legacy_marked_zip_sqlite_is_gap(tmp_path):
+def test_triage_aiida_legacy_zip_and_sqlite_resolved_through_its_database(tmp_path):
     legacy = make_zip({"metadata.json": b"{}", "data.json": b"{}",
                        "nodes/ab/cd/uuid1/path/vasprun.xml": b"<x/>",
                        "nodes/ab/cd/uuid1/path/DOSCAR": b"d"})
-    sqlite = make_zip({"metadata.json": b"{}", "repo/" + "a" * 64: b"blob", "db.sqlite3": b"s"})
+    sq_vasp = make_sqlite_aiida({UUID_A: {"vasprun.xml": b"<v/>", "DOSCAR": b"d"},
+                                 UUID_B: {"sub/OUTCAR": b"o" * 10}, UUID_Q: {"aiida.out": b"qe"}})
+    sq_qe = make_sqlite_aiida({UUID_Q: {"aiida.out": b"qe", "data-file-schema.xml": b"x"}})
+    broken = make_zip({"metadata.json": b"{}", "repo/" + "a" * 64: b"blob", "db.sqlite3": b"s"})
     recs = [mc_record("leg", {"x.aiida": len(legacy)}, description="QE"),
-            mc_record("sq", {"y.aiida": len(sqlite)}, description="VASP")]
-    s, keep, report = _triage_case(tmp_path, recs, {("leg", "x.aiida"): legacy,
-                                                    ("sq", "y.aiida"): sqlite})
+            mc_record("sqv", {"v.aiida": len(sq_vasp)}, description="QE"),       # no mention
+            mc_record("sqq", {"q.aiida": len(sq_qe)}, description="VASP"),       # mention, no VASP
+            mc_record("sqb", {"b.aiida": len(broken)}, description="VASP")]      # unreadable db
+    s, keep, report = _triage_case(tmp_path, recs, {
+        ("leg", "x.aiida"): legacy, ("sqv", "v.aiida"): sq_vasp, ("sqq", "q.aiida"): sq_qe,
+        ("sqb", "b.aiida"): broken})
+    by = {u["unit"]["record_id"]: u for u in keep}
+    assert set(by) == {"leg", "sqv", "sqb"}
+    assert by["leg"]["files"][0]["archive_kind"] == "zip"            # legacy: real member names
+    assert by["leg"]["recid"] == unit_id("leg", "x.aiida")
+    # sqlite_zip: its database lists the VASP nodes, at their legacy-layout paths
+    assert by["sqv"]["triage_reason"] == "vasp_evidence"
+    assert by["sqv"]["files"][0]["archive_kind"] == "aiida"
+    pk = by["sqv"]["peek"]["v.aiida"]
+    assert pk["db_status"] == "ok" and pk["n_primary"] == 2 and pk["primary_bytes"] == 14
+    assert pk["primary_sample"] == [f"nodes/59/8e/{UUID_B[4:]}/path/sub/OUTCAR",
+                                    f"nodes/fb/16/{UUID_A[4:]}/path/vasprun.xml"]
+    rep = {r["recid"]: r for r in report["records"]}
+    assert rep["sqq"]["reason"] == "peek_proved_no_vasp"            # the database proves it empty
+    # an unreadable database: not cached, an evidence gap, fetched fail-safe for the mention
+    assert by["sqb"]["triage_reason"] == "vasp_mention"
+    assert by["sqb"]["files"][0]["archive_kind"] == "aiida"
+    assert "db_failed" in rep["sqb"]["gaps"][0]
+    s2, _, _ = _triage_case(tmp_path, recs, {
+        ("leg", "x.aiida"): legacy, ("sqv", "v.aiida"): sq_vasp, ("sqq", "q.aiida"): sq_qe,
+        ("sqb", "b.aiida"): broken})
+    assert s2["peeks_cached"] == 3 and s2["peeked"] == 2   # only the failed one re-peeked (x2)
+
+
+def test_triage_sqlite_database_over_cap_is_unresolved(tmp_path):
+    sq = make_sqlite_aiida({UUID_A: {"vasprun.xml": b"<v/>"}})
+    rec = mc_record("big", {"e.aiida": len(sq)}, description="QE")
+    s, keep, report = _triage_case(tmp_path, [rec], {("big", "e.aiida"): sq}, max_db_bytes=10)
     (u,) = keep
-    assert u["unit"]["record_id"] == "leg" and u["files"][0]["archive_kind"] == "zip"
-    assert u["recid"] == unit_id("leg", "x.aiida")
-    sq = next(r for r in report["records"] if r["recid"] == "sq")
-    assert sq["reason"] == "evidence_gap_only" and "sqlite_zip" in sq["gaps"][0]
-    assert s["records_with_gaps"] == 1
+    assert u["triage_reason"] == "unresolved_fetch" and u["files"][0]["archive_kind"] == "aiida"
+    assert "db_too_large" in report["records"][0]["gaps"][0]
+    _, keep0, _ = _triage_case(tmp_path / "off", [rec], {("big", "e.aiida"): sq}, max_db_bytes=0)
+    assert keep0[0]["triage_reason"] == "unresolved_fetch"          # db never read -> unresolved
 
 
 def test_triage_default_allowlist_restricts_bosoni(tmp_path):
@@ -617,8 +740,13 @@ def test_triage_peek_cache_reused_on_rerun(tmp_path):
 def test_triage_nested_only_zip_non_mention_dropped_with_gap(tmp_path):
     nz = make_zip({"runs.tar.gz": b"t"})
     rec = mc_record("n", {"a.zip": len(nz)}, description="QE")
-    _, keep, report = _triage_case(tmp_path, [rec], {("n", "a.zip"): nz})
+    _, keep, report = _triage_case(tmp_path, [rec], {("n", "a.zip"): nz},
+                                   unresolved_policy="none")
     assert keep == [] and "nested archive" in report["records"][0]["gaps"][0]
+    s, keep2, _ = _triage_case(tmp_path / "all", [rec], {("n", "a.zip"): nz})   # default: all
+    (u,) = keep2
+    assert u["triage_reason"] == "unresolved_fetch" and [f["key"] for f in u["files"]] == ["a.zip"]
+    assert s["blind_fetch"] == {"records": 1, "units": 1, "bytes": len(nz)}
 
 
 # --------------------------------------------------------------------------- #
@@ -678,6 +806,112 @@ def test_declared_archive_kind_extracts_aiida_and_unknown_kind_is_ignored(tmp_pa
     assert unit["vasprun"].endswith("e.aiida/nodes/ab/cd/u1/path/vasprun.xml")
     assert fe["calc_availability"][0]["dos"] is True          # DOSCAR in the SAME node dir
     assert not (tmp_path / "raw" / "r" / "extracted" / "e.aiida" / "nodes" / "ef").exists()
+
+
+def test_aiida_archive_repository_walk_and_vasp_nodes(tmp_path):
+    from zenodo_harvest import aiida_archive as aa
+    meta = {"o": {"vasprun.xml": {"k": "k1"}, "sub": {"o": {"OUTCAR": {"k": "k2"}, "e": {}}},
+                  "bad": "x", "": {"k": "k3"}}}
+    assert sorted(aa.iter_repository_files(meta)) == [("sub/OUTCAR", "k2"), ("vasprun.xml", "k1")]
+    assert list(aa.iter_repository_files(None)) == []
+    assert aa.legacy_node_dir(UUID_A) == f"nodes/fb/16/{UUID_A[4:]}/path"
+    assert aa.db_member(["x/db.sqlite3", "x/y/db.sqlite3", "a"]) == "x/db.sqlite3"
+    assert aa.repo_prefix("x/db.sqlite3") == "x/"
+    z = make_sqlite_aiida({UUID_A: {"vasprun.xml": b"<v/>"}, UUID_Q: {"aiida.out": b"qe"}})
+    db = tmp_path / "db.sqlite3"
+    db.write_bytes(zipfile.ZipFile(io.BytesIO(z)).read("db.sqlite3"))
+    (node,) = aa.vasp_nodes(db, zfetch._is_primary_name)       # the QE node is not listed
+    assert node["uuid"] == UUID_A and node["files"][0][0] == "vasprun.xml"
+    (tmp_path / "junk").write_bytes(b"not a database at all" * 10)
+    with pytest.raises(ValueError):
+        aa.vasp_nodes(tmp_path / "junk", zfetch._is_primary_name)
+
+
+def test_extract_aiida_sqlite_writes_legacy_layout_and_availability(tmp_path):
+    z = make_sqlite_aiida({UUID_A: {"vasprun.xml": b"<v/>", "DOSCAR": b"d", "CHGCAR": b"c" * 9},
+                           UUID_B: {"sub/OUTCAR": b"o", "sub/INCAR": b"i", "gone/OUTCAR": b"g"},
+                           UUID_Q: {"aiida.out": b"qe"}}, drop_blobs=("gone/OUTCAR",))
+    arc = tmp_path / "e.aiida"
+    arc.write_bytes(z)
+    budget = zfetch.StagingBudget(max_bytes=10**9, max_files=10**6)
+    budget.begin_record()
+    names, extracted = zfetch._extract_aiida(arc, tmp_path / "out" / "e.aiida", 10**9, budget)
+    a, b = f"nodes/fb/16/{UUID_A[4:]}/path", f"nodes/59/8e/{UUID_B[4:]}/path"
+    assert sorted(extracted) == [f"{b}/sub/INCAR", f"{b}/sub/OUTCAR", f"{a}/vasprun.xml"]
+    assert f"{a}/CHGCAR" in names and f"{a}/DOSCAR" in names       # heavy: availability only
+    assert not (tmp_path / "out" / "e.aiida" / a / "CHGCAR").exists()
+    assert (tmp_path / "out" / "e.aiida" / a / "vasprun.xml").read_bytes() == b"<v/>"
+    assert not list((tmp_path / "out").glob(".*.tmp"))           # the database copy is gone
+    staged = 1 + sum(1 for _ in (tmp_path / "out").rglob("*"))    # + the "out" dir itself
+    assert budget.used_files == staged                           # every inode accounted, db refunded
+    assert budget.used_bytes == sum(f.stat().st_size for f in (tmp_path / "out").rglob("*")
+                                    if f.is_file())
+
+
+def test_extract_aiida_handles_legacy_zip_and_tar_exports(tmp_path):
+    legacy = make_zip({"data.json": b"{}", "nodes/ab/cd/u1/path/OUTCAR": b"o"})
+    (tmp_path / "l.aiida").write_bytes(legacy)
+    _, ex = zfetch._extract_aiida(tmp_path / "l.aiida", tmp_path / "lo", 10**9)
+    assert ex == ["nodes/ab/cd/u1/path/OUTCAR"]
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:          # `verdi export -F tar.gz`
+        for name, data in {"data.json": b"{}", "nodes/ab/cd/u2/path/vasprun.xml": b"<x/>"}.items():
+            ti = tarfile.TarInfo(name)
+            ti.size = len(data)
+            tf.addfile(ti, io.BytesIO(data))
+    (tmp_path / "t.aiida").write_bytes(buf.getvalue())
+    _, ex2 = zfetch._extract_aiida(tmp_path / "t.aiida", tmp_path / "to", 10**9)
+    assert ex2 == ["nodes/ab/cd/u2/path/vasprun.xml"]
+
+
+def test_nested_aiida_archive_inside_a_zip_is_recursed(tmp_path):
+    inner = make_sqlite_aiida({UUID_A: {"vasprun.xml": b"<v/>"}})
+    outer = make_zip({"exports/run.aiida": inner, "README": b"r"})
+    assert zfetch._nested_archive_kind("run.aiida") == "aiida"
+    cand = record_to_candidate(mc_record("n", {"wrap.zip": len(outer)},
+                                         checksums=md5s({"wrap.zip": outer})))
+    sess = FakeFileSession({content_url("n", "wrap.zip"): outer})
+    rej = zfetch.RejectionLogger(tmp_path / "rej.jsonl")
+    fe = zfetch.fetch_record(cand, sess, tmp_path / "raw", None, rej)
+    rej.close()
+    assert fe is not None and fe["n_calc_units"] == 1
+    (unit,) = fe["calc_units"]
+    assert unit["vasprun"].endswith(f"run.aiida__extracted/nodes/fb/16/{UUID_A[4:]}/path/vasprun.xml")
+
+
+def test_tar_lzma_is_declared_a_tar_archive():
+    cand = record_to_candidate(mc_record("l", {"JPCM.tar.lzma": 3180, "README.md": 1},
+                                         description="VASP"))
+    f = next(x for x in cand["files"] if x["key"] == "JPCM.tar.lzma")
+    assert f["archive_kind"] == "tar" and cand["vasp_rank"] == 3
+    assert "JPCM.tar.lzma" in cand["archives"]
+
+
+def test_compressed_data_files_are_not_blind_fetched_as_tarballs(tmp_path):
+    from materials_cloud_harvest.triage import _is_compressed_data_file
+    assert _is_compressed_data_file("optimade.jsonl.gz") and _is_compressed_data_file("a.json.bz2")
+    assert not _is_compressed_data_file("vasprun.xml.gz")          # a VASP file, never "data"
+    assert not _is_compressed_data_file("run.tar.gz") and not _is_compressed_data_file("x.gz")
+    rec = mc_record("q", {"optimade.jsonl.gz": 8 * 10**9, "calcs.gz": 10, "notes.txt": 1},
+                    description="QE")
+    s, keep, _ = _triage_case(tmp_path, [rec], {})
+    (u,) = keep                     # only the ambiguous bare .gz (maybe a tarball) is fetched
+    assert [f["key"] for f in u["files"]] == ["calcs.gz"] and s["bytes_to_fetch"] == 10
+    rec2 = mc_record("m", {"vasprun.xml.gz": 50, "traj.xyz.gz": 10**6}, description="VASP")
+    _, keep2, _ = _triage_case(tmp_path / "loose", [rec2], {})
+    (lu,) = keep2                   # the loose unit keeps the VASP file, drops the data file
+    assert lu["recid"] == "m~loose" and [f["key"] for f in lu["files"]] == ["vasprun.xml.gz"]
+
+
+def test_unresolved_policy_dft_keeps_only_dft_worded_records(tmp_path):
+    recs = [mc_record("d", {"a.tar.gz": 5}, description="first-principles PBE calculations"),
+            mc_record("q", {"a.tar.gz": 5}, description="DFT with Quantum ESPRESSO"),
+            mc_record("x", {"a.tar.gz": 5}, description="experimental spectra")]
+    s, keep, _ = _triage_case(tmp_path, recs, {}, unresolved_policy="dft")
+    assert [u["unit"]["record_id"] for u in keep] == ["d"]
+    assert s["decisions"] == {"unresolved_fetch": 1, "no_vasp_evidence": 2}
+    with pytest.raises(ValueError):
+        _triage_case(tmp_path / "bad", recs, {}, unresolved_policy="some")
 
 
 # --------------------------------------------------------------------------- #
@@ -783,6 +1017,87 @@ def test_end_to_end_aiida_export_calc_ids_identical_split_or_not(tmp_path):
     assert m["availability"]["dos"] is True
     assert m["parser"] == "pymatgen.Vasprun"
     assert by                                             # (keeps the mapping exercised)
+
+
+def test_end_to_end_sqlite_zip_aiida_archive(tmp_path):
+    """A new-format (aiida-core >= 2.0) archive: triage lists its VASP calcs from db.sqlite3, the
+    shared fetch's AiiDA extractor writes them at their legacy-layout node paths, and the shared
+    parse turns them into verified frames — calc_ids carry the node UUID path."""
+    from zenodo_harvest.dataset_ops import verify_dataset
+    from zenodo_harvest.parse import parse
+    arc = make_sqlite_aiida({
+        UUID_A: {"vasprun.xml": _fixture("vasprun_dfpt.xml"), "DOSCAR": b"dos"},
+        UUID_B: {"OUTCAR": _fixture("OUTCAR_example_1")},
+        UUID_Q: {"aiida.out": b"quantum espresso"}})
+    rec = mc_record("sq-e2e", {"group3.aiida": len(arc)}, description="2D magnets (no code named)",
+                    checksums=md5s({"group3.aiida": arc}))
+    man = tmp_path / "manifests"
+    cpath = _write_jsonl(man / "cand.jsonl", [record_to_candidate(rec)])
+    sess = FakeFileSession({content_url("sq-e2e", "group3.aiida"): arc})
+    t = triage(cpath, man / "keep.jsonl", session=sess, interval=0.0)  # type: ignore[arg-type]
+    assert t["decisions"] == {"vasp_evidence": 1} and t["blind_spot_recovered"] == ["sq-e2e"]
+    f = zfetch.fetch(man / "keep.jsonl", out_path=man / "fetched.jsonl", raw_dir=tmp_path / "raw",
+                     rejections_path=man / "rej.jsonl", max_bytes=None,
+                     session_factory=lambda: sess)
+    assert f["calc_units"] == 2
+    ds = tmp_path / "dataset"
+    pr = parse(man / "fetched.jsonl", dataset_dir=ds, raw_dir=tmp_path / "raw",
+               rejections_path=ds / "rejections.jsonl")
+    assert pr["calcs_parsed"] == 2 and pr["frames"] > 0
+    assert verify_dataset(ds)["ok"]
+    metas = {m["calc_id"]: m for m in read_jsonl(ds / "metadata.jsonl")}
+    assert sorted(metas) == [
+        f"materials_cloud:sq-e2e:group3.aiida/nodes/59/8e/{UUID_B[4:]}/path/OUTCAR",
+        f"materials_cloud:sq-e2e:group3.aiida/nodes/fb/16/{UUID_A[4:]}/path/vasprun.xml"]
+    m = metas[f"materials_cloud:sq-e2e:group3.aiida/nodes/fb/16/{UUID_A[4:]}/path/vasprun.xml"]
+    assert m["availability"]["dos"] is True and m["parser"] == "pymatgen.Vasprun"
+    assert not list((tmp_path / "raw").rglob("*.tmp"))          # the database copy never stays
+
+
+def test_overlap_script_fingerprints_exact_and_near_duplicates(tmp_path):
+    import importlib.util
+    ase_io = pytest.importorskip("ase.io")
+    from ase import Atoms
+    spec = importlib.util.spec_from_file_location(
+        "csd3_mc_overlap", Path(__file__).resolve().parents[1] / "scripts" / "csd3" /
+        "materials_cloud" / "csd3_mc_overlap.py")
+    assert spec and spec.loader
+    ov = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ov)
+
+    def write(ds: Path, source: str, rid: str, calcs: dict[str, list[float]]) -> None:
+        ds.mkdir(parents=True)
+        frames, metas = [], []
+        for name, energies in calcs.items():
+            cid = f"{source}:{rid}:{name}/vasprun.xml"
+            for i, e in enumerate(energies):
+                a = Atoms("Si2", positions=[[0, 0, 0], [1.4, 1.4, 1.4]], cell=[5.4] * 3, pbc=True)
+                a.info.update({"calc_id": cid, "ionic_step": i, "REF_energy": e})
+                frames.append(a)
+            metas.append({"calc_id": cid, "shards": ["shard-00000.extxyz.gz"],
+                          "provenance": {"source": source, "record_id": rid},
+                          "calc_parameters": {"potcar_set_hash": "h"}})
+        ase_io.write(str(ds / "shard-00000.extxyz.gz"), frames, format="extxyz")
+        (ds / "metadata.jsonl").write_text("".join(json.dumps(m) + "\n" for m in metas))
+
+    write(tmp_path / "mc" / "dataset", "materials_cloud", "hmdsb", {
+        "same": [-10.0, -10.5], "rerun": [-9.0, -10.70001], "new": [-3.0]})
+    write(tmp_path / "zen", "zenodo", "4683140", {"a": [-10.0, -10.5], "b": [-9.5, -10.70002],
+                                                  "c": [-1.0]})
+    _write_jsonl(tmp_path / "mc" / "manifests" / "mc_candidates.jsonl", [
+        {"recid": "hmdsb", "overlap": {"zenodo_linked_in_dataset": ["10.5281/zenodo.4683140 "
+                                                                     "(zenodo:4683140)"]}},
+        {"recid": "other"}])
+    assert ov.flagged_pairs(tmp_path / "mc" / "manifests" / "mc_candidates.jsonl") == {
+        "hmdsb": {"4683140"}}
+    mc = ov.calcs_of(tmp_path / "mc" / "dataset" / "metadata.jsonl", {"hmdsb"})
+    zen = ov.calcs_of(tmp_path / "zen" / "metadata.jsonl", {"4683140"})
+    r = ov.compare(ov.fingerprints(tmp_path / "mc" / "dataset", mc),
+                   ov.fingerprints(tmp_path / "zen", zen))
+    assert (r["mc_calcs"], r["zenodo_calcs"]) == (3, 3)
+    assert (r["exact_duplicates"], r["near_duplicates_only"], r["mc_unique"],
+            r["zenodo_unmatched"]) == (1, 1, 1, 1)
+    assert r["examples_exact"][0][1] == "zenodo:4683140:a/vasprun.xml"
 
 
 # --------------------------------------------------------------------------- #
@@ -932,9 +1247,13 @@ def test_legacy_aiida_with_only_a_nested_archive_is_kept_for_mention_records(tmp
 def test_loose_inputs_are_not_positive_evidence(tmp_path):
     rec = mc_record("q", {"POSCAR": 10, "kpoints.dat": 5, "incarnation_notes.txt": 5,
                           "big.tar.gz": 10**11}, description="Quantum ESPRESSO")
-    s, keep, _ = _triage_case(tmp_path, [rec], {})
+    s, keep, _ = _triage_case(tmp_path, [rec], {}, unresolved_policy="none")
     assert keep == [] and s["decisions"] == {"no_vasp_evidence": 1}
     assert s["unpeekable_skipped"] == {"files": 1, "bytes": 10**11}
+    sa, keep_a, _ = _triage_case(tmp_path / "all", [rec], {})
+    (u,) = keep_a                     # "all": only the unresolvable tar is fetched, not the inputs
+    assert sa["decisions"] == {"unresolved_fetch": 1} and [f["key"] for f in u["files"]] == [
+        "big.tar.gz"]
     rec2 = mc_record("q2", {"OUTCAR": 10, "big.tar.gz": 10**11}, description="QE")
     s2, keep2, _ = _triage_case(tmp_path / "b", [rec2], {})
     assert s2["decisions"] == {"vasp_evidence": 1}                 # a loose OUTCAR IS evidence
@@ -988,11 +1307,15 @@ def test_failed_zip_peek_is_a_reported_gap_and_nested_aiida_too(tmp_path):
     inner = make_zip({"export.aiida": b"z"})
     recs = [mc_record("q", {"broken.zip": 123}, description="QE"),      # 404 -> peek fails
             mc_record("n", {"wrap.zip": len(inner)}, description="QE")]
-    s, keep, report = _triage_case(tmp_path, recs, {("n", "wrap.zip"): inner})
+    s, keep, report = _triage_case(tmp_path, recs, {("n", "wrap.zip"): inner},
+                                   unresolved_policy="none")
     assert keep == []
     by = {r["recid"]: r for r in report["records"]}
     assert by["q"]["reason"] == "evidence_gap_only" and "zip peek_failed" in by["q"]["gaps"][0]
-    assert "AiiDA export" in by["n"]["gaps"][0]
+    assert "nested archive" in by["n"]["gaps"][0]           # an inner .aiida is a sub-archive
+    s2, keep2, _ = _triage_case(tmp_path / "all", recs, {("n", "wrap.zip"): inner})
+    assert {u["unit"]["record_id"] for u in keep2} == {"q", "n"}
+    assert s2["decisions"] == {"unresolved_fetch": 2}
 
 
 def test_budget_exceeding_units_are_not_pending_and_are_reported(tmp_path):

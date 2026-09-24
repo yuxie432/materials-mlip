@@ -4,21 +4,27 @@ The Materials Cloud census (discover) hands over EVERY public record; triage tur
 keep-list with the evidence policy chosen for this harvest (user decision 2026-09-23):
 
 * **Evidence.** Each ``.zip`` and ``.aiida`` file is peeked — its central directory read over HTTP
-  Range (ZIP64-aware, :mod:`remote_zip`) — to list the VASP outputs inside without downloading.
-  Tar-family archives cannot be peeked (no index; compressed streams are non-seekable).
+  Range (ZIP64-aware, :mod:`remote_zip`) — to list the VASP outputs inside without downloading; a
+  sqlite_zip AiiDA archive (names only in its database) is resolved by pulling its ``db.sqlite3``
+  over Range and listing the nodes that hold VASP outputs. Tar-family archives cannot be peeked
+  (no index; compressed streams are non-seekable).
 * **Keep rule.** A record whose own text mentions VASP (``vasp_mention``) is kept FAIL-SAFE, as on
   Zenodo: dropped only when every archive was peeked successfully and none holds a VASP primary or
-  a nested archive. Any OTHER record is kept only on POSITIVE evidence — a peek found a
-  ``vasprun``/``OUTCAR``/``vaspout`` member — so VASP hidden in records that never say "VASP" is
-  recovered while the ~1 TB of unpeekable tars in (overwhelmingly QE) records is not downloaded
-  blind.
-* **File pruning** (fetch touches only what can yield VASP): a zip proven to hold none is dropped;
-  a **legacy-format AiiDA export** with VASP members is kept and marked ``archive_kind="zip"`` (the
-  shared fetch then extracts it like any zip — its members keep real names); a sqlite_zip export
-  (names hidden in ``db.sqlite3``) or an unreadable ``.aiida`` is dropped from the fetch list and
-  reported as an evidence gap (the CSD3 probe inspects those). ``file_allowlist`` restricts a
-  record to named files — by default the Bosoni ACWF verification record keeps only its two
-  ``*_results_vasp.aiida`` exports (user decision).
+  a nested archive. Any OTHER record is kept on POSITIVE evidence (a peek found a
+  ``vasprun``/``OUTCAR``/``vaspout`` member — ``vasp_evidence``) or, per ``unresolved_policy``,
+  when an archive could not be settled by a peek at all (``unresolved_fetch``): the policy was
+  ``none`` in the first census and is ``all`` since 2026-09-24 (user decision, after the CSD3
+  census): where zips could be peeked, 7.8% of records that never mention VASP held VASP outputs,
+  so the ~1 TB of tars in such records is fetched too — fetch keeps only VASP files, and S3 serves
+  CSD3 at ~50-100 MB/s.
+* **File pruning** (fetch touches only what can yield VASP): a zip — or AiiDA archive — proven to
+  hold none is dropped; a **legacy-format AiiDA export** with VASP members is marked
+  ``archive_kind="zip"`` (its members keep real names, so the shared zip path — targeted member
+  fetch included — handles it); a **sqlite_zip** one, and any AiiDA archive a peek could not
+  resolve (a legacy TAR export, an unreadable or too-big one), is marked ``archive_kind="aiida"``
+  for the shared AiiDA extractor. ``file_allowlist`` restricts a record to named files — by
+  default the Bosoni ACWF verification record keeps only its two ``*_results_vasp.aiida`` exports
+  (user decision).
 * **Fetch units.** A kept record is split into one keep-list entry per archive (``recid =
   <record_id>~<key-derived tag>``, :func:`unit_id` — derived from the archive KEY, never its
   position, so a re-run of triage that keeps a different set of archives cannot renumber a unit
@@ -63,7 +69,7 @@ from zenodo_harvest.manifest import JsonlWriter, RejectionLogger, read_jsonl
 
 from .client import new_session
 from .records import AIIDA_EXT, classify_mc_files
-from .remote_zip import DEFAULT_MAX_CD_BYTES, peek_archive
+from .remote_zip import DEFAULT_MAX_CD_BYTES, DEFAULT_MAX_DB_BYTES, peek_archive
 
 logger = logging.getLogger(__name__)
 
@@ -75,9 +81,14 @@ DEFAULT_FILE_ALLOWLIST: dict[str, tuple[str, ...]] = {
 UNIT_SEP = "~"
 # Bump when the evidence rules (remote_zip.zip_evidence / aiida_format) change, so cached peek
 # verdicts computed under the old rules are re-evaluated instead of trusted.
-EVIDENCE_RULES_VERSION = 2
+# v3 (2026-09-24): ZIP64-locator + truncated-count fixes, sqlite_zip database evidence, nested
+# AiiDA archives counted as sub-archives.
+EVIDENCE_RULES_VERSION = 3
 # Peek outcomes that are NOT a property of the file and must be retried rather than cached.
-_UNCACHED_STATUSES = ("peek_failed", "cd_too_large")
+_UNCACHED_STATUSES = ("peek_failed", "cd_too_large", "db_too_large")
+UNRESOLVED_POLICIES = ("all", "dft", "none")
+_DFT_WORDS = re.compile(r"\b(dft|density[- ]functional|first[- ]principles|ab[- ]initio|pbe|"
+                        r"hse06?|paw|projector[- ]augmented)\b", re.IGNORECASE)
 
 
 def _is_aiida(key: str) -> bool:
@@ -88,9 +99,37 @@ def _peekable(f: dict[str, Any]) -> bool:
     return f.get("ext") == ".zip" or _is_aiida(str(f.get("key", "")))
 
 
+# A single compressed DATA file (``optimade.jsonl.gz``, ``alexandria_ps_000.json.bz2``,
+# ``traj.xyz.gz``): the shared fetch's bare-compression heuristic tries such names as misnamed
+# tarballs (right for Zenodo's ``…-vasp-raw.gz``), but a known data extension under the compression
+# says it is not one — so triage does not fetch it as an archive (CSD3 census: ~10 GB of them in
+# records that would otherwise be blind-fetched, incl. an 8.5 GB OPTIMADE dump).
+_BARE_COMPRESSION = (".gz", ".bz2", ".xz", ".zst")
+_DATA_EXTS = (".json", ".jsonl", ".xyz", ".extxyz", ".csv", ".tsv", ".txt", ".dat", ".lmp",
+              ".lammps", ".dump", ".npy", ".npz", ".pkl", ".pickle", ".h5", ".hdf5", ".cif",
+              ".pdb", ".log", ".out", ".xml", ".yaml", ".yml", ".html", ".md")
+
+
+def _is_compressed_data_file(base: str) -> bool:
+    low = base.lower()
+    if not low.endswith(_BARE_COMPRESSION):
+        return False
+    stem = low.rsplit(".", 1)[0]
+    # a compressed VASP file (``vasprun.xml.gz``, ``OUTCAR.xz``) is a VASP file, never "data"
+    return stem.endswith(_DATA_EXTS) and not stem.endswith(".tar") and not _PARSE_RE.search(stem)
+
+
 def _fetch_kind(f: dict[str, Any]) -> str | None:
-    """The archive kind the shared fetch will use for this file (declared or sniffed)."""
-    return f.get("archive_kind") or _is_archive(str(f.get("key", "")).rsplit("/", 1)[-1])
+    """The archive kind the shared fetch will use for this file (declared or sniffed), or None
+    for a plain file — including a single compressed data file (see :data:`_DATA_EXTS`)."""
+    declared = f.get("archive_kind")
+    if declared:
+        return str(declared)
+    base = str(f.get("key", "")).rsplit("/", 1)[-1]
+    kind = _is_archive(base)
+    if kind in ("tar", "tarzst") and _is_compressed_data_file(base):
+        return None
+    return kind
 
 
 def _peek_key(recid: str, f: dict[str, Any]) -> str:
@@ -132,7 +171,9 @@ def split_units(cand: dict[str, Any], files: list[dict[str, Any]]) -> list[dict[
     Deterministic and stable across re-runs whatever else triage keeps or prunes."""
     rid = cand["recid"]
     archives = [f for f in files if _fetch_kind(f)]
-    direct = [f for f in files if not _fetch_kind(f)]
+    # (a compressed data file is left out: the shared fetch would sniff it as a tarball)
+    direct = [f for f in files if not _fetch_kind(f)
+              and not _is_compressed_data_file(str(f.get("key", "")).rsplit("/", 1)[-1])]
     groups: list[tuple[str, list[dict[str, Any]]]] = [(unit_id(rid, str(a["key"])), [a])
                                                       for a in archives]
     if any(_is_loose_primary(f) for f in direct):
@@ -149,13 +190,27 @@ def split_units(cand: dict[str, Any], files: list[dict[str, Any]]) -> list[dict[
     return units
 
 
-def _decide(cand: dict[str, Any], files: list[dict[str, Any]],
-            ev: dict[str, dict[str, Any]]) -> tuple[bool, str, list[dict[str, Any]], list[str]]:
+def _dft_worded(cand: dict[str, Any]) -> bool:
+    """The ``dft`` unresolved policy's filter: DFT words in the record's metadata — discover's
+    ``metadata_signals`` (scanned over title + description + keywords) or PBE/HSE-style terms in
+    the title/keywords — and no other DFT code named."""
+    text = " ".join([str(cand.get("title") or ""), " ".join(map(str, cand.get("keywords") or []))])
+    worded = bool(cand.get("metadata_signals")) or bool(_DFT_WORDS.search(text))
+    return worded and not cand.get("other_codes")
+
+
+def _decide(cand: dict[str, Any], files: list[dict[str, Any]], ev: dict[str, dict[str, Any]],
+            unresolved_policy: str = "all"
+            ) -> tuple[bool, str, list[dict[str, Any]], list[str]]:
     """``(keep, reason, files_to_fetch, gaps)`` for one record (see the module docstring).
 
     Positive evidence = something the shared fetch would turn into a calc unit: a peeked archive
-    member or a loose file whose name seeds a unit (``fetch._unit_role`` vasprun/vaspout/outcar).
-    Loose INPUT files (POSCAR/INCAR/KPOINTS…) are not evidence of anything parseable."""
+    member (for a sqlite_zip AiiDA archive: a database node) or a loose file whose name seeds a
+    unit (``fetch._unit_role`` vasprun/vaspout/outcar). Loose INPUT files (POSCAR/INCAR/KPOINTS…)
+    are not evidence of anything parseable. An archive whose contents no peek can settle (a tar, an
+    unreadable zip/AiiDA archive, one holding sub-archives) is *unresolved*: fetched for a
+    VASP-mentioning record, and for any other record as ``unresolved_policy`` says (``all`` — the
+    2026-09-24 decision —, ``dft`` = DFT-worded records naming no other code, ``none``)."""
     positive = False
     unresolved = False
     gaps: list[str] = []
@@ -180,37 +235,48 @@ def _decide(cand: dict[str, Any], files: list[dict[str, Any]],
             continue
         e = ev.get(key) or {}
         status = e.get("status", "not_peeked")
+        # the shared aiida extractor handles every AiiDA shape (legacy zip/tar, sqlite_zip)
+        as_aiida = {**f, "archive_kind": "aiida"}
         if status != "ok":
-            gaps.append(f"{key}: {'aiida export' if aiida else 'zip'} {status}")
+            # an unreadable zip, or an AiiDA archive that is not a zip (a legacy TAR export) / too
+            # big to peek / whose database could not be read: only a download can tell
+            gaps.append(f"{key}: {'aiida archive' if aiida else 'zip'} {status}")
             unresolved = True
-            if not aiida:
-                fetch_files.append(f)    # an unreadable zip: fetch confirms it at download
-            continue                     # an unreadable .aiida is unusable to fetch
-        has_vasp = e.get("n_primary", 0) > 0
-        has_nested = e.get("n_nested", 0) > 0
-        if has_nested and not has_vasp:
-            gaps.append(f"{key}: {e.get('n_nested')} nested archive(s), contents invisible")
-        if e.get("n_nested_aiida"):
-            gaps.append(f"{key}: {e.get('n_nested_aiida')} AiiDA export(s) inside, not extracted")
-        if aiida and e.get("aiida_format") == "sqlite_zip":
-            gaps.append(f"{key}: aiida sqlite_zip export (names only in db.sqlite3)")
-            unresolved = True
+            fetch_files.append(as_aiida if aiida else f)
             continue
-        if has_vasp or has_nested:
+        fmt = e.get("aiida_format")
+        if fmt == "sqlite_zip" and e.get("db_status") != "ok":
+            gaps.append(f"{key}: sqlite_zip AiiDA archive, database not inspected")
+            unresolved = True
+            fetch_files.append(as_aiida)
+            continue
+        has_vasp = e.get("n_primary", 0) > 0
+        n_inner = int(e.get("n_nested", 0) or 0) + int(e.get("n_nested_aiida", 0) or 0)
+        if n_inner and not has_vasp:
+            gaps.append(f"{key}: {n_inner} nested archive(s), contents invisible to a peek")
+        if has_vasp or n_inner:
             positive = positive or has_vasp
-            unresolved = unresolved or (has_nested and not has_vasp)
-            # a legacy (or plain-zip) .aiida keeps real member names -> extract it as a zip
-            fetch_files.append({**f, "archive_kind": "zip"} if aiida else f)
-        # else: names visible, no VASP output, no sub-archive -> proven empty, pruned
+            unresolved = unresolved or (n_inner > 0 and not has_vasp)
+            if fmt == "sqlite_zip":
+                fetch_files.append(as_aiida)            # names only via its database
+            elif aiida:
+                fetch_files.append({**f, "archive_kind": "zip"})   # legacy: real member names
+            else:
+                fetch_files.append(f)
+        # else: every member (for sqlite_zip: every database node) seen, no VASP output and no
+        # sub-archive -> proven empty, pruned
     fetchable = any(_fetch_kind(f) or _is_loose_primary(f) for f in fetch_files)
     if cand.get("vasp_mention"):
         if not (positive or unresolved):
             return False, "peek_proved_no_vasp", [], gaps
-        if not fetchable:                # e.g. its only VASP-candidates are sqlite_zip exports
+        if not fetchable:
             return False, "evidence_gap_only", [], gaps
         return True, "vasp_mention", fetch_files, gaps
     if positive and fetchable:           # positive evidence always leaves a fetchable file
         return True, "vasp_evidence", fetch_files, gaps
+    if unresolved and fetchable and (unresolved_policy == "all" or (
+            unresolved_policy == "dft" and _dft_worded(cand))):
+        return True, "unresolved_fetch", fetch_files, gaps
     return False, ("evidence_gap_only" if gaps else "no_vasp_evidence"), [], gaps
 
 
@@ -255,13 +321,20 @@ def triage(in_path: str | Path, out_path: str | Path, *,
            split: bool = True, interval: float = 0.4,
            max_records: int | None = None,
            peek_retry_wait: float = 5.0,
-           peek_workers: int = 4) -> dict[str, Any]:
+           peek_workers: int = 4,
+           unresolved_policy: str = "all",
+           max_db_bytes: int = DEFAULT_MAX_DB_BYTES) -> dict[str, Any]:
     """Peek, decide and write the fetch-unit keep-list + a census report (see module docs).
 
     Peeks are REQUEST-bound (1-3 small Range reads, each through MC's ~0.3-2 s API redirect hop),
     so ``peek_workers`` run them concurrently (a thread each, its own session unless ``session``
     is given), with request starts paced by ``interval`` across all threads. Decisions depend only
-    on per-file evidence, so the keep-list is identical whatever the concurrency."""
+    on per-file evidence, so the keep-list is identical whatever the concurrency. A sqlite_zip AiiDA
+    archive's peek also pulls its database (<= ``max_db_bytes``; 0 = never) to list its VASP calcs.
+    ``unresolved_policy`` says which records WITHOUT a VASP mention or positive evidence still get
+    their unresolvable archives fetched (see :func:`_decide`)."""
+    if unresolved_policy not in UNRESOLVED_POLICIES:
+        raise ValueError(f"unresolved_policy must be one of {UNRESOLVED_POLICIES}")
     in_path, out = Path(in_path), Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     report = Path(report_path) if report_path else out.with_name(out.stem + ".report.json")
@@ -314,7 +387,7 @@ def triage(in_path: str | Path, out_path: str | Path, *,
             if attempt:
                 time.sleep(peek_retry_wait)
             pacer.wait()
-            evidence, status = peek_archive(_sess(), f["download"], max_cd_bytes)
+            evidence, status = peek_archive(_sess(), f["download"], max_cd_bytes, max_db_bytes)
             attempts += 1
             if not status.startswith("peek_failed"):
                 break
@@ -347,11 +420,11 @@ def triage(in_path: str | Path, out_path: str | Path, *,
             files = list(cand.get("files") or [])
             ev = {f["key"]: cache[_peek_key(rid, f)] for f in files
                   if _peekable(f) and _peek_key(rid, f) in cache}
-            keep, reason, fetch_files, gaps = _decide(cand, files, ev)
+            keep, reason, fetch_files, gaps = _decide(cand, files, ev, unresolved_policy)
             stats[f"decision:{reason}"] += 1
             if not keep and not cand.get("vasp_mention"):
-                # the deliberate blind spot of the evidence policy: unpeekable (tar-family)
-                # archives in records that never mention VASP are not downloaded to check
+                # the residual blind spot under a narrower unresolved_policy: unpeekable
+                # (tar-family) archives in records that never mention VASP, not downloaded
                 unpk = [f for f in files if _fetch_kind(f) and not _peekable(f)]
                 stats["unpeekable_skipped_files"] += len(unpk)
                 stats["unpeekable_skipped_bytes"] += sum(int(f.get("size") or 0) for f in unpk)
@@ -362,7 +435,7 @@ def triage(in_path: str | Path, out_path: str | Path, *,
                      "vasp_mention": bool(cand.get("vasp_mention")), "keep": keep,
                      "reason": reason, "gaps": gaps,
                      "bytes_total": cand.get("bytes_total"),
-                     "bytes_to_fetch": sum(int(f.get("size") or 0) for f in fetch_files),
+                     "bytes_to_fetch": 0,
                      "files": [{"key": f["key"], "size": f.get("size"),
                                 "peek": ev.get(f["key"])} for f in files if _peekable(f)
                                or _fetch_kind(f)]}
@@ -379,24 +452,36 @@ def triage(in_path: str | Path, out_path: str | Path, *,
                 kept["signals"] = [*kept.get("signals", []),
                                    f"peek confirmed VASP outputs ({len(prim)}+ shown)"]
             units = split_units(kept, fetch_files) if split else [kept]
+            # what fetch will really download: the units' files (a loose non-VASP file that
+            # belongs to no unit is never fetched)
+            entry["bytes_to_fetch"] = sum(int(f.get("size") or 0) for u in units
+                                          for f in u.get("files") or [])
             for u in units:
                 keep_w.write(json.dumps(u) + "\n")
             stats["kept_records"] += 1
             stats["units"] += len(units)
             stats["bytes_to_fetch"] += entry["bytes_to_fetch"]
+            if reason == "unresolved_fetch":
+                stats["blind_units"] += len(units)
+                stats["blind_bytes"] += entry["bytes_to_fetch"]
             entry["n_units"] = len(units)
             per_record.append(entry)
 
     kept_entries = [e for e in per_record if e["keep"]]
     summary = {
         "in": str(in_path), "out": str(out), "report": str(report),
+        "unresolved_policy": unresolved_policy,
         "records": stats["records"], "below_min_rank": stats["below_min_rank"],
         "kept_records": stats["kept_records"], "fetch_units": stats["units"],
         "bytes_to_fetch": stats["bytes_to_fetch"],
         "peeked": stats["peeked"], "peeks_cached": stats["peeks_cached"],
         "decisions": {k.split(":", 1)[1]: v for k, v in stats.items() if k.startswith("decision:")},
         "records_with_gaps": stats["records_with_gaps"],
-        "blind_spot_recovered": [e["recid"] for e in kept_entries if not e["vasp_mention"]],
+        # records that never mention VASP but whose peek FOUND VASP outputs
+        "blind_spot_recovered": [e["recid"] for e in kept_entries if e["reason"] == "vasp_evidence"],
+        # records fetched only because their archives cannot be peeked (unresolved_policy)
+        "blind_fetch": {"records": stats["decision:unresolved_fetch"],
+                        "units": stats["blind_units"], "bytes": stats["blind_bytes"]},
         "unpeekable_skipped": {"files": stats["unpeekable_skipped_files"],
                                "bytes": stats["unpeekable_skipped_bytes"]},
     }

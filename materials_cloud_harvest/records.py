@@ -26,6 +26,9 @@ from .client import BASE, content_url
 
 SOURCE = "materials_cloud"
 AIIDA_EXT = ".aiida"
+# Tarballs whose compression the shared name sniffing does not know but ``tarfile`` reads (its xz
+# opener auto-detects the legacy ``.lzma`` container): declared ``archive_kind="tar"`` explicitly.
+EXTRA_TAR_SUFFIXES = (".tar.lzma", ".tlz")
 
 # --- licence policy (user decision 2026-09-23: admit NC/NC-SA, drop ND / no-licence / MC non-open)
 # Materials Cloud ids that are NOT open licences, although the shared blocklist gate
@@ -188,9 +191,12 @@ def normalize_files(rec: dict[str, Any], base: str = BASE) -> list[dict[str, Any
         key = str((e or {}).get("key") or name or "")
         if not key:
             continue
-        out.append({"key": key, "size": int((e or {}).get("size") or 0), "ext": _ext(key),
-                    "checksum": (e or {}).get("checksum"), "download": content_url(recid, key, base),
-                    "mimetype": (e or {}).get("mimetype")})
+        f = {"key": key, "size": int((e or {}).get("size") or 0), "ext": _ext(key),
+             "checksum": (e or {}).get("checksum"), "download": content_url(recid, key, base),
+             "mimetype": (e or {}).get("mimetype")}
+        if key.lower().endswith(EXTRA_TAR_SUFFIXES):
+            f["archive_kind"] = "tar"
+        out.append(f)
     return sorted(out, key=lambda f: f["key"])
 
 
@@ -203,12 +209,16 @@ def classify_mc_files(files: list[dict[str, Any]]) -> dict[str, Any]:
     i.e. an archive whose contents only a peek can reveal — so it is ranked like one."""
     fc = classify_files(files)
     aiida = [f["key"] for f in files if str(f.get("key", "")).lower().endswith(AIIDA_EXT)]
-    if aiida:
-        fc["archives"] = sorted(set(fc["archives"]) | set(aiida))
+    declared = [f["key"] for f in files if f.get("archive_kind") and f["key"] not in aiida]
+    if aiida or declared:
+        fc["archives"] = sorted(set(fc["archives"]) | set(aiida) | set(declared))
         if fc["rank"] < CATEGORY_RANK["archive"]:
             fc["category"], fc["rank"] = "archive", CATEGORY_RANK["archive"]
             fc["signals"] = [s for s in fc["signals"] if "no VASP/archive" not in s]
-        fc["signals"].append(f"{len(aiida)} AiiDA export(s), contents unknown (peek to confirm)")
+        if aiida:
+            fc["signals"].append(f"{len(aiida)} AiiDA export(s), contents unknown (peek to confirm)")
+        if declared:
+            fc["signals"].append(f"{len(declared)} other archive(s) ({', '.join(declared[:3])})")
     return fc
 
 
