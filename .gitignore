@@ -113,3 +113,8 @@ logs_mc/
 dataset_mc/
 manifests_mc/
 /materials_cloud/
+
+# Zenodo census (FURTHER_WORK part A): SLURM logs + census artifacts pulled down for offline review.
+# On the cluster the census lives under $ZENODO_CENSUS_DATA (default <ZENODO_HARVEST_DATA>/census).
+logs_census/
+census_csd3/
