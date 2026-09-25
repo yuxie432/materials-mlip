@@ -161,7 +161,8 @@ def metadata_signal(title: str, description: str, keywords: list[str]) -> list[s
 _NONFREE_LICENSE_TOKENS = {"nc", "nd"}
 # License ids (lower-cased) that mean "no reusable license granted".
 _NO_LICENSE_IDS = {"", "notspecified", "all-rights-reserved", "arr", "closed",
-                   "restricted", "copyright", "none"}
+                   "restricted", "copyright", "none",
+                   "other-closed"}   # Zenodo's legacy "Other (Not Open)" id
 
 
 def is_reusable_license(lic: str | None) -> bool:
