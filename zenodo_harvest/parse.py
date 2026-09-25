@@ -71,6 +71,7 @@ import re
 import threading
 import warnings
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -569,7 +570,14 @@ def _frame(structure: Any, energy: float | None, forces: Any, *, calc_id: str,
     if energy is not None:
         atoms.info["REF_energy"] = float(energy)
     if forces is not None:
-        atoms.arrays["REF_forces"] = np.asarray(forces, dtype=float)
+        forces = np.asarray(forces, dtype=float)
+        # Assigned straight into ``arrays`` (bypassing ASE's length check), so check it here: a
+        # malformed primary with fewer force rows than atoms (seen live: a 4-atom vasprun with 2
+        # force rows, inside a code tarball) otherwise parses "fine" and only fails in the extxyz
+        # writer. Raising rejects the calc as a parse error — or falls back to its OUTCAR.
+        if forces.shape != (len(atoms), 3):
+            raise ValueError(f"forces shape {forces.shape} does not match {len(atoms)} atoms")
+        atoms.arrays["REF_forces"] = forces
     # Per-calc net scalars broadcast onto every frame (net charge is frame-invariant; net
     # magnetization is the calc's converged value). Written ONLY when known — a None put into
     # atoms.info would serialise as a bare extxyz key ASE reads back as True (same trap as
@@ -1724,6 +1732,25 @@ def parse(
                 done_calc_ids.add(meta["calc_id"])   # a duplicate unit later this run is skipped
                 stats["calcs_parsed"] += 1
 
+            def _write_or_reject(get_result: Any, calc_id: str) -> None:
+                """Write one calc's result; an exception that escaped the parser's own handling
+                (or came from writing its frames) is recorded AGAINST THE CALC — before, the
+                parallel loop logged it with no calc_id and no rejection, so the calc vanished
+                from the audit trail. ``parse_error`` is non-terminal: a later run retries it.
+                Storage errors (OSError: disk full, I/O) are not the calc's fault — they stop
+                the parse instead of rejecting every remaining calc. (ASE builds a frame fully
+                before writing it, so a failing frame writes nothing; only a failure on a LATER
+                frame of the same calc would leave orphans — which ``verify`` reports.)"""
+                try:
+                    _write_result(get_result())
+                except OSError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - one bad calc must not stop the run
+                    logger.warning("parse of %s raised unexpectedly: %s: %s",
+                                   calc_id, type(exc).__name__, exc)
+                    rej.reject("parse", calc_id, "parse_error",
+                               detail=f"{type(exc).__name__}: {exc}")
+
             _log_at = [0]
 
             def _maybe_log_progress() -> None:
@@ -1770,7 +1797,7 @@ def parse(
                 # order (fine: frame_ids are unique and prune drops the orphan tail).
                 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
                 units = _iter_units()
-                inflight: set = set()
+                inflight: dict = {}                  # future -> calc_id (for its audit line)
                 exhausted = False
                 mem = _MemBudget(parse_mem_budget) if parse_mem_budget > 0 else None
                 if mem is not None:
@@ -1785,19 +1812,16 @@ def parse(
                             exhausted = True
                             return
                         logger.debug("parsing %s", cid)
-                        inflight.add(pool.submit(_parse_one_admitted, mem, parse_rss_ratio, u,
-                                                 bm, av, rej, max_primary_bytes,
-                                                 parse_timeout_s, cid))
+                        inflight[pool.submit(_parse_one_admitted, mem, parse_rss_ratio, u,
+                                             bm, av, rej, max_primary_bytes,
+                                             parse_timeout_s, cid)] = cid
 
                     while not exhausted and len(inflight) < parse_workers * 2:
                         _submit_one()
                     while inflight:
-                        done, inflight = wait(inflight, return_when=FIRST_COMPLETED)
+                        done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
                         for fut in done:
-                            try:
-                                _write_result(fut.result())
-                            except Exception as exc:  # noqa: BLE001 - _parse_one shouldn't raise
-                                logger.warning("parse worker raised unexpectedly: %s", exc)
+                            _write_or_reject(fut.result, inflight.pop(fut))
                             _maybe_log_progress()
                             if not exhausted:
                                 _submit_one()
@@ -1808,8 +1832,9 @@ def parse(
                 for unit, base_meta, availability, calc_id in _iter_units():
                     logger.debug("parsing %s", calc_id)
                     _maybe_log_progress()
-                    _write_result(_parse_one(unit, base_meta, availability, rej,
-                                             max_primary_bytes, parse_timeout_s, calc_id))
+                    _write_or_reject(partial(_parse_one, unit, base_meta, availability, rej,
+                                             max_primary_bytes, parse_timeout_s, calc_id),
+                                     calc_id)
     stats["rejections"] = rej.n
     stats["pruned"] = pruned
     logger.info("parse: %s", stats)
