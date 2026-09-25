@@ -38,6 +38,9 @@ two flagged records were inspected: not record-level duplicates — `docs/MATERI
     nested `.aiida` counts as a sub-archive), `sqlite_evidence` (a sqlite_zip archive: pull its
     `db.sqlite3` over Range to `$TMPDIR`, list the VASP nodes with the SHARED
     `aiida_archive.vasp_nodes`), `fetch_member` (one CRC-checked member over Range).
+    Also used by `zenodo_census` triage: an optional `size=` makes the tail read an ordinary range
+    (Zenodo mis-serves suffix ranges longer than the file; MC calls pass no size → unchanged), and a
+    body that breaks mid-read is a failed (uncached) peek rather than an exception.
   - `discover.py` — stage 0: enumerate → candidates → access + licence gates (drops to
     `mc_rejections.jsonl`) → **overlap FLAGS** (`zenodo_linked_in_dataset` via related-identifier
     DOIs in the Zenodo dataset, `zenodo_title_similar`, `nomad_calcs_citing` via a substring-

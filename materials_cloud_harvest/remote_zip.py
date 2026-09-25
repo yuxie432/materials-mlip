@@ -117,7 +117,7 @@ def _find_eocd(blob: bytes) -> int:
 
 
 def read_central_directory(session: requests.Session, url: str, tail: int = DEFAULT_TAIL,
-                           max_cd_bytes: int = DEFAULT_MAX_CD_BYTES
+                           max_cd_bytes: int = DEFAULT_MAX_CD_BYTES, size: int | None = None
                            ) -> tuple[list[ZipMember], int]:
     """Enumerate a remote zip's members: ``(members, total_size)``. ZIP64-aware.
 
@@ -130,16 +130,33 @@ def read_central_directory(session: requests.Session, url: str, tail: int = DEFA
     masquerade as "an archive with no VASP inside" (the caller would prune it on that verdict).
     Raises :class:`RemoteZipError` when the file is not a zip we can address (Range refused, no
     EOCD — e.g. a tar-format AiiDA export —, an inconsistent directory, or one above
-    ``max_cd_bytes``)."""
-    with _ranged_get(session, url, f"bytes=-{tail}") as r:
-        cr = r.headers.get("Content-Range", "")
-        blob = r.content
+    ``max_cd_bytes``).
+
+    ``size`` (the file's length, when the caller knows it) turns the tail read into an ordinary
+    ``bytes=<start>-<end>`` range instead of a suffix range: Zenodo mis-serves a suffix range
+    longer than the file (206 with an underflowed start and a body it never sends — re-verified
+    2026-09-25 on a 275 KB file), so a suffix read of every zip smaller than ``tail`` fails there.
+    Without ``size`` the behaviour is exactly as before (Materials Cloud's S3 serves suffixes
+    correctly). A ``size`` that disagrees with the server's is corrected from the reply."""
+    def _tail(n: int | None) -> tuple[str, bytes]:
+        spec = f"bytes={max(0, n - tail)}-{n - 1}" if n else f"bytes=-{tail}"
+        try:
+            with _ranged_get(session, url, spec) as r:
+                return r.headers.get("Content-Range", ""), r.content
+        except RemoteZipError as exc:
+            if n and "HTTP 416" in str(exc):     # a listed size past the real end: suffix read
+                return _tail(None)
+            raise
+
+    cr, blob = _tail(size if size and size > 0 else None)
     if "/" not in cr:
         raise RemoteZipError("no Content-Range on the tail read")
     try:
         total = int(cr.split("/")[-1])
     except ValueError as exc:
         raise RemoteZipError(f"bad Content-Range {cr!r}") from exc
+    if size and total != size:                 # stale listing size: re-read the real tail
+        cr, blob = _tail(total)
     blob_start = total - len(blob)
     idx = _find_eocd(blob)
     if idx < 0:
@@ -312,14 +329,17 @@ def sqlite_evidence(session: requests.Session, url: str, members: list[ZipMember
 
 
 def peek_archive(session: requests.Session, url: str, max_cd_bytes: int = DEFAULT_MAX_CD_BYTES,
-                 max_db_bytes: int = DEFAULT_MAX_DB_BYTES) -> tuple[ZipEvidence | None, str]:
+                 max_db_bytes: int = DEFAULT_MAX_DB_BYTES, size: int | None = None
+                 ) -> tuple[ZipEvidence | None, str]:
     """Peek one remote zip/AiiDA export: ``(evidence, status)`` with status ``"ok"`` or a short
     failure reason (``"not_zip"``, ``"cd_too_large"``, ``"peek_failed: …"``). A sqlite_zip AiiDA
     archive is resolved through its database (:func:`sqlite_evidence`): a database over
     ``max_db_bytes`` (0 = never read one) makes the status ``"db_too_large"``, a failed transfer
-    or query ``"peek_failed: db …"`` (retried in-run, never cached)."""
+    or query ``"peek_failed: db …"`` (retried in-run, never cached). ``size`` as in
+    :func:`read_central_directory` (pass it on Zenodo)."""
     try:
-        members, _total = read_central_directory(session, url, max_cd_bytes=max_cd_bytes)
+        members, _total = read_central_directory(session, url, max_cd_bytes=max_cd_bytes,
+                                                 size=size)
     except RemoteZipError as exc:
         msg = str(exc)
         if "not a zip" in msg:
@@ -327,8 +347,10 @@ def peek_archive(session: requests.Session, url: str, max_cd_bytes: int = DEFAUL
         if "> cap" in msg:
             return None, "cd_too_large"
         return None, f"peek_failed: {msg[:160]}"
-    except (struct.error, ValueError) as exc:
-        return None, f"peek_failed: {type(exc).__name__}: {exc}"
+    except (struct.error, ValueError, requests.RequestException) as exc:
+        # a body that breaks mid-read (dropped connection, Zenodo's broken over-long suffix range)
+        # is a failed — retryable, never cached — peek, not a crash of the whole triage
+        return None, f"peek_failed: {type(exc).__name__}: {str(exc)[:120]}"
     ev = zip_evidence(members)
     if ev.aiida_format == "sqlite_zip" and max_db_bytes:
         ev = sqlite_evidence(session, url, members, ev, max_db_bytes)
