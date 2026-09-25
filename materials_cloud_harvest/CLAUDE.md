@@ -4,6 +4,9 @@ A third source adapter harvests VASP data from the **Materials Cloud Archive**
 (https://archive.materialscloud.org — EPFL/MARVEL's InvenioRDM repository) into the *same*
 `extxyz.gz` + `metadata.jsonl` schema as Zenodo and NOMAD. Full design + live-verified API facts +
 the full census: `docs/MATERIALS_CLOUD_HARVEST.md`; CSD3 runbook: `scripts/csd3/materials_cloud/`.
+**Harvest COMPLETE (2026-09-25, jobs 36245037 + 36251084): 102 records / 75,751 calcs /
+2,545,669 frames, verify exact** — outcome, every rejection bucket and the training-time data-quality
+flags (NEB images, VASP MLFF runs, label quirks): `docs/MATERIALS_CLOUD_HARVEST_RESULT.md`.
 Scope (user decisions 2026-09-23, revised 2026-09-24 after the CSD3 census): **full census** of
 all ~1.2k records (no keyword recall limit); VASP-mentioning records kept fail-safe, any other record
 kept on **positive peek evidence** or — `--unresolved all` — when an archive cannot be settled by a

@@ -9,12 +9,12 @@ Everything under "measured" was obtained live from the MC API on **2026-09-23** 
 every record). It supersedes the raw plan in `EXTERNAL_DATA_SOURCES.md` §5, several of whose
 numbers turned out wrong (see §9).
 
-> **Status (2026-09-24): census + sizing bench RUN on CSD3 (§11); code revised from the results;
-> pipeline not yet run.** The first CSD3 census exposed a ZIP64 reader bug (25 archives unreadable)
-> and two policy questions, both now decided: **fetch every archive no peek can settle** (the
-> residual blind spot, ~1.1 TB) and **extract sqlite_zip AiiDA archives** (aiida-vasp calcs found in
-> one record). Parse now runs under a RAM budget (§5). Next: re-run `10_discover.sh`, then
-> `20_pipeline.sh` (runbook: `scripts/csd3/materials_cloud/README.md`).
+> **Status (2026-09-25): HARVEST COMPLETE — 102 records / 75,751 calcs / 2,545,669 frames, verify
+> exact; every rejection bucket evaluated, none worth a recovery job.** Outcome, funnel, yield by
+> decision and the data-quality notes for training: **`MATERIALS_CLOUD_HARVEST_RESULT.md`**. This
+> file keeps the design: the first CSD3 census (§11) exposed a ZIP64 reader bug and two policy
+> questions, decided as **fetch every archive no peek can settle** (it found half of all calcs) and
+> **extract sqlite_zip AiiDA archives**; parse runs under a RAM budget (§5).
 
 ---
 
@@ -29,6 +29,7 @@ numbers turned out wrong (see §9).
 | Triage | Range-peek every `.zip` and `.aiida` central directory (ZIP64-aware; a sqlite_zip AiiDA archive's `db.sqlite3` is pulled and queried). VASP-mentioning records kept fail-safe; others kept on **positive evidence** (a peek found `vasprun`/`OUTCAR`/`vaspout`) **or when an archive cannot be settled by a peek** (tars, unreadable/nested zips — `unresolved_fetch`, decided 2026-09-24). |
 | AiiDA exports (894 GB, 35% of MC bytes) | **Both formats extracted**: legacy exports keep real member names (Bosoni's VASP exports); sqlite_zip archives are mapped through their database by the shared `_extract_aiida` (aiida-vasp calcs found in the AMaRaNTA 2D-magnets record). A database proving an export VASP-free prunes it. |
 | Code | `materials_cloud_harvest/` (stages 0-1, retrying fetch glue, CLI) + backward-compatible additions to the shared code: fetch hooks, an AiiDA extractor (`zenodo_harvest/aiida_archive.py`), the zip-count fix, a parse RAM budget. calc_ids `materials_cloud:<record_id>:<path>`. |
+| **Result (2026-09-25)** | **102 records / 75,751 calcs / 2.55M frames** (91% OUTCAR-parsed; 65.6% of frames from one AIMD record), verify exact, in a 15 min discover job + a 9 h 41 min pipeline job; the blind fetch yielded 38 records = 49.6% of calcs — `MATERIALS_CLOUD_HARVEST_RESULT.md` |
 | Cost | One ~30 min discover/triage job + one ≤12 h pipeline job: **~1.2k fetch units / ~1.2 TB** transfer (1.1 TB of it blind-fetched archives, ~3.5 h at the measured 96 MB/s). |
 
 ---
@@ -301,6 +302,9 @@ never approached, and the bytes come from presigned S3 URLs a token would not sp
   so deferrals are not expected).
 * **Disk** (dedicated ~880 GB / ~990k inodes free): staging valve 780 GB / 900k inodes; the pilot
   staged 4.3 bytes per downloaded byte for evidenced units (extracted vaspruns), 5.4 inodes/calc.
+* **Measured (2026-09-25)**: 1,200 units / 1.25 TB → 75,751 calcs: 38,175 from the 84 evidenced
+  records (64 yielding) and 37,576 from 38 of the 524 blind-fetched ones (7.3% hit rate vs 7.8%
+  predicted); 9 h 41 min (fetch-bound, one attempt), 0 deferrals, staging peak 257 GB / 240k inodes.
 
 ---
 
@@ -333,6 +337,10 @@ never approached, and the bytes come from presigned S3 URLs a token would not sp
   POSCAR/CONTCAR/INCAR-only).
 * **Split archives** are not reassembled (logged `archive_multipart_unsupported`); `.rar`/`.7z` need
   the `archives` extra + an `unrar` on PATH (the pipeline script checks and warns).
+* **Parser limits met in the harvest** (details + counts in `MATERIALS_CLOUD_HARVEST_RESULT.md`):
+  VASP 4.x OUTCARs (ASE's chunking assumes the ≥ 5 block order; 236 calcs, validated fix
+  recorded), ASE header quirks (477), misnamed / truncated archives (all non-VASP here); and two
+  training-time flags — NEB images (VTST prints NEB, not DFT, forces) and VASP MLFF runs.
 * **Point-in-time**: a re-run of `10_discover.sh` picks up new records (the census is cheap).
 * The same full-census + evidence idea **does not scale verbatim to Zenodo** (7.3M records, 30
   req/min search, ~5k req/h file endpoint): a filtered variant (paper-graph via OpenAlex +

@@ -6,6 +6,11 @@ account once with `export SBATCH_ACCOUNT=<MYGROUP>-SL3-CPU`, activate the env be
 `mkdir -p logs_mc` before the first submit. Design + live-verified API facts:
 `docs/MATERIALS_CLOUD_HARVEST.md`.
 
+**Status: harvest RUN (2026-09-24/25, jobs `36245037` + `36251084`) — 102 records / 75,751 calcs /
+2.55M frames, verify exact; result: `docs/MATERIALS_CLOUD_HARVEST_RESULT.md`.** Left to do: step 4
+(the overlap check) and, when no re-parse is planned, `rm -rf $MC_HARVEST_DATA/raw` (3.9 GiB /
+13.8k inodes of rejected calcs' files). Step 5 is not needed (no deferred primaries).
+
 ```
 scripts/csd3/materials_cloud/10_discover.sh     # stage 0-1: full census + gates + overlap flags + peeks
 scripts/csd3/materials_cloud/15_bench.sh        # sizing: speed probe + AiiDA census + fetch/parse pilot (RUN 2026-09-24)

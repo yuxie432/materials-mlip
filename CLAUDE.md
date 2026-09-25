@@ -169,6 +169,12 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
     moment must never drop a calc, so a vasprun whose `<eigenvalues>` pymatgen cannot read
     (`KeyError('eigenvalues')` on some real ISPIN=2 uploads) is retried WITHOUT eigenvalues — the
     calc + net charge are kept, only the net moment falls back to `None`.
+    **Nothing escapes the audit trail** (2026-09-25): `_frame` rejects a force array whose shape
+    is not `(n_atoms, 3)` (it is set straight into `atoms.arrays`, bypassing ASE's check — a
+    1-row array would otherwise be silently broadcast onto every atom by the extxyz writer), and
+    any exception that still escapes a calc's parse or frame write is recorded as a non-terminal
+    `parse_error` rejection against that calc in BOTH loops (it used to be a calc_id-less log line
+    in the parallel loop); a storage `OSError` (disk full) stops the parse instead.
   - `outcar_params.py` — parse an OUTCAR **header** into a vasprun-schema `calc_parameters`:
     the user `INCAR:` echo (via pymatgen's canonical `Incar` parser, stdlib fallback) + the
     resolved-parameter blocks (`parameters`) + POTCAR titels + k-points. `run_type` is
@@ -448,6 +454,8 @@ has its own `CLAUDE.md` with the details:
 - `materials_cloud_harvest/` — Materials Cloud Archive: full census of all ~1.2k records, zip +
   AiiDA-archive peeks (sqlite_zip ones through their `db.sqlite3`), archives no peek can settle
   fetched too, the shared fetch with an anonymous session (`docs/MATERIALS_CLOUD_HARVEST.md`).
+  **Harvest COMPLETE 2026-09-25**: 102 records / 75,751 calcs / 2,545,669 frames, verify exact,
+  every rejection evaluated (none worth a recovery job) — `docs/MATERIALS_CLOUD_HARVEST_RESULT.md`.
   It added backward-compatible pieces to the shared code: fetch hooks (source-supplied
   `provenance` passthrough, per-file `archive_kind`, `session_factory`; the Zenodo token is now
   attached only to `zenodo.org` hosts), an **AiiDA extractor** (`zenodo_harvest/aiida_archive.py` +
