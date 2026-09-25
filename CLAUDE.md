@@ -19,6 +19,8 @@ a machine learning interatomic potential (MLIP) using openly accessible DFT data
 This document describes the intended architecture and domain conventions agreed with the project
 mentor. All five stages (discover → triage → fetch → parse → store) now exist as the
 `zenodo_harvest` package and run end-to-end. See `docs/DESIGN.md` for the full data/storage design.
+**All three VASP harvests are complete (Zenodo, NOMAD, Materials Cloud); the next-phase work plan
+(blind-spot discovery → combined curated corpus → MLIP value study) is `docs/FURTHER_WORK.md`.**
 
 ## Code layout & commands
 
