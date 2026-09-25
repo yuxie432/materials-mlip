@@ -21,6 +21,9 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
 `zenodo_harvest` package and run end-to-end. See `docs/DESIGN.md` for the full data/storage design.
 **All three VASP harvests are complete (Zenodo, NOMAD, Materials Cloud); the next-phase work plan
 (blind-spot discovery → combined curated corpus → MLIP value study) is `docs/FURTHER_WORK.md`.**
+**Part A (blind-spot discovery) is BUILT as `zenodo_census/` — a census of every archive-bearing
+Zenodo record scored offline + selectively peeked, feeding the ordinary pipeline
+(`docs/ZENODO_CENSUS.md`, `scripts/csd3/census/`); CSD3 runs pending.**
 
 ## Code layout & commands
 
@@ -467,6 +470,20 @@ has its own `CLAUDE.md` with the details:
   record-join to `status.py`. Two shared recall fixes (2026-09-24): `zipstream`/Zenodo `triage`
   walk a zip's central directory by its bytes, not the EOCD count (a 16-bit-truncated count made
   targeted fetch able to "prove" an archive VASP-free).
+
+Not a source but a Zenodo discovery front-end, with its own `CLAUDE.md`:
+
+- `zenodo_census/` — FURTHER_WORK part A: replaces keyword discovery with a **census** of every
+  record holding an archive or a loose VASP primary (583k records, ~3.4 h at page size 100 with the
+  token), offline signals (robust local text matching — Zenodo's `q` loses words glued by `&nbsp;`
+  and never stems quoted phrases —, depositor account / ORCID / community of the known-VASP records,
+  linked or citing papers that cite the VASP method papers via OpenAlex, Europe PMC data-availability
+  mentions) → tiers → ZIP64-aware zip peeks + tar head-peeks under one Zenodo-rate pacer → an ORDINARY
+  Zenodo keep-list for `20_pipeline.sh` (`docs/ZENODO_CENSUS.md`). Shared changes (backward-
+  compatible): `materials_cloud_harvest/remote_zip.py` takes an optional `size=` (Zenodo breaks
+  suffix ranges longer than the file), retries a 416 from a stale size, and reports a mid-read
+  failure as a failed peek; `zenodo_harvest/models.is_reusable_license` treats `other-closed` as not
+  reusable.
 
 ## Scope and starting point
 

@@ -97,6 +97,8 @@ easy, high-gain fix, which is why the stage is closed here.
 
 ### Limitations of the current approach (be aware when using / extending the dataset)
 
+- *(2026-09-25: addressed by the Zenodo census — `docs/ZENODO_CENSUS.md`, which also measured two
+  more search-side causes: `&nbsp;`-glued words and unstemmed quoted phrases.)*
 - **Metadata-only discovery — the main recall gap.** Zenodo's search (`q`) indexes metadata *text*
   (title/description/keywords/creators) **and top-level filenames**, but **nothing inside archives**.
   Since nearly all VASP data is packed in `.zip`/`.tar.gz`, a record is found only if its description

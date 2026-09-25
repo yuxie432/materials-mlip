@@ -79,6 +79,15 @@ packaging) and `ervm4-pn188` ↔ `7023990` (the Zenodo side is only a code snaps
 
 ## A. Recover the VASP data Zenodo's keyword search cannot see (do first)
 
+> **Status 2026-09-25: BUILT as `zenodo_census/` — design, measurements and decisions in
+> `docs/ZENODO_CENSUS.md`, runbook `scripts/csd3/census/`; CSD3 runs pending.** The research found a
+> cheaper, more complete route than the design sketched below: Zenodo's search accepts field
+> syntax, so a census of every record that HOLDS an archive (`files.entries.ext:…`, 583k records,
+> all resource types) costs ~5.8k pages ≈ 3.4 h, after which the snowball / paper-graph / text
+> signals are offline joins rather than per-depositor searches. Also measured: `&nbsp;` and
+> unstemmed quoted phrases break Zenodo's own text matching, and the depositor account (`owners`)
+> is a better snowball key than names. The original sketch is kept below for the record.
+
 ### Problem (measured)
 
 Zenodo's `q` indexes metadata **text** + top-level filenames, never archive contents, and nearly all

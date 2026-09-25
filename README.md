@@ -12,6 +12,8 @@ for domain conventions.
 zenodo_harvest/     the importable package (the pipeline itself)
 nomad_harvest/      second source adapter: NOMAD (reuses zenodo_harvest stages 3-5)
 materials_cloud_harvest/  third source adapter: Materials Cloud Archive (reuses fetch + 3-5)
+zenodo_census/      Zenodo census: finds the VASP records keyword discovery misses and writes
+                    an ordinary Zenodo keep-list (docs/ZENODO_CENSUS.md)
 tests/              offline pytest suite — top level by convention: pytest's rootdir
                     discovery expects it there, and it is deliberately NOT packaged
                     (pyproject ships only `zenodo_harvest`)
