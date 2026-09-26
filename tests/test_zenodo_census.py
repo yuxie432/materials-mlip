@@ -299,6 +299,253 @@ def test_census_client_paces_request_starts(monkeypatch):
     assert sleeps == [pytest.approx(0.5)]   # waits 2.0 s from the previous START, not the end
 
 
+# --- records Zenodo's default serializer breaks on (the first CSD3 census died on one) ----------
+
+def test_legacy_from_native_reproduces_the_default_serializer():
+    """Real hits of four records in both serializations: the conversion is exact for every field
+    the census keeps (notes, journal, keywords, relations, community slug, licence renames,
+    multiple rights, no licence, several affiliations, a publication subtype)."""
+    doc = json.loads((Path(__file__).parent / "zenodo_serializer_pairs.json").read_text())
+    for legacy, native in doc["pairs"]:
+        conv = zc.legacy_from_native(native)
+        assert conv["_serializer"] == "inveniordm"
+        got, want = zc.slim_hit(conv), zc.slim_hit(legacy)
+        assert got.pop("_serializer") == "inveniordm"
+        assert got == want, legacy["id"]
+        a, b = Candidate.from_record(got).to_dict(), Candidate.from_record(want).to_dict()
+        a.pop("retrieved_at")
+        b.pop("retrieved_at")
+        assert a == b
+
+
+def to_native(h: dict) -> dict:
+    """A legacy-shaped test hit (``zhit``) in the native serializer's shape."""
+    m = h["metadata"]
+    rt = m["resource_type"]
+    return {
+        "id": str(h["id"]), "created": h["created"],
+        "pids": {"doi": {"identifier": h["doi"]}},
+        "parent": {"id": h["conceptrecid"],
+                   "access": {"owned_by": {"user": h["owners"][0]["id"]}},
+                   "communities": {"entries": [{"id": "u" + c["id"], "slug": c["id"]}
+                                               for c in m["communities"]]},
+                   "pids": {"doi": {"identifier": h["conceptdoi"]}}},
+        "access": {"record": "public", "files": "public", "embargo": {"active": False},
+                   "status": "open"},
+        "links": {"self_html": h["links"]["self_html"]},
+        "metadata": {
+            "title": m["title"], "description": m["description"],
+            "resource_type": {"id": rt["type"], "title": {"en": rt["title"]}},
+            "rights": [{"id": m["license"]["id"]}] if m["license"] else [],
+            "publication_date": m["publication_date"],
+            "subjects": [{"subject": k} for k in m["keywords"]],
+            "creators": [{"person_or_org": {"name": c["name"]},
+                          "affiliations": [{"name": c["affiliation"]}]} for c in m["creators"]],
+            "related_identifiers": [{"identifier": r["identifier"], "scheme": r["scheme"],
+                                     "relation_type": {"id": r["relation"].lower()}}
+                                    for r in m["related_identifiers"]]},
+        "files": {"entries": {f["key"]: {k: f[k] for k in ("id", "key", "size", "checksum")}
+                              for f in h["files"]}},
+    }
+
+
+class SearchResp(FakeResp):
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            import requests
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
+
+
+class FakeSearchServer:
+    """``/api/records`` over one newest-first record list. The default serializer fails (500) on
+    any page holding a ``poison`` id; both serializers fail on a ``dead`` id; ``down(n)`` makes
+    the next n requests fail with 503 (an outage); ``bad_request`` answers everything with 400."""
+
+    def __init__(self, records: list[dict], poison: tuple = (), dead: tuple = ()):
+        self.records, self.poison, self.dead = records, set(poison), set(dead)
+        self.headers: dict[str, str] = {}
+        self.outage = 0
+        self.bad_request = False
+        self.log: list[tuple[int, int, bool, int]] = []      # (page, size, native, status)
+
+    def down(self, n: int) -> None:
+        self.outage = n
+
+    def get(self, u: str, params: dict | None = None, headers: dict | None = None,
+            **_: Any) -> SearchResp:
+        p = params or {}
+        page, size = int(p.get("page", 1)), int(p["size"])
+        native = (headers or {}).get("Accept") == zc.NATIVE_ACCEPT
+        records = self.records
+        if str(p.get("q", "")).startswith("recid:("):             # resolve_versions batches
+            wanted = set(str(p["q"])[len("recid:("):-1].split(" OR "))
+            records = [r for r in records if str(r["id"]) in wanted]
+        chunk = records[(page - 1) * size: page * size]
+        ids = {str(r["id"]) for r in chunk}
+        if self.bad_request or page * size > 10_000:
+            status = 400
+        elif self.outage > 0:
+            self.outage -= 1
+            status = 503
+        elif ids & self.dead or (not native and ids & self.poison):
+            status = 500
+        else:
+            status = 200
+        self.log.append((page, size, native, status))
+        if status != 200:
+            return SearchResp(status, json_obj={"status": status})
+        hits = [to_native(r) if native else r for r in chunk]
+        return SearchResp(200, json_obj={"hits": {"hits": hits, "total": len(records)}})
+
+
+def _recs(n: int) -> list[dict]:
+    return [zhit(str(1000 + i), {f"d{i}.zip": 10 + i}, title=f"record {i}", keywords=[f"k{i}"],
+                 owners=[str(i % 3)], communities=["c1"] if i % 4 == 0 else [],
+                 related=[{"identifier": f"10.1000/p{i}", "relation": "isSupplementTo",
+                           "scheme": "doi"}] if i % 5 == 0 else [],
+                 concept=str(900 + i))
+            for i in range(n)]
+
+
+def _client(server: FakeSearchServer, monkeypatch: pytest.MonkeyPatch,
+            events: list | None = None) -> zc.CensusClient:
+    monkeypatch.setattr(zc.time, "sleep", lambda s: None)
+    c = zc.CensusClient(token="t", min_interval=0.0, session=server)
+    c.outage_delay, c.outage_patience = 1.0, 8.0
+    if events is not None:
+        c.on_poison = events.append
+    return c
+
+
+def test_census_client_isolates_records_the_default_serializer_breaks_on(monkeypatch):
+    recs = _recs(250)
+    server = FakeSearchServer(recs, poison=("1137", "1138", "1205"))    # two adjacent + one
+    events: list[dict] = []
+    got = list(_client(server, monkeypatch, events).iter_window("q", size=100))
+    assert [r["id"] for r in got] == [r["id"] for r in recs]            # all, in order
+    for r, want in zip(got, recs):
+        slim = zc.slim_hit(r)
+        slim.pop("_serializer", None)
+        assert slim == zc.slim_hit(want)                                # converted ones exact
+    assert {r["id"] for r in got if r.get("_serializer")} == {1137, 1138, 1205}
+    assert [(e["status"], e["offset"], e["id"]) for e in events] == [
+        ("converted", 137, 1137), ("converted", 138, 1138), ("converted", 205, 1205)]
+    assert all(e["native"]["id"] == str(e["id"]) for e in events)
+    # bounded: pages 2 and 3 are tried once (with the usual retries), then split 100 -> 10 -> 1
+    assert len([x for x in server.log if x[1] == 100]) == 1 + 6 + 6
+    assert len(server.log) < 70
+
+
+def test_census_client_counts_a_window_whose_newest_record_is_poison(monkeypatch):
+    recs = _recs(30)
+    server = FakeSearchServer(recs, poison=("1000",))
+    events: list[dict] = []
+    c = _client(server, monkeypatch, events)
+    assert c.count("q") == 30                     # shared count (size=1, page 1) fails -> probe
+    assert (10_000, 1, True, 200) in server.log   # the probe serializes no hit
+    got = list(c.iter_window("q", size=10))
+    assert [r["id"] for r in got] == [r["id"] for r in recs]
+    assert [e["offset"] for e in events] == [0]
+
+
+def test_census_client_waits_out_an_outage_instead_of_skipping(monkeypatch):
+    recs = _recs(40)
+    server = FakeSearchServer(recs)
+    events: list[dict] = []
+    c = _client(server, monkeypatch, events)
+    it = c.iter_window("q", size=10)
+    first = [next(it) for _ in range(10)]
+    server.down(9)            # page 2: 6 failed attempts, then 3 failed probes, then back
+    got = first + list(it)
+    assert [r["id"] for r in got] == [r["id"] for r in recs] and events == []
+    assert not any(r.get("_serializer") for r in got)
+
+
+def test_census_client_stops_on_a_long_outage_and_logs_nothing(monkeypatch):
+    server = FakeSearchServer(_recs(40))
+    events: list[dict] = []
+    c = _client(server, monkeypatch, events)
+    it = c.iter_window("q", size=10)
+    [next(it) for _ in range(10)]
+    server.down(10_000)
+    with pytest.raises(zc.ZenodoOutage):
+        list(it)
+    assert events == []                       # an outage is never recorded as broken records
+
+
+def test_census_client_restarts_a_page_when_an_outage_begins_mid_isolation(monkeypatch):
+    recs = _recs(30)
+    server = FakeSearchServer(recs, poison=("1015",))
+    events: list[dict] = []
+    c = _client(server, monkeypatch, events)
+    real_single = zc.CensusClient._single
+    calls = {"n": 0}
+
+    def flaky_single(self, query, offset, sort, extra):
+        calls["n"] += 1
+        if calls["n"] == 3:                   # Zenodo goes down for a while mid-isolation
+            server.down(12)
+        return real_single(self, query, offset, sort, extra)
+
+    monkeypatch.setattr(zc.CensusClient, "_single", flaky_single)
+    got = list(c.iter_window("q", size=10))
+    assert [r["id"] for r in got] == [r["id"] for r in recs]
+    assert [(e["status"], e["id"]) for e in events] == [("converted", 1015)]
+
+
+def test_census_client_reports_a_record_neither_serializer_returns(monkeypatch):
+    recs = _recs(25)
+    server = FakeSearchServer(recs, dead=("1012",))
+    events: list[dict] = []
+    got = list(_client(server, monkeypatch, events).iter_window("q", size=10))
+    assert [r["id"] for r in got] == [r["id"] for r in recs if r["id"] != 1012]
+    assert [(e["status"], e["offset"], e["query"]) for e in events] == [("unresolved", 12, "q")]
+
+
+def test_census_client_does_not_isolate_client_errors(monkeypatch):
+    import requests
+    server = FakeSearchServer(_recs(5))
+    server.bad_request = True
+    with pytest.raises(requests.HTTPError):
+        list(_client(server, monkeypatch).iter_window("q", size=5))
+    assert len(server.log) == 1               # a 400 is our bug: no retries, no isolation
+
+
+def test_resolve_versions_survives_a_batch_the_default_serializer_breaks_on(tmp_path,
+                                                                           monkeypatch):
+    recs = _recs(8)
+    server = FakeSearchServer(recs, poison=("1003",))
+    out = tmp_path / "versions.jsonl"
+    s = zl.resolve_versions(["1001", "1003", "1005", "77"], out, _client(server, monkeypatch))
+    assert s["resolved"] == 3 and s["unknown"] == 1
+    got = {r["id"]: r["conceptrecid"] for r in read_jsonl(out)}
+    assert got == {"1001": "901", "1003": "903", "1005": "905", "77": None}
+    assert any(native and status == 200 for _, _, native, status in server.log)
+
+
+def test_run_census_logs_poison_records_and_resumes(tmp_path, monkeypatch):
+    from datetime import date as _date
+    recs = _recs(12)
+    out = tmp_path / "census.jsonl"
+    server = FakeSearchServer(recs, poison=("1007",))
+    s = zc.run_census(_client(server, monkeypatch), out, start=_date(2024, 1, 1),
+                      end=_date(2024, 1, 1), page_size=5)
+    assert s["written"] == 12 and s["poison_converted"] == 1 and s["poison_unresolved"] == 0
+    lines = [json.loads(x) for x in out.read_text().splitlines()]
+    assert [r["id"] for r in lines] == [r["id"] for r in recs]
+    assert [r.get("_serializer") for r in lines].count("inveniordm") == 1
+    assert [r["id"] for r in zc.iter_census(out)] == [r["id"] for r in recs]
+    poison = [json.loads(x) for x in (tmp_path / "census.jsonl.poison.jsonl").read_text()
+              .splitlines()]
+    assert [(p["status"], p["id"], p["offset"]) for p in poison] == [("converted", 1007, 7)]
+    s2 = zc.run_census(_client(server, monkeypatch), out)        # resume: window already done
+    assert s2["windows_skipped"] == 1 and s2["written"] == 0
+    from zenodo_census.cli import _poison_summary
+    with (tmp_path / "census.jsonl.poison.jsonl").open("a") as fh:     # a re-paged window, torn line
+        fh.write(json.dumps(poison[0]) + "\n" + '{"status": "unres')
+    assert _poison_summary(tmp_path / "census.jsonl.poison.jsonl") == {"converted": 1}
+
+
 # --------------------------------------------------------------------------- #
 # signals                                                                      #
 # --------------------------------------------------------------------------- #
@@ -1172,6 +1419,7 @@ def test_head_evidence_uses_strict_names():
 
 
 def test_triage_declares_real_extractors_and_skips_by_concept(tmp_path, monkeypatch):
+    monkeypatch.setattr(hp.time, "sleep", lambda *_: None)     # the 503s below back off
     ok = {"status": "ok", "mode": "zip"}
     st, ff = zt.file_verdict(_f("export.zip"), {**ok, "n_primary": 2, "aiida_format": "sqlite_zip",
                                                  "db_status": "ok"})
@@ -1195,7 +1443,6 @@ def test_triage_declares_real_extractors_and_skips_by_concept(tmp_path, monkeypa
     tgz = make_tar({"c/OUTCAR": b"1"})
     v = zt.peek_file(Flaky({"u": tgz}), "zip", {**f, "size": len(tgz)})
     assert v["status"].startswith("peek_failed")
-    monkeypatch.setattr(hp.time, "sleep", lambda *_: None)
     # exclude_keep by concept: a newer version of a kept record is skipped
     census, blobs, _ = _triage_fixture(tmp_path, monkeypatch)
     prior = _write_jsonl(tmp_path / "old_keep.jsonl", [{"recid": "999", "conceptrecid": "1000"}])

@@ -254,6 +254,22 @@ def _lines(p: Path) -> int:
         return sum(1 for _ in fh)
 
 
+def _poison_summary(p: Path) -> dict[str, int]:
+    """Distinct records in the census poison log by outcome (a re-paged window logs a record again;
+    a torn line from a live writer is skipped)."""
+    seen: dict[str, set[str]] = {}
+    if p.is_file():
+        with p.open() as fh:
+            for line in fh:
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                key = str(e.get("id") or f"{e.get('query')}@{e.get('offset')}")
+                seen.setdefault(str(e.get("status")), set()).add(key)
+    return {k: len(v) for k, v in sorted(seen.items())}
+
+
 def status(P: dict[str, Path]) -> dict[str, object]:
     """Line counts / completion flags of each stage's output (read-only; safe while running)."""
     cur = Path(str(P["datacite"]) + ".cursor")
@@ -263,6 +279,7 @@ def status(P: dict[str, Path]) -> dict[str, object]:
         "root": str(P["root"]),
         "census_lines": _lines(P["census"]),
         "census_windows_done": _lines(Path(str(P["census"]) + ".windows.jsonl")),
+        "census_poison": _poison_summary(Path(str(P["census"]) + ".poison.jsonl")),
         "datacite_links": _lines(P["datacite"]),
         "datacite_complete": cur.is_file() and cur.read_text().strip() == "done",
         "epmc_papers": _lines(P["epmc"]),

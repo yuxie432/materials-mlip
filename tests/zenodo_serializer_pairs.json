@@ -1,0 +1,781 @@
+{
+ "_about": "Live Zenodo search hits (2026-09-26) of records 31044, 10630244, 16809186, 13888307 in both serializations - [default (legacy) JSON, native application/vnd.inveniordm.v1+json] - trimmed identically (descriptions/notes to 90 chars, first 2 creators and files, unused fields dropped). zenodo_census.census.legacy_from_native(native) must reproduce slim_hit(legacy).",
+ "pairs": [
+  [
+   {
+    "id": 31044,
+    "conceptrecid": "617048",
+    "doi": "10.5281/zenodo.31044",
+    "conceptdoi": "",
+    "created": "2016-06-29T12:07:31+00:00",
+    "owners": [
+     {
+      "id": "5998"
+     }
+    ],
+    "links": {
+     "self_html": "https://zenodo.org/records/31044"
+    },
+    "metadata": {
+     "title": "Strain effects on oxygen migration in perovskites",
+     "keywords": [
+      "perovskite",
+      "diffusion",
+      "oxygen",
+      "migration barrier",
+      "migration energy",
+      "SOFC",
+      "strain",
+      "density functional theory"
+     ],
+     "resource_type": {
+      "title": "Dataset",
+      "type": "dataset"
+     },
+     "license": {
+      "id": "cc-zero"
+     },
+     "access_right": "open",
+     "publication_date": "2015-01-28",
+     "related_identifiers": [
+      {
+       "identifier": "10.1039/c4cp05554c",
+       "relation": "isSupplementTo",
+       "scheme": "doi"
+      },
+      {
+       "identifier": "10.1039/c6cp90050j",
+       "relation": "isSupplementTo",
+       "scheme": "doi"
+      }
+     ],
+     "journal": {
+      "issue": "4",
+      "pages": "2715-2721",
+      "title": "Physical Chemistry Chemical Physics",
+      "volume": "17"
+     },
+     "description": "<p>This data is cross-posted here:</p>\n\n<p>https://materialsdata.nist.gov/dspace/xmlui/han",
+     "notes": "Note: We would like to acknowledge the NSF Graduate Fellowship Program under Grant No. DGE",
+     "creators": [
+      {
+       "name": "Mayeshiba, Tam",
+       "affiliation": "University of Wisconsin-Madison"
+      },
+      {
+       "name": "Morgan, Dane",
+       "affiliation": "University of Wisconsin-Madison"
+      }
+     ]
+    },
+    "files": [
+     {
+      "id": "3a4d5bf9-65f1-46e7-942f-0e8b93faa573",
+      "key": "S3_bulk_supercells.tar.gz",
+      "size": 9469129,
+      "checksum": "md5:55eaa0217f077157babec26c01947dbb",
+      "links": {
+       "self": "https://zenodo.org/api/records/31044/files/S3_bulk_supercells.tar.gz/content"
+      }
+     },
+     {
+      "id": "b9c41737-0d32-4aa7-b598-dbbdf4d36d8b",
+      "key": "S5_GGAU_barrier_comparison.tar.gz",
+      "size": 256746340,
+      "checksum": "md5:c922ef77648c8a28412695fc9f8a4bb6",
+      "links": {
+       "self": "https://zenodo.org/api/records/31044/files/S5_GGAU_barrier_comparison.tar.gz/content"
+      }
+     }
+    ]
+   },
+   {
+    "id": "31044",
+    "created": "2016-06-29T12:07:31+00:00",
+    "pids": {
+     "doi": {
+      "identifier": "10.5281/zenodo.31044"
+     }
+    },
+    "parent": {
+     "id": "617048",
+     "access": {
+      "owned_by": {
+       "user": "5998"
+      }
+     },
+     "pids": {
+      "doi": {
+       "identifier": ""
+      }
+     }
+    },
+    "access": {
+     "record": "public",
+     "files": "public",
+     "embargo": {
+      "active": false,
+      "reason": null
+     },
+     "status": "open"
+    },
+    "links": {
+     "self_html": "https://zenodo.org/records/31044"
+    },
+    "custom_fields": {
+     "journal:journal": {
+      "title": "Physical Chemistry Chemical Physics",
+      "issue": "4",
+      "volume": "17",
+      "pages": "2715-2721"
+     }
+    },
+    "metadata": {
+     "title": "Strain effects on oxygen migration in perovskites",
+     "resource_type": {
+      "id": "dataset",
+      "title": {
+       "en": "Dataset"
+      }
+     },
+     "publication_date": "2015-01-28",
+     "subjects": [
+      {
+       "subject": "perovskite"
+      },
+      {
+       "subject": "diffusion"
+      },
+      {
+       "subject": "oxygen"
+      },
+      {
+       "subject": "migration barrier"
+      },
+      {
+       "subject": "migration energy"
+      },
+      {
+       "subject": "SOFC"
+      },
+      {
+       "subject": "strain"
+      },
+      {
+       "subject": "density functional theory"
+      }
+     ],
+     "description": "<p>This data is cross-posted here:</p>\n\n<p>https://materialsdata.nist.gov/dspace/xmlui/han",
+     "rights": [
+      {
+       "id": "cc0-1.0"
+      }
+     ],
+     "creators": [
+      {
+       "person_or_org": {
+        "type": "personal",
+        "name": "Mayeshiba, Tam"
+       },
+       "affiliations": [
+        {
+         "name": "University of Wisconsin-Madison"
+        }
+       ]
+      },
+      {
+       "person_or_org": {
+        "type": "personal",
+        "name": "Morgan, Dane"
+       },
+       "affiliations": [
+        {
+         "name": "University of Wisconsin-Madison"
+        }
+       ]
+      }
+     ],
+     "related_identifiers": [
+      {
+       "identifier": "10.1039/c4cp05554c",
+       "scheme": "doi",
+       "relation_type": {
+        "id": "issupplementto"
+       }
+      },
+      {
+       "identifier": "10.1039/c6cp90050j",
+       "scheme": "doi",
+       "relation_type": {
+        "id": "issupplementto"
+       }
+      }
+     ],
+     "additional_descriptions": [
+      {
+       "description": "Note: We would like to acknowledge the NSF Graduate Fellowship Program under Grant No. DGE",
+       "type": {
+        "id": "notes"
+       }
+      }
+     ]
+    },
+    "files": {
+     "entries": {
+      "S3_bulk_supercells.tar.gz": {
+       "id": "3a4d5bf9-65f1-46e7-942f-0e8b93faa573",
+       "key": "S3_bulk_supercells.tar.gz",
+       "size": 9469129,
+       "checksum": "md5:55eaa0217f077157babec26c01947dbb"
+      },
+      "S5_GGAU_barrier_comparison.tar.gz": {
+       "id": "b9c41737-0d32-4aa7-b598-dbbdf4d36d8b",
+       "key": "S5_GGAU_barrier_comparison.tar.gz",
+       "size": 256746340,
+       "checksum": "md5:c922ef77648c8a28412695fc9f8a4bb6"
+      }
+     }
+    }
+   }
+  ],
+  [
+   {
+    "id": 10630244,
+    "conceptrecid": "10075593",
+    "doi": "10.5281/zenodo.10630244",
+    "conceptdoi": "10.5281/zenodo.10075593",
+    "created": "2024-02-15T10:08:45.938287+00:00",
+    "owners": [
+     {
+      "id": "1018308"
+     }
+    ],
+    "links": {
+     "self_html": "https://zenodo.org/records/10630244"
+    },
+    "metadata": {
+     "title": "Computational Prediction of an Antimony-based n-type Transparent Conducting Oxide: F-doped Sb2O5",
+     "resource_type": {
+      "title": "Journal article",
+      "type": "publication",
+      "subtype": "article"
+     },
+     "access_right": "open",
+     "publication_date": "2024-02",
+     "description": "<p>Transparent conducting oxides (TCOs) possess a unique combination of optical transparen",
+     "creators": [
+      {
+       "name": "Li, Ke",
+       "affiliation": "University College London",
+       "orcid": "0009-0000-4544-6514"
+      },
+      {
+       "name": "Willis, Joe",
+       "affiliation": "University College London",
+       "orcid": "0000-0002-1900-2677"
+      }
+     ]
+    },
+    "files": [
+     {
+      "id": "ed0fe280-d597-4ad8-aa94-873019b77df3",
+      "key": "Sb2O5_zenodo.zip",
+      "size": 4930922333,
+      "checksum": "md5:2587904ffa0394e48891a21c610e3a41",
+      "links": {
+       "self": "https://zenodo.org/api/records/10630244/files/Sb2O5_zenodo.zip/content"
+      }
+     },
+     {
+      "id": "a055cef2-6437-45aa-83ee-8b257ee91490",
+      "key": "New_Figures.zip",
+      "size": 11517986,
+      "checksum": "md5:659239692952690df1d3b071da3b5f91",
+      "links": {
+       "self": "https://zenodo.org/api/records/10630244/files/New_Figures.zip/content"
+      }
+     }
+    ]
+   },
+   {
+    "id": "10630244",
+    "created": "2024-02-15T10:08:45.938287+00:00",
+    "pids": {
+     "doi": {
+      "identifier": "10.5281/zenodo.10630244"
+     }
+    },
+    "parent": {
+     "id": "10075593",
+     "access": {
+      "owned_by": {
+       "user": "1018308"
+      }
+     },
+     "pids": {
+      "doi": {
+       "identifier": "10.5281/zenodo.10075593"
+      }
+     }
+    },
+    "access": {
+     "record": "public",
+     "files": "public",
+     "embargo": {
+      "active": false,
+      "reason": null
+     },
+     "status": "open"
+    },
+    "links": {
+     "self_html": "https://zenodo.org/records/10630244"
+    },
+    "custom_fields": {},
+    "metadata": {
+     "title": "Computational Prediction of an Antimony-based n-type Transparent Conducting Oxide: F-doped Sb2O5",
+     "resource_type": {
+      "id": "publication-article",
+      "title": {
+       "en": "Journal article"
+      }
+     },
+     "publication_date": "2024-02",
+     "description": "<p>Transparent conducting oxides (TCOs) possess a unique combination of optical transparen",
+     "rights": [],
+     "creators": [
+      {
+       "person_or_org": {
+        "type": "personal",
+        "name": "Li, Ke",
+        "identifiers": [
+         {
+          "identifier": "0009-0000-4544-6514",
+          "scheme": "orcid"
+         }
+        ]
+       },
+       "affiliations": [
+        {
+         "name": "University College London"
+        },
+        {
+         "name": "Thomas Young Centre"
+        }
+       ]
+      },
+      {
+       "person_or_org": {
+        "type": "personal",
+        "name": "Willis, Joe",
+        "identifiers": [
+         {
+          "identifier": "0000-0002-1900-2677",
+          "scheme": "orcid"
+         }
+        ]
+       },
+       "affiliations": [
+        {
+         "name": "University College London"
+        },
+        {
+         "name": "Thomas Young Centre"
+        }
+       ]
+      }
+     ]
+    },
+    "files": {
+     "entries": {
+      "Sb2O5_zenodo.zip": {
+       "id": "ed0fe280-d597-4ad8-aa94-873019b77df3",
+       "key": "Sb2O5_zenodo.zip",
+       "size": 4930922333,
+       "checksum": "md5:2587904ffa0394e48891a21c610e3a41"
+      },
+      "New_Figures.zip": {
+       "id": "a055cef2-6437-45aa-83ee-8b257ee91490",
+       "key": "New_Figures.zip",
+       "size": 11517986,
+       "checksum": "md5:659239692952690df1d3b071da3b5f91"
+      }
+     }
+    }
+   }
+  ],
+  [
+   {
+    "id": 16809186,
+    "conceptrecid": "16808990",
+    "doi": "10.5281/zenodo.16809186",
+    "conceptdoi": "10.5281/zenodo.16808990",
+    "created": "2025-08-11T22:54:26.508517+00:00",
+    "owners": [
+     {
+      "id": "253479"
+     }
+    ],
+    "links": {
+     "self_html": "https://zenodo.org/records/16809186"
+    },
+    "metadata": {
+     "title": "Griffin-Group/hat-cu-chirality-dft-data",
+     "resource_type": {
+      "title": "Dataset",
+      "type": "dataset"
+     },
+     "license": {
+      "id": "mit-license"
+     },
+     "access_right": "open",
+     "publication_date": "2025-08-11",
+     "related_identifiers": [
+      {
+       "identifier": "https://github.com/Griffin-Group/hat-cu-chirality-dft-data/tree/v1.0.1",
+       "relation": "isSupplementTo",
+       "resource_type": "software",
+       "scheme": "url"
+      },
+      {
+       "identifier": "10.1002/sstr.202500422",
+       "relation": "isSupplementTo",
+       "resource_type": "publication-article",
+       "scheme": "doi"
+      }
+     ],
+     "description": "<p>DFT data for \"Tuning Interface Electronic Properties via Chiral 2D Metal-Organic Framew",
+     "creators": [
+      {
+       "name": "Bernard Field",
+       "affiliation": "Lawrence Berkeley National Laboratory"
+      }
+     ]
+    },
+    "files": [
+     {
+      "id": "16dfaa56-ebe6-4404-84ff-4bcf77f4f328",
+      "key": "Griffin-Group/hat-cu-chirality-dft-data-v1.0.1.zip",
+      "size": 352168415,
+      "checksum": "md5:a4f52c8b9b9d87fbcbeb672bb2b4036e",
+      "links": {
+       "self": "https://zenodo.org/api/records/16809186/files/Griffin-Group/hat-cu-chirality-dft-data-v1.0.1.zip/content"
+      }
+     },
+     {
+      "id": "c477a108-6939-4053-b30e-4b7fc681b894",
+      "key": "hat-cu-chirality-dft-data-large-files.tar",
+      "size": 3141580288,
+      "checksum": "md5:506729872fc80c8725cccc8cb702812a",
+      "links": {
+       "self": "https://zenodo.org/api/records/16809186/files/hat-cu-chirality-dft-data-large-files.tar/content"
+      }
+     }
+    ]
+   },
+   {
+    "id": "16809186",
+    "created": "2025-08-11T22:54:26.508517+00:00",
+    "pids": {
+     "doi": {
+      "identifier": "10.5281/zenodo.16809186"
+     }
+    },
+    "parent": {
+     "id": "16808990",
+     "access": {
+      "owned_by": {
+       "user": "253479"
+      }
+     },
+     "pids": {
+      "doi": {
+       "identifier": "10.5281/zenodo.16808990"
+      }
+     }
+    },
+    "access": {
+     "record": "public",
+     "files": "public",
+     "embargo": {
+      "active": false,
+      "reason": null
+     },
+     "status": "open"
+    },
+    "links": {
+     "self_html": "https://zenodo.org/records/16809186"
+    },
+    "custom_fields": {},
+    "metadata": {
+     "title": "Griffin-Group/hat-cu-chirality-dft-data",
+     "resource_type": {
+      "id": "dataset",
+      "title": {
+       "en": "Dataset"
+      }
+     },
+     "publication_date": "2025-08-11",
+     "description": "<p>DFT data for \"Tuning Interface Electronic Properties via Chiral 2D Metal-Organic Framew",
+     "rights": [
+      {
+       "id": "mit"
+      },
+      {
+       "id": "cc-by-4.0"
+      }
+     ],
+     "creators": [
+      {
+       "person_or_org": {
+        "type": "personal",
+        "name": "Bernard Field"
+       },
+       "affiliations": [
+        {
+         "name": "Lawrence Berkeley National Laboratory"
+        }
+       ]
+      }
+     ],
+     "related_identifiers": [
+      {
+       "identifier": "https://github.com/Griffin-Group/hat-cu-chirality-dft-data/tree/v1.0.1",
+       "scheme": "url",
+       "relation_type": {
+        "id": "issupplementto"
+       },
+       "resource_type": {
+        "id": "software"
+       }
+      },
+      {
+       "identifier": "10.1002/sstr.202500422",
+       "scheme": "doi",
+       "relation_type": {
+        "id": "issupplementto"
+       },
+       "resource_type": {
+        "id": "publication-article"
+       }
+      }
+     ]
+    },
+    "files": {
+     "entries": {
+      "Griffin-Group/hat-cu-chirality-dft-data-v1.0.1.zip": {
+       "id": "16dfaa56-ebe6-4404-84ff-4bcf77f4f328",
+       "key": "Griffin-Group/hat-cu-chirality-dft-data-v1.0.1.zip",
+       "size": 352168415,
+       "checksum": "md5:a4f52c8b9b9d87fbcbeb672bb2b4036e"
+      },
+      "hat-cu-chirality-dft-data-large-files.tar": {
+       "id": "c477a108-6939-4053-b30e-4b7fc681b894",
+       "key": "hat-cu-chirality-dft-data-large-files.tar",
+       "size": 3141580288,
+       "checksum": "md5:506729872fc80c8725cccc8cb702812a"
+      }
+     }
+    }
+   }
+  ],
+  [
+   {
+    "id": 13888307,
+    "conceptrecid": "13888306",
+    "doi": "10.5281/zenodo.13888307",
+    "conceptdoi": "10.5281/zenodo.13888306",
+    "created": "2025-04-07T14:42:52.230308+00:00",
+    "owners": [
+     {
+      "id": "134718"
+     }
+    ],
+    "links": {
+     "self_html": "https://zenodo.org/records/13888307"
+    },
+    "metadata": {
+     "title": "Intrinsic point defect tolerance in selenium for indoor and tandem photovoltaics",
+     "resource_type": {
+      "title": "Dataset",
+      "type": "dataset"
+     },
+     "license": {
+      "id": "cc-by-4.0"
+     },
+     "access_right": "open",
+     "publication_date": "2024-10-04",
+     "communities": [
+      {
+       "id": "wmd-group"
+      }
+     ],
+     "related_identifiers": [
+      {
+       "identifier": "10.26434/chemrxiv-2024-91h02-v2",
+       "relation": "isSupplementTo",
+       "resource_type": "publication-preprint",
+       "scheme": "doi"
+      },
+      {
+       "identifier": "10.1039/D4EE04647A",
+       "relation": "isSupplementTo",
+       "resource_type": "publication-article",
+       "scheme": "doi"
+      }
+     ],
+     "journal": {
+      "title": "Energy & Environmental Science"
+     },
+     "description": "<p>Accompanying data &amp; analysis notebooks for 'Intrinsic point defect tolerance in sel",
+     "creators": [
+      {
+       "name": "Kavanagh, Se\u00e1n R.",
+       "affiliation": "Harvard University Center for the Environment (HUCE)",
+       "orcid": "0000-0003-4577-9647"
+      }
+     ]
+    },
+    "files": [
+     {
+      "id": "ffea7af7-2c69-4332-9552-93172d03a1cb",
+      "key": "Rasmus_Expt_Data.xlsx",
+      "size": 275071,
+      "checksum": "md5:4f3467ef83b7b28dee9e4e2d7cb74333",
+      "links": {
+       "self": "https://zenodo.org/api/records/13888307/files/Rasmus_Expt_Data.xlsx/content"
+      }
+     },
+     {
+      "id": "ec0068b1-af79-4438-a962-42427328d760",
+      "key": "Zenodo.zip",
+      "size": 19592469794,
+      "checksum": "md5:17fe11d48fb0c333cc02b6a4df974d5e",
+      "links": {
+       "self": "https://zenodo.org/api/records/13888307/files/Zenodo.zip/content"
+      }
+     }
+    ]
+   },
+   {
+    "id": "13888307",
+    "created": "2025-04-07T14:42:52.230308+00:00",
+    "pids": {
+     "doi": {
+      "identifier": "10.5281/zenodo.13888307"
+     }
+    },
+    "parent": {
+     "id": "13888306",
+     "access": {
+      "owned_by": {
+       "user": "134718"
+      }
+     },
+     "communities": {
+      "entries": [
+       {
+        "id": "61a0c21e-a50e-42d2-8226-d4eff8157a84",
+        "slug": "wmd-group"
+       }
+      ]
+     },
+     "pids": {
+      "doi": {
+       "identifier": "10.5281/zenodo.13888306"
+      }
+     }
+    },
+    "access": {
+     "record": "public",
+     "files": "public",
+     "embargo": {
+      "active": false,
+      "reason": null
+     },
+     "status": "open"
+    },
+    "links": {
+     "self_html": "https://zenodo.org/records/13888307"
+    },
+    "custom_fields": {
+     "journal:journal": {
+      "title": "Energy & Environmental Science"
+     }
+    },
+    "metadata": {
+     "title": "Intrinsic point defect tolerance in selenium for indoor and tandem photovoltaics",
+     "resource_type": {
+      "id": "dataset",
+      "title": {
+       "en": "Dataset"
+      }
+     },
+     "publication_date": "2024-10-04",
+     "description": "<p>Accompanying data &amp; analysis notebooks for 'Intrinsic point defect tolerance in sel",
+     "rights": [
+      {
+       "id": "cc-by-4.0"
+      }
+     ],
+     "creators": [
+      {
+       "person_or_org": {
+        "type": "personal",
+        "name": "Kavanagh, Se\u00e1n R.",
+        "identifiers": [
+         {
+          "identifier": "0000-0003-4577-9647",
+          "scheme": "orcid"
+         }
+        ]
+       },
+       "affiliations": [
+        {
+         "name": "Harvard University Center for the Environment (HUCE)"
+        }
+       ]
+      }
+     ],
+     "related_identifiers": [
+      {
+       "identifier": "10.26434/chemrxiv-2024-91h02-v2",
+       "scheme": "doi",
+       "relation_type": {
+        "id": "issupplementto"
+       },
+       "resource_type": {
+        "id": "publication-preprint"
+       }
+      },
+      {
+       "identifier": "10.1039/D4EE04647A",
+       "scheme": "doi",
+       "relation_type": {
+        "id": "issupplementto"
+       },
+       "resource_type": {
+        "id": "publication-article"
+       }
+      }
+     ]
+    },
+    "files": {
+     "entries": {
+      "Rasmus_Expt_Data.xlsx": {
+       "id": "ffea7af7-2c69-4332-9552-93172d03a1cb",
+       "key": "Rasmus_Expt_Data.xlsx",
+       "size": 275071,
+       "checksum": "md5:4f3467ef83b7b28dee9e4e2d7cb74333"
+      },
+      "Zenodo.zip": {
+       "id": "ec0068b1-af79-4438-a962-42427328d760",
+       "key": "Zenodo.zip",
+       "size": 19592469794,
+       "checksum": "md5:17fe11d48fb0c333cc02b6a4df974d5e"
+      }
+     }
+    }
+   }
+  ]
+ ]
+}

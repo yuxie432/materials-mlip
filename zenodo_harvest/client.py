@@ -103,13 +103,18 @@ class ZenodoClient:
         if wait > 0:
             time.sleep(wait)
 
-    def _get(self, path: str, params: dict[str, Any] | None = None, max_retries: int = 5) -> dict:
+    def _get(self, path: str, params: dict[str, Any] | None = None, max_retries: int = 5,
+             headers: dict[str, str] | None = None) -> dict:
         url = f"{self.base}{path}"
+        # per-request headers (e.g. another serializer's Accept) only when asked for
+        kwargs: dict[str, Any] = {"params": params, "timeout": 60}
+        if headers:
+            kwargs["headers"] = headers
         attempt = 0
         while True:
             self._throttle()
             try:
-                resp = self.session.get(url, params=params, timeout=60)
+                resp = self.session.get(url, **kwargs)
             except requests.RequestException as exc:
                 # Transient network failure (ConnectionError/ReadTimeout/…): retry
                 # on the SAME budget as a 5xx (exponential backoff), then give up
