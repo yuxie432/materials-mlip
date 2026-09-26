@@ -53,6 +53,12 @@ ZENODO_CENSUS_DATA=$HOME/zc_smoke python -m zenodo_census.cli -v census \
 C1=$(sbatch --parsable scripts/csd3/census/10_census.sh)
 C2=$(sbatch --parsable --dependency=afterok:$C1 scripts/csd3/census/20_score.sh)
 python -m zenodo_census.cli status            # any time (read-only)
+#    If 10_census.sh FAILS (its .err ends in a traceback; 20_score.sh is then cancelled by the
+#    dependency): fix the cause, `git pull`, and submit the same two lines again — finished windows
+#    are skipped, the unfinished one is re-paged (duplicate lines are harmless), finished link pulls
+#    return at once. Records Zenodo's JSON serializer cannot return are handled in-run and listed in
+#    $ZENODO_CENSUS_DATA/census.jsonl.poison.jsonl; a long Zenodo outage stops the job cleanly
+#    ("ZenodoOutage ... resubmit to resume").
 #    -> REVIEW / send $ZENODO_CENSUS_DATA/score_report.json: tier sizes, the peek workload,
 #       the known-miss probes, the Europe PMC coverage.
 

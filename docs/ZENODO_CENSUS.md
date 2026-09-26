@@ -6,10 +6,12 @@ every record that could hold VASP output, scored offline and peeked selectively 
 taken. Everything under "measured" was obtained live on **2026-09-25**. CSD3 runbook:
 `scripts/csd3/census/README.md`.
 
-> **Status (2026-09-25): BUILT, offline-tested (61 census tests incl. a census → triage → shared
+> **Status (2026-09-26): BUILT, offline-tested (71 census tests incl. a census → triage → shared
 > fetch → parse → verify run), live-smoked (census stage, link parsers), and independently reviewed
-> (two review passes; every finding fixed with a regression test — §12); not yet run on CSD3.**
-> Results go in §11 after the runs.
+> (two review passes; every finding fixed with a regression test — §12). First CSD3 census run
+> (job 36358803): 79 windows / 462,524 records (2013 → 2026-06-20) and both link channels done, then
+> it died on a record Zenodo's own JSON serializer cannot return — the census now routes around such
+> records without losing them (§2); resubmit to resume (~1 h left).** Results go in §11.
 
 ---
 
@@ -74,6 +76,36 @@ bisects the same windows (the census is a snapshot of that range; `--fresh` star
 final line left by a kill is cut before any append. `iter_census` yields the deduplicated view
 (newest version per concept). Live smoke: one day = 199 records in 2 pages, 17 s.
 
+**Records Zenodo cannot serialize (measured 2026-09-26).** The first CSD3 run died after 3 h on page 25
+of the window `2026-06-20T00:45 … 2026-06-29T19:52:30`: HTTP 500 on all six attempts, and still 500
+twenty hours later — deterministic, not an outage. Bisecting that page with bodiless `HEAD` requests
+(10 × size 10, then 10 × size 1) isolated **one** record at offset 2486, `20797668` ("ACTRIS/EARLINET
+Level 3 2000-2021 climatological dataset", atmospheric lidar data; its 99 page neighbours serialize
+fine). Zenodo's default ("legacy") JSON serializer fails on it everywhere — `/api/records/20797668`
+is a 500 too — while InvenioRDM's own serializer (`Accept: application/vnd.inveniordm.v1+json`)
+returns it. Not the cause: its custom rights entry (1,749 such records passed in the finished range);
+the likely trigger is its only location being a geometry-only `Polygon` (point locations without a
+place passed). So `CensusClient` now:
+
+* on a page that still fails after the usual retries, first checks that Zenodo answers at all — a
+  probe for a page past the end, which returns `hits.total` without serializing any hit (verified) —
+  and waits out an outage (60 s doubling to 10 min, up to an hour, then stops resumably) instead of
+  mistaking it for broken records;
+* if Zenodo answers, splits the page into aligned sub-pages (100 → 10 → 1), so every record the
+  default serializer can return still comes from it, and reads each record that still fails from the
+  native serializer, rewritten into the default shape by `legacy_from_native` — **exact** for every
+  field the census keeps (checked on nine live records in both serializations: identical `slim_hit`
+  and keep-list entries) and tagged `_serializer: "inveniordm"`;
+* logs each such record to `census.jsonl.poison.jsonl` (the native hit; a record neither serializer
+  returns — none seen — is listed with its window and offset, never dropped silently), and counts
+  them in the run summary (`poison_converted` / `poison_unresolved`);
+* counts a window whose newest hit is such a record with the same probe, and serves
+  `search_page` (the `resolve` step's batched lookups) through the native serializer when the default
+  one fails.
+
+The cost is ~2 min per such record; none occurred in the first 462k records, and the record's
+community (`actris-ares`) holds 48 records in all.
+
 ---
 
 ## 3. Signals and tiers (stage 0'', offline)
@@ -125,8 +157,8 @@ without really examining them — archives it did not recognise (`.aiida`, `.txz
 
 | channel | source | size / cost |
 |---|---|---|
-| paper → dataset | DataCite event store: `/events?prefix=10.5281&source-id=crossref&relation-type-id=references` (Crossref reference lists citing Zenodo DOIs). DataCite's per-DOI `citationCount` is mostly the depositor's own `IsSupplementTo` links (already in the census) and list responses omit the citing DOIs. | 46,171 links, ~47 cursor pages |
-| data availability | Europe PMC full text: `("VASP" OR "Vienna ab initio" …) AND zenodo` → Zenodo ids in each OA paper (PMC by PMCID, preprints by their `PPR` id) | 592 hits (7 preprints) |
+| paper → dataset | DataCite event store: `/events?prefix=10.5281&source-id=crossref&relation-type-id=references` (Crossref reference lists citing Zenodo DOIs). DataCite's per-DOI `citationCount` is mostly the depositor's own `IsSupplementTo` links (already in the census) and list responses omit the citing DOIs. | 46,190 events, 47 cursor pages → 46,133 links (the rest name no parseable Zenodo id) |
+| data availability | Europe PMC full text: `("VASP" OR "Vienna ab initio" …) AND zenodo` → Zenodo ids in each OA paper (PMC by PMCID, preprints by their `PPR` id) | 592 hits (7 preprints) → 572 full texts, 554 naming a Zenodo id; 20 answer HTTP 500 persistently (the publisher does not allow the XML — NCBI's copy of one is front matter only); re-tried each run, not cached |
 | versions | papers often cite a VERSION DOI while the census holds the newest version: batched `recid:(a OR b …)` searches with `all_versions=true` map ids to concepts | ≤ ~250 searches |
 | paper verdict | OpenAlex singleton lookup per DOI (free; list/filter calls are metered since 2026 — anonymous $0.10/day, $1/day with a free key): `referenced_works` ∩ {Kresse–Furthmüller 1996 PRB/CMS, Kresse–Joubert 1999, Blöchl 1994, Kresse–Hafner 1993/1994} + primary-topic field. Only papers of records still in T2/T3 are looked up. | ~50k lookups at ≤ 8/s |
 
@@ -211,6 +243,10 @@ See `scripts/csd3/census/README.md`: `10_census.sh` (census + link pulls) → `2
 
 ## 9. Shared-code changes (backward-compatible)
 
+* `zenodo_harvest/client.py`: `ZenodoClient._get` takes optional per-request `headers` (the census
+  asks for the native serializer with an `Accept` header); they are passed to the session only when
+  given, so existing callers and test doubles see exactly the old call.
+
 * `materials_cloud_harvest/remote_zip.py`: `read_central_directory` / `peek_archive` take an optional
   `size` (tail read as an ordinary range — the Zenodo suffix-range bug above); without it the
   behaviour is unchanged. `peek_archive` also turns a body that breaks mid-read
@@ -247,9 +283,18 @@ See `scripts/csd3/census/README.md`: `10_census.sh` (census + link pulls) → `2
 
 ## 11. Results
 
-*(to be filled after the CSD3 runs: census size, tier sizes, link coverage, triage funnel and yield
-per signal, residual rate + extrapolation, Europe PMC coverage / recall of the keyword method, the
-Kavanagh probes, pipeline outcome.)*
+### First census run — CSD3 job 36358803 (2026-09-25, FAILED after 3 h 05 min, resumable)
+
+| step | outcome |
+|---|---|
+| census | 79 leaf windows contiguous from 2013-01-01 to 2026-06-20T00:45 = **462,524 records** (+2,400 lines of the unfinished 80th window, harmless duplicates), 3 h 03 min at ~26 req/min — on the planned pace. Died on the record above (`20797668`); bounds `2013-01-01 … 2026-09-25` fixed. |
+| still to do | **121,468 records** created 2026-06-20T00:45 … 2026-09-26 (counted live 2026-09-26; the summer of 2026 is dense) ≈ 1,300 pages ≈ 1 h on resume, after ~6 min of count calls that re-derive the finished windows (their counts moved by 78 records in all, too little to change any leaf). |
+| DataCite links | complete: 46,133 links (47 pages, ~2 min). |
+| Europe PMC | complete bar 20 papers with no downloadable XML (above): 572 / 592. |
+
+*(to be filled after the remaining runs: census size, tier sizes, link coverage, triage funnel and
+yield per signal, residual rate + extrapolation, Europe PMC coverage / recall of the keyword method,
+the Kavanagh probes, pipeline outcome.)*
 
 ---
 

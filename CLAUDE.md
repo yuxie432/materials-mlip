@@ -23,7 +23,9 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
 (blind-spot discovery → combined curated corpus → MLIP value study) is `docs/FURTHER_WORK.md`.**
 **Part A (blind-spot discovery) is BUILT as `zenodo_census/` — a census of every archive-bearing
 Zenodo record scored offline + selectively peeked, feeding the ordinary pipeline
-(`docs/ZENODO_CENSUS.md`, `scripts/csd3/census/`); CSD3 runs pending.**
+(`docs/ZENODO_CENSUS.md`, `scripts/csd3/census/`). First CSD3 census run: 462,524 of ~584k records,
+then died on a record Zenodo's own JSON serializer cannot return (fixed: native-serializer fallback,
+`docs/ZENODO_CENSUS.md` §2); resume pending.**
 
 ## Code layout & commands
 
@@ -483,7 +485,9 @@ Not a source but a Zenodo discovery front-end, with its own `CLAUDE.md`:
   compatible): `materials_cloud_harvest/remote_zip.py` takes an optional `size=` (Zenodo breaks
   suffix ranges longer than the file), retries a 416 from a stale size, and reports a mid-read
   failure as a failed peek; `zenodo_harvest/models.is_reusable_license` treats `other-closed` as not
-  reusable.
+  reusable; `zenodo_harvest/client.ZenodoClient._get` takes optional per-request `headers` (the
+  census's fallback to InvenioRDM's native serializer for records Zenodo's default JSON serializer
+  answers with HTTP 500 — measured on `20797668`).
 
 ## Scope and starting point
 

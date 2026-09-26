@@ -4,7 +4,10 @@ Not a new data source: a **replacement discovery front-end for Zenodo** that fin
 keyword search cannot see, and hands the ORDINARY Zenodo pipeline a standard keep-list (same fetch,
 parse, store, schema and calc_ids `zenodo:<recid>:<path>` as the existing dataset). Design,
 measurements and user decisions: `docs/ZENODO_CENSUS.md`; CSD3 runbook: `scripts/csd3/census/`.
-Status 2026-09-25: built + offline-tested + live-smoked; not yet run on CSD3.
+Status 2026-09-26: built + offline-tested + live-smoked. First CSD3 census run (job 36358803): 79 windows /
+462,524 records + both link channels, then died on a record Zenodo's default JSON serializer cannot return
+(`20797668`, HTTP 500 everywhere) — now routed around losslessly (below); resubmit `10_census.sh` to resume
+(121,468 records ≈ 1 h left).
 
 Why (measured live 2026-09-25): Zenodo's `q` sees metadata text only; beyond that, an `&nbsp;` glues
 words into one token (`4541602` "ab initio&nbsp;defect" matches neither), quoted phrases are not
@@ -18,7 +21,15 @@ has no computation word at all, and the keyword discover's cut-off is 2026-07-30
     page size 100 (token; 25 anonymous) ≈ 5.8k pages ≈ 3.4 h. `CensusClient` paces request STARTS
     (2.2 s; the shared client waits after each response, which doubled the run). `slim_hit` keeps what
     `Candidate.from_record` reads + `owners` (depositor account), ORCIDs, communities, related ids,
-    references, notes. Leaf-window sentinels (`census.jsonl.windows.jsonl`) for resume, the first
+    references, notes. **Serializer-proof** (2026-09-26): a page that still fails after the retries is
+    first checked against a health probe (a page past the end: `hits.total`, no hit serialized) — an
+    outage is waited out (60 s doubling, ≤ 1 h, then `ZenodoOutage`, resumable), never taken for bad
+    records; otherwise it is split into aligned sub-pages (100 → 10 → 1) and each record that still
+    fails is read from InvenioRDM's native serializer (`Accept: application/vnd.inveniordm.v1+json`),
+    rewritten by `legacy_from_native` (exact for every kept field — checked on live pairs, fixture
+    `tests/zenodo_serializer_pairs.json`), tagged `_serializer: "inveniordm"` and logged to
+    `census.jsonl.poison.jsonl` (summary `poison_converted`/`poison_unresolved`); `count` and
+    `search_page` (used by `resolve`) fall back the same way. Leaf-window sentinels (`census.jsonl.windows.jsonl`) for resume, the first
     run's `created` range fixed in `census.jsonl.bounds.json` (a later-day resume must bisect the
     same windows); `truncate_torn_tail` cuts a torn last line before ANY append (used by every
     writer in the package — census, links, peek cache); `iter_census` = newest version per concept,
@@ -70,9 +81,11 @@ has no computation word at all, and the keyword discover's cut-off is 2026-07-30
     recid AND concept. Writes `<out>` (Candidate dicts, files pruned, `census` bookkeeping),
     `<out>.report.json` (Wilson-CI residual rate — all positives AND `rate_primary`, the strict
     go/no-go — + extrapolation, yield per signal, probes), `<out>.rejections.jsonl` (rewritten).
-- Shared-code change (backward-compatible): `materials_cloud_harvest/remote_zip.py` —
+- Shared-code changes (backward-compatible): `materials_cloud_harvest/remote_zip.py` —
   `read_central_directory`/`peek_archive` accept `size=` (ordinary-range tail read) and report a body
-  that breaks mid-read as a failed peek instead of raising. `zenodo_harvest` is untouched.
+  that breaks mid-read as a failed peek instead of raising; `zenodo_harvest/client.py` —
+  `ZenodoClient._get(headers=…)`, passed to the session only when given (the native-serializer
+  `Accept`); `zenodo_harvest/models.is_reusable_license` treats `other-closed` as not reusable.
 - Offline tests: `tests/test_zenodo_census.py` (census resume/dedup/torn lines/pacing; signals incl.
   the real metadata of the three hidden Kavanagh records; exclusions/seeds/score/EPMC coverage; link
   parsers + resume; head-peeks over real tar/gz/bz2/xz/zst/GNU/PAX streams; Zenodo's broken suffix
