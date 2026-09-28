@@ -23,9 +23,8 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
 (blind-spot discovery → combined curated corpus → MLIP value study) is `docs/FURTHER_WORK.md`.**
 **Part A (blind-spot discovery) is BUILT as `zenodo_census/` — a census of every archive-bearing
 Zenodo record scored offline + selectively peeked, feeding the ordinary pipeline
-(`docs/ZENODO_CENSUS.md`, `scripts/csd3/census/`). First CSD3 census run: 462,524 of ~584k records,
-then died on a record Zenodo's own JSON serializer cannot return (fixed: native-serializer fallback,
-`docs/ZENODO_CENSUS.md` §2); resume pending.**
+(`docs/ZENODO_CENSUS.md`, `scripts/csd3/census/`). Census COMPLETE + scored on CSD3 (583,930 records;
+T1 2,932 / T2 33,046; all 4 known keyword misses in T1); triage next (T1 first).**
 
 ## Code layout & commands
 

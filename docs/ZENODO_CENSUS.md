@@ -6,12 +6,11 @@ every record that could hold VASP output, scored offline and peeked selectively 
 taken. Everything under "measured" was obtained live on **2026-09-25**. CSD3 runbook:
 `scripts/csd3/census/README.md`.
 
-> **Status (2026-09-26): BUILT, offline-tested (71 census tests incl. a census → triage → shared
-> fetch → parse → verify run), live-smoked (census stage, link parsers), and independently reviewed
-> (two review passes; every finding fixed with a regression test — §12). First CSD3 census run
-> (job 36358803): 79 windows / 462,524 records (2013 → 2026-06-20) and both link channels done, then
-> it died on a record Zenodo's own JSON serializer cannot return — the census now routes around such
-> records without losing them (§2); resubmit to resume (~1 h left).** Results go in §11.
+> **Status (2026-09-28): census COMPLETE (583,930 records, every one of the 303 dataset records
+> among them) and SCORED on CSD3 — T1 2,932 · T2 33,046 · T3 344,689 · T0 200,743; all four known
+> keyword misses are T1 (§11). Next: triage (peeks), T1 first. The first census run died on a record
+> Zenodo's own JSON serializer cannot return; the census now routes around such records (§2).** 72
+> offline census tests; two review passes (§12).
 
 ---
 
@@ -149,7 +148,11 @@ metadata or every manifest is missing (a wrong data root would otherwise re-admi
 NC filter dropped unevaluated. **Re-checked, not excluded**: keyword candidates the old triage dropped
 without really examining them — archives it did not recognise (`.aiida`, `.txz`, `.tzst`, bare
 `.zst` …, which ranked such records below its gate) and zips ≥ 100 MB that its 16-bit entry-count bug
-(fixed 2026-09-24) may have "proven" empty. Records in a keep-list (fetched) are always final.
+(fixed 2026-09-24) may have "proven" empty — matched on recid or concept (the census's newer version
+of such a candidate is re-checked too), and always peeked: one the census signals put in T3 / T0 is
+promoted to T2 (reason `keyword_recheck`, the signal tier kept as `tier_by_signals`; added
+2026-09-28 after the first scoring left some unpeeked). Records in a keep-list (fetched) are always
+final.
 
 ---
 
@@ -292,9 +295,60 @@ See `scripts/csd3/census/README.md`: `10_census.sh` (census + link pulls) → `2
 | DataCite links | complete: 46,133 links (47 pages, ~2 min). |
 | Europe PMC | complete bar 20 papers with no downloadable XML (above): 572 / 592. |
 
-*(to be filled after the remaining runs: census size, tier sizes, link coverage, triage funnel and
-yield per signal, residual rate + extrapolation, Europe PMC coverage / recall of the keyword method,
-the Kavanagh probes, pipeline outcome.)*
+### Census COMPLETE — CSD3 job 36465881 (2026-09-26, resume, 56 min)
+
+| | |
+|---|---|
+| resume | 79 finished windows skipped after ~7 min of count calls; the unfinished window re-paged, its page 25 isolated in 2.7 min (`20797668` read through the native serializer); 17 new windows, 121,441 records. |
+| census | **583,930 records** (586,365 lines = + 2,400 duplicate lines of the re-paged window + 35 concepts seen in two versions), 96 contiguous `created` windows 2013-01-01 → 2026-09-26; 1 record converted from the native serializer, 0 unresolved; 4 h 00 min of paging in all. |
+| check | **all 303 dataset records are in the census** — the archive / loose-VASP query misses none of the known VASP records. |
+
+### Scoring — CSD3 job 36465906 (2026-09-26, 2 h 32 min)
+
+| step | outcome |
+|---|---|
+| links top-up | no-op (DataCite complete; the same 20 Europe PMC papers still HTTP 500) |
+| resolve | 19,888 cited ids → 18,090 concepts, 1,798 unknown (deleted / restricted); 8 min |
+| OpenAlex | 55,001 paper DOIs of still-T2/T3 records: 52,240 found, 2,761 unknown, 0 failed; **232 cite the VASP method papers** (0.4%; 103 of them in Materials Science); 2 h 04 min at 8/s |
+| score | 581,410 records scored in 9 min: 303 in the dataset and 2,217 evaluated by the keyword harvest excluded, 364 keyword candidates re-admitted for a re-check |
+
+| tier | records | dataset | software | publication | other types | zips | other archives | archive bytes (zip + other) |
+|---|---|---|---|---|---|---|---|---|
+| **T1** | **2,932** | 1,743 | 654 | 397 | 138 | 4,774 | 1,559 | 3.5 + 3.1 TB |
+| T2 | 33,046 | 21,824 | 7,157 | 3,159 | 906 | 52,360 | 32,588 | 54.7 + 31.1 TB |
+| T3 | 344,689 | 87,433 | 193,323 | 47,863 | 16,070 | 462,793 | 149,131 | 331 + 168 TB |
+| T0 | 200,743 | 116,183 | 58,757 | 17,422 | 8,381 | 439,755 | 330,659 | 334 + 220 TB |
+
+Signals (a record can carry several) — T1: DFT + materials text 1,466 · seed ORCID 814 · Europe PMC
+mention 363 · seed depositor account 285 · MLIP + materials text 253 · linked paper cites VASP 242 ·
+"VASP" in the text 113 · VASP-named archive 45 · loose VASP primary 13. T2: linked paper in a
+physical-science field 22,081 · sparse metadata + a materials cue 3,799 · formula 3,298 · materials
+text 3,132 · bulk (> 300-record) seed account 2,883 · DFT text 2,330 · seed name 576 · workflow-named
+file 432 · MLIP text 210 · seed community 181. Licences in T1: 2,840 open · 14 NC · 16 ND · 62 none
+(ND / none go to the review list only if a peek finds VASP).
+
+**Known misses (probes)** — all four T1: `4541602` (text + depositor + ORCID), `13888307` (depositor
++ ORCID), `12518256` (ORCID), `10630244` (Europe PMC + text + ORCID; no licence → review list).
+
+**Recall of the keyword method (Europe PMC)** — the full texts of VASP papers name 627 distinct
+Zenodo records: 48 are in the dataset, 102 were evaluated by the keyword harvest and not harvested,
+**363 were never evaluated (all T1)**, 114 hold no archive. Keyword discovery had examined only 150
+of the 513 archive-bearing records VASP papers point to (29%); among those it examined, 48 (32%)
+held harvestable VASP output.
+
+**Expected gain (before triage — an estimate, not a measurement).** The dataset's records are
+heavy-tailed (median 54 calcs / 408 frames; the top 10 of 303 hold 82% of the frames), so the record
+count is the predictable number: at the 32% rate above, the 363 never-evaluated paper-linked records
+alone hold ~60–120 VASP records (half to the full rate); with the depositor / ORCID / text / paper
+signals of the rest of T1 and the long T2 tail, **~100–400 new records** (+30–130% on 303) is the
+plausible range — tens of thousands of calcs, frames anywhere from ~0.5 M to ~10 M depending on
+whether a few large trajectory sets are among them. Triage turns this into measured numbers
+(`census_keep.report.json`: VASP evidence per record, yield per signal, the residual rate).
+
+**Triage workload** — T1 + T2 = 57,134 zips (~1.3 requests each) + up to 34,147 other archives (one
+≤ 8 MB head read per tar-family stream; rar/7z are not peeked) ≈ 95–110k requests ≈ 21–25 h at
+4.5k/h — about 3× the design estimate, because T2 is 33k (two thirds of it `paper_field`). T1 plus
+the residual (3,000) and negative (300) samples ≈ 15k requests ≈ 3.5 h.
 
 ---
 

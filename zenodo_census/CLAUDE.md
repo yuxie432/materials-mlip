@@ -4,10 +4,10 @@ Not a new data source: a **replacement discovery front-end for Zenodo** that fin
 keyword search cannot see, and hands the ORDINARY Zenodo pipeline a standard keep-list (same fetch,
 parse, store, schema and calc_ids `zenodo:<recid>:<path>` as the existing dataset). Design,
 measurements and user decisions: `docs/ZENODO_CENSUS.md`; CSD3 runbook: `scripts/csd3/census/`.
-Status 2026-09-26: built + offline-tested + live-smoked. First CSD3 census run (job 36358803): 79 windows /
-462,524 records + both link channels, then died on a record Zenodo's default JSON serializer cannot return
-(`20797668`, HTTP 500 everywhere) — now routed around losslessly (below); resubmit `10_census.sh` to resume
-(121,468 records ≈ 1 h left).
+Status 2026-09-28: census COMPLETE on CSD3 (583,930 records incl. all 303 dataset records; the first run
+died on a record Zenodo's default JSON serializer cannot return, `20797668` — now routed around losslessly,
+below) and SCORED: T1 2,932 · T2 33,046 · T3 344,689 · T0 200,743, all 4 known misses T1, 363 records named
+in VASP papers never seen by keyword search (`docs/ZENODO_CENSUS.md` §11). Next: `30_triage.sh`, T1 first.
 
 Why (measured live 2026-09-25): Zenodo's `q` sees metadata text only; beyond that, an `&nbsp;` glues
 words into one token (`4541602` "ab initio&nbsp;defect" matches neither), quoted phrases are not
@@ -55,7 +55,9 @@ has no computation word at all, and the keyword discover's cut-off is 2026-07-30
     `candidates_full`/`keep`/`nc_candidates`/`nc_keep`/`byid_10579527_keep`; NOT
     `candidates_nolicense`, which holds post-cut-off records never evaluated; dropped candidates the
     old triage could not examine — `needs_recheck`: archives invisible to `models.ARCHIVE_EXTS`, or
-    zips ≥ 100 MB under its 16-bit-count bug — are re-checked; the CLI refuses to score without the
+    zips ≥ 100 MB under its 16-bit-count bug — are re-checked, matched on recid OR concept, and always
+    peeked: one the signals put in T3/T0 is promoted to T2 (`keyword_recheck`, `tier_by_signals` kept);
+    the CLI refuses to score without the
     exclusion inputs unless `--allow-missing-exclusions`), `build_seeds`,
     `record_signals`, `lookup_dois` (only papers of still-T2/T3 records), `score` → `scored.jsonl` +
     `score_report.json` (tier × type counts, peek workload, `PROBE_RECIDS` = the 4 Kavanagh misses,
