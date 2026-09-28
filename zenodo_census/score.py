@@ -98,7 +98,8 @@ class Exclusions:
         self.dataset_names: set[str] = set()
         self._kept: set[str] = set()
         self._dropped: dict[str, tuple[str | None, str]] = {}   # recid -> (concept, recheck why)
-        self.recheck: dict[str, str] = {}
+        self.recheck: dict[str, str] = {}                        # recid -> why
+        self._recheck_concepts: dict[str, str] = {}              # conceptrecid -> why
         self.stats: Counter = Counter()
 
     def add_dataset(self, metadata_path: str | Path) -> None:
@@ -150,19 +151,28 @@ class Exclusions:
 
     def _resolve(self) -> None:
         """Re-include dropped-but-unexamined candidates (never a kept one)."""
+        self._recheck_concepts = {}
         for rid, (concept, why) in self._dropped.items():
             if rid in self._kept or (concept and concept in self._kept):
                 self.recheck.pop(rid, None)
                 continue
             self.recheck[rid] = why
+            if concept:
+                self._recheck_concepts[concept] = why
         self.stats["recheck"] = len(self.recheck)
+
+    def recheck_reason(self, rid: str, concept: str | None = None) -> str | None:
+        """Why this record is re-checked, or None — matched on the recid OR the concept, so the
+        census's newer version of a candidate the old triage could not examine is re-checked
+        too rather than excluded as evaluated."""
+        return self.recheck.get(rid) or (self._recheck_concepts.get(concept) if concept else None)
 
     def status(self, rec: dict[str, Any]) -> str | None:
         rid = str(rec.get("id"))
         concept = str(rec.get("conceptrecid") or rid)
         if rid in self.dataset_recids or concept in self.dataset_concepts:
             return "in_dataset"
-        if rid in self.recheck:
+        if self.recheck_reason(rid, concept):
             return None
         if rid in self.evaluated_recids or concept in self.evaluated_concepts:
             return "evaluated"
@@ -294,7 +304,7 @@ def epmc_coverage(epmc: dict[str, set[str]], versions: dict[str, str], excl: Exc
         if zid in excl.dataset_recids or concept in excl.dataset_concepts:
             counts["in_dataset"] += 1
         elif (zid in excl.evaluated_recids or concept in excl.evaluated_concepts) and \
-                zid not in excl.recheck:
+                not excl.recheck_reason(zid, concept):
             counts["evaluated_by_keywords"] += 1
         elif key_tier.get(concept) or key_tier.get(zid):
             counts[f"census_{key_tier.get(concept) or key_tier.get(zid)}"] += 1
@@ -330,7 +340,8 @@ def score(census_path: str | Path, out_path: str | Path, *, excl: Exclusions, se
             rtype = str(rt.get("type") if isinstance(rt, dict) else rt)
             counts["census"] += 1
             ex = excl.status(rec)
-            if rid in excl.recheck:
+            recheck = excl.recheck_reason(rid, str(rec.get("conceptrecid") or rid))
+            if recheck and not ex:
                 counts["recheck_of_keyword_candidates"] += 1
             if ex:
                 counts[f"excluded_{ex}"] += 1
@@ -342,6 +353,11 @@ def score(census_path: str | Path, out_path: str | Path, *, excl: Exclusions, se
             lic_cls = licence_class(lic)
             sig = record_signals(rec, seeds, citing, epmc, openalex)
             tier, why = tier_of(sig)
+            tier_by_signals = tier
+            if recheck and tier in ("T3", "T0"):
+                # the keyword harvest judged it a candidate but its triage could not examine it:
+                # peeked whatever the census signals say
+                tier, why = "T2", ["keyword_recheck"]
             if access not in (None, "open"):
                 tier, why = "X", [f"access_{access}"]
             arch = archive_summary(rec.get("files") or [])
@@ -352,6 +368,9 @@ def score(census_path: str | Path, out_path: str | Path, *, excl: Exclusions, se
                    "tier": tier, "reasons": why, "signals": _compact(sig), **arch,
                    "n_files": len(rec.get("files") or []),
                    "bytes_total": sum(int(f.get("size") or 0) for f in rec.get("files") or [])}
+            if recheck:
+                row["recheck"] = recheck
+                row["tier_by_signals"] = tier_by_signals
             fh.write(json.dumps(row) + "\n")
             if epmc:
                 key_tier[rid] = key_tier[row["conceptrecid"]] = tier

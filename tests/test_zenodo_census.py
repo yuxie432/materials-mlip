@@ -1273,6 +1273,38 @@ def test_exclusions_recheck_what_the_old_triage_could_not_examine(tmp_path):
     assert ex.status({"id": 3, "conceptrecid": "2"}) is None
     assert ex.status({"id": 5, "conceptrecid": "4"}) == "evaluated"
     assert ex.status({"id": 7, "conceptrecid": "6"}) == "evaluated"
+    # the census holds a NEWER version of candidate 3: re-checked too, not excluded as evaluated
+    assert ex.status({"id": 9, "conceptrecid": "2"}) is None
+    assert ex.recheck_reason("9", "2") == ex.recheck["3"]
+
+
+def test_score_always_peeks_keyword_candidates_the_old_triage_could_not_examine(tmp_path):
+    """A recheck candidate the census signals put in T3 / T0 is promoted to T2 (peeked by the
+    default triage); T1/T2 ones keep their tier; a non-open record stays excluded (X)."""
+    cands = _write_jsonl(tmp_path / "candidates_full.jsonl", [
+        {"recid": r, "conceptrecid": str(int(r) - 1), "vasp_rank": 3,
+         "files": [{"key": "big.zip", "size": 300_000_000}]} for r in ("11", "21", "31", "41")])
+    census = _write_jsonl(tmp_path / "census.jsonl", [
+        zc.slim_hit(zhit("11", {"big.zip": 300_000_000}, title="Supplementary files",
+                         concept="10")),                                          # T3 by signals
+        zc.slim_hit(zhit("21", {"big.zip": 300_000_000}, concept="20",
+                         title="Zebrafish neuron imaging, mouse brain, patients, clinical")),
+        zc.slim_hit(zhit("32", {"big.zip": 300_000_000}, concept="30",            # newer version
+                         title="VASP DFT relaxations of perovskite oxides")),     # T1 anyway
+        zc.slim_hit(zhit("41", {"big.zip": 300_000_000}, concept="40", title="Data",
+                         access="restricted")),
+    ])
+    ex = zs.Exclusions()
+    ex.add_manifest(cands)
+    rep = zs.score(census, tmp_path / "scored.jsonl", excl=ex, seeds=sg.Seeds())
+    rows = {r["recid"]: r for r in read_jsonl(tmp_path / "scored.jsonl")}
+    assert rows["11"]["tier"] == "T2" and rows["11"]["reasons"] == ["keyword_recheck"]
+    assert rows["11"]["tier_by_signals"] == "T3" and "16-bit" in rows["11"]["recheck"]
+    assert rows["21"]["tier"] == "T2" and rows["21"]["tier_by_signals"] == "T0"
+    assert rows["32"]["tier"] == "T1" and rows["32"]["tier_by_signals"] == "T1"
+    assert rows["41"]["tier"] == "X"
+    assert rep["counts"]["recheck_of_keyword_candidates"] == 4
+    assert rep["reasons"]["T2:keyword_recheck"] == 2
 
 
 def test_cli_refuses_to_score_without_exclusion_inputs(tmp_path, monkeypatch):
