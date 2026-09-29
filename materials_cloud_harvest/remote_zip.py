@@ -238,6 +238,7 @@ class ZipEvidence:
     nested_aiida: list[str] = field(default_factory=list)  # AiiDA archives inside (extractable)
     aiida_format: str | None = None
     primary_bytes: int = 0                                 # uncompressed bytes of the primaries
+    primary_max_bytes: int = 0                             # ... of the largest one (parse RAM)
     db_status: str | None = None                           # sqlite_zip only (see above)
     db_bytes: int = 0
 
@@ -246,7 +247,7 @@ class ZipEvidence:
              "primary_sample": self.primary[:max_names], "n_vasp_named": self.vasp_any,
              "n_nested": len(self.nested), "nested_sample": self.nested[:max_names],
              "n_nested_aiida": len(self.nested_aiida), "aiida_format": self.aiida_format,
-             "primary_bytes": self.primary_bytes}
+             "primary_bytes": self.primary_bytes, "primary_max_bytes": self.primary_max_bytes}
         if self.db_status is not None:
             d["db_status"], d["db_bytes"] = self.db_status, self.db_bytes
         return d
@@ -273,6 +274,7 @@ def zip_evidence(members: list[ZipMember]) -> ZipEvidence:
             if _unit_role(base) in _PRIMARY_ROLES:
                 ev.primary.append(n)
                 ev.primary_bytes += int(m.uncomp_size or 0)
+                ev.primary_max_bytes = max(ev.primary_max_bytes, int(m.uncomp_size or 0))
         if base.lower().endswith(".aiida"):
             ev.nested_aiida.append(n)
         elif _nested_archive_kind(base) is not None:
@@ -323,7 +325,9 @@ def sqlite_evidence(session: requests.Session, url: str, members: list[ZipMember
             ev.vasp_any += 1
             if _is_primary_name(base):
                 ev.primary.append(f"{ndir}/{rel}")
-                ev.primary_bytes += sizes.get(f"{prefix}repo/{key}", 0)
+                blob = sizes.get(f"{prefix}repo/{key}", 0)
+                ev.primary_bytes += blob
+                ev.primary_max_bytes = max(ev.primary_max_bytes, blob)
     ev.db_status = "ok"
     return ev
 

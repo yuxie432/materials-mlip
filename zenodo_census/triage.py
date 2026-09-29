@@ -50,6 +50,13 @@ from zenodo_harvest.manifest import JsonlWriter, RejectionLogger, read_jsonl
 from zenodo_harvest.models import Candidate
 
 from .census import _records, iter_census, truncate_torn_tail
+from .deeppeek import (
+    DEEP_MAX_REQUESTS,
+    NESTED_MAX_MEMBERS,
+    nested_zip_peek,
+    sevenzip_peek,
+    tar_walk,
+)
 from .headpeek import DEFAULT_HEAD_BYTES, head_peek
 from .score import PROBE_RECIDS, is_github_snapshot
 from .signals import is_loose_primary
@@ -58,6 +65,7 @@ logger = logging.getLogger(__name__)
 
 # Bump when the evidence rules change, so cached verdicts from older rules are re-evaluated.
 EVIDENCE_RULES_VERSION = 2          # v2: strict head names, end-block completeness, fallbacks
+DEEP_RULES_VERSION = 1              # deeppeek verdicts (tar walk, 7z end header, nested in zip)
 _UNCACHED = ("peek_failed", "cd_too_large", "db_too_large", "head_too_small")
 # Zenodo documents 100 req/min + 5,000 req/h for authenticated clients: 0.8 s between request
 # starts is 75/min and 4,500/h.
@@ -210,6 +218,8 @@ def file_verdict(f: dict[str, Any], e: dict[str, Any] | None
         base = key.rsplit("/", 1)[-1]
         return ("empty", None) if _is_compressed_data_file(base) and _is_archive(base) else (
             "loose", f)
+    if e and str(e.get("mode") or "").startswith("deep_") and e.get("status") == "ok":
+        return _deep_verdict(f, e)
     if mode == "none":
         return "unresolved", f
     aiida = key.lower().endswith(".aiida")
@@ -245,6 +255,42 @@ def file_verdict(f: dict[str, Any], e: dict[str, Any] | None
     if n_prim or int(e.get("n_vasp_named") or 0) or int(e.get("n_heavy") or 0):
         return "vasp", as_fetch
     return "unresolved", as_fetch
+
+
+def _deep_verdict(f: dict[str, Any], e: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    """A deeper peek's verdict (``deeppeek``): a primary seen -> ``vasp``; an exact listing with
+    nothing further nested (for a zip: every nested archive listed exactly) -> ``empty``; else the
+    head-peek rule for partial listings (VASP-named or heavy files are evidence)."""
+    as_fetch = {**f, "archive_kind": e["as_kind"]} if e.get("as_kind") else f
+    if int(e.get("n_primary") or 0) > 0:
+        return "vasp", as_fetch
+    if e.get("complete") and (e.get("mode") == "deep_zip" or not int(e.get("n_nested") or 0)):
+        return "empty", None
+    if int(e.get("n_vasp_named") or 0) or int(e.get("n_heavy") or 0):
+        return "vasp", as_fetch
+    return "unresolved", as_fetch
+
+
+def deep_kind(f: dict[str, Any], e: dict[str, Any] | None) -> str | None:
+    """Which deeper peek can settle this file, if any: ``tar`` (an uncompressed tar the head did
+    not cover), ``7z`` (by name, or a 7z in disguise), ``zip`` (a zip whose own listing holds no
+    primary but nests archives). Compressed tar streams and rar have no in-place listing."""
+    base = str(f.get("key") or "").rsplit("/", 1)[-1].lower()
+    mode = _mode(f)
+    if mode == "none":
+        return "7z" if base.endswith(".7z") else None
+    if not e:
+        return None
+    if e.get("status") == "is_7z":
+        return "7z"
+    if e.get("status") != "ok":
+        return None
+    if e.get("mode") == "head" and e.get("kind") == "tar" and not e.get("complete"):
+        return "tar"
+    if (e.get("mode") == "zip" and int(e.get("n_nested") or 0) > 0
+            and not int(e.get("n_primary") or 0)):
+        return "zip"
+    return None
 
 
 def evidence_strength(files: list[dict[str, Any]], ev: dict[str, dict[str, Any]]) -> str:
@@ -346,7 +392,10 @@ def keep_entry(rec: dict[str, Any], row: dict[str, Any], files: list[dict[str, A
                       "peek": {k: {kk: vv for kk, vv in v.items()
                                    if kk in ("mode", "status", "n_members", "n_primary",
                                              "n_vasp_named", "n_heavy", "n_nested",
-                                             "complete", "kind", "aiida_format")}
+                                             "complete", "kind", "aiida_format",
+                                             "primary_bytes", "primary_max_bytes",
+                                             "n_nested_peeked", "n_nested_exact",
+                                             "inner_members", "requests")}
                                for k, v in ev.items()}}
     return cand
 
@@ -361,7 +410,9 @@ def triage(scored_path: str | Path, census_path: str | Path, out_path: str | Pat
            review_path: str | Path | None = None, report_path: str | Path | None = None,
            rejections_path: str | Path | None = None, cache_path: str | Path | None = None,
            max_records: int | None = None, include_github_residual: bool = False,
-           exclude_keep: Iterable[str | Path] = ()) -> dict[str, Any]:
+           exclude_keep: Iterable[str | Path] = (), deep_peek: bool = True,
+           deep_max_requests: int = DEEP_MAX_REQUESTS,
+           nested_max_members: int = NESTED_MAX_MEMBERS) -> dict[str, Any]:
     """Peek, decide, and write the keep-list + licence-review list + report (module docstring).
 
     ``tiers`` are evaluated in full (T3 restricted to ``types``); the residual/negative samples are
@@ -369,7 +420,15 @@ def triage(scored_path: str | Path, census_path: str | Path, out_path: str | Pat
     earlier run's keep-list (``exclude_keep``) are skipped, so a later full-T3 run never re-fetches
     the residual sample. Peek verdicts are cached in ONE file beside the keep-list
     (``peeks.jsonl``, keyed by record/file/size/checksum), shared by every run, so a killed run —
-    or the next one — never repeats a completed read."""
+    or the next one — never repeats a completed read.
+
+    ``deep_peek``: files of records the standard peeks leave unresolved get a second, deeper look
+    (:mod:`.deeppeek` — uncompressed tars walked header to header, 7z end headers, archives nested
+    in zips), cached in the same file; a successful deep verdict replaces the standard one. For T2
+    (no fail-safe) it is the only way VASP inside such archives is found; for a T1 fail-safe record
+    it saves the whole download of an archive proven empty. Whatever stays unresolved in a T1
+    record is still downloaded whole, with no size cap, as in the keyword harvest (user decision
+    2026-09-29)."""
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     review = Path(review_path) if review_path else out.with_name(
@@ -462,6 +521,84 @@ def triage(scored_path: str | Path, census_path: str | Path, out_path: str | Pat
                 rate = i / max(1e-9, time.monotonic() - t0) * 3600
                 logger.info("census triage: peeked %d/%d files (%.0f/h)", i, len(todo), rate)
 
+    def std_ev(rid: str) -> dict[str, dict[str, Any]]:
+        return {str(f.get("key")): cache[_cache_key(m, rid, f, head_bytes)]
+                for f in recs[rid].get("files") or []
+                if (m := _mode(f)) in ("zip", "head") and _cache_key(m, rid, f, head_bytes) in cache}
+
+    def deep_key(kind: str, rid: str, f: dict[str, Any]) -> str:
+        return (f"d{DEEP_RULES_VERSION}\t{kind}\t{rid}\t{f.get('key')}\t{f.get('size')}"
+                f"\t{f.get('checksum')}\tr{deep_max_requests}"
+                + (f"\tm{nested_max_members}" if kind == "zip" else ""))
+
+    def wants_deep(rid: str, ev0: dict[str, dict[str, Any]]) -> bool:
+        """Records the standard peeks leave unresolved — T1 fail-safe (a proof of "no VASP" saves a
+        whole download) or not fetched at all (T2: a VASP find is recall gained). A settled record
+        gains nothing."""
+        files = list(recs[rid].get("files") or [])
+        return deep_peek and decide(str(chosen[rid]["tier"]), files, ev0)[1] in (
+            "strong_unresolved", "unresolved_not_fetched")
+
+    deep_todo: dict[str, tuple[str, dict[str, Any]]] = {}
+    if deep_peek:
+        for rid in order:
+            files = list(recs[rid].get("files") or [])
+            ev0 = std_ev(rid)
+            if not wants_deep(rid, ev0):
+                continue
+            for f in files:
+                kind = deep_kind(f, ev0.get(str(f.get("key"))))
+                if kind:
+                    ck = deep_key(kind, rid, f)
+                    if ck in cache:
+                        stats["deep_cached"] += 1
+                    else:
+                        deep_todo.setdefault(ck, (kind, f))
+
+    def run_deep(item: tuple[str, dict[str, Any]]) -> dict[str, Any]:
+        kind, f = item
+        url = (f.get("links") or {}).get("self") or f.get("download")
+        size = int(f.get("size") or 0)
+        v: dict[str, Any] = {}
+        for attempt in (1, 2):
+            try:
+                if not url or not size:
+                    return {"mode": f"deep_{kind}", "status": "no_download_link"}
+                if kind == "tar":
+                    v = tar_walk(sess(), url, size, max_requests=deep_max_requests)
+                elif kind == "7z":
+                    v = sevenzip_peek(sess(), url, size, max_requests=deep_max_requests,
+                                      name=str(f.get("key") or "").rsplit("/", 1)[-1] or None)
+                else:
+                    v = nested_zip_peek(sess(), url, size, max_members=nested_max_members,
+                                        max_requests=deep_max_requests)
+            except Exception as exc:  # noqa: BLE001 - one bad file must never stop the run
+                v = {"mode": f"deep_{kind}", "status": f"peek_failed: {type(exc).__name__}: "
+                                                      f"{str(exc)[:120]}"}
+            if not str(v.get("status", "")).startswith("peek_failed") or attempt == 2:
+                break
+            time.sleep(5)                                    # one in-run retry
+        return v
+
+    if deep_todo:
+        logger.info("census triage: %d unresolved files get a deeper peek (%d cached)",
+                    len(deep_todo), stats["deep_cached"])
+        t1 = time.monotonic()
+        with JsonlWriter(cache_file) as cw, \
+                ThreadPoolExecutor(max_workers=max(1, peek_workers)) as pool:
+            dfuts = {pool.submit(run_deep, item): ck for ck, item in deep_todo.items()}
+            for i, fut in enumerate(as_completed(dfuts), 1):
+                ck = dfuts[fut]
+                v = fut.result()
+                cache[ck] = v
+                stats[f"deep_{str(v.get('mode'))[5:]}_{str(v.get('status')).split(':', 1)[0]}"] += 1
+                stats["deep_requests"] += int(v.get("requests") or 0)
+                if not str(v.get("status", "")).startswith(_UNCACHED):
+                    cw.write({"k": ck, "v": v})
+                if i % 100 == 0:
+                    logger.info("census triage: deep-peeked %d/%d files (%.0f min)", i,
+                                len(deep_todo), (time.monotonic() - t1) / 60)
+
     rej_path.unlink(missing_ok=True)          # regenerated whole, like the keep-list
     per_record: list[dict[str, Any]] = []
     kept_by: Counter = Counter()
@@ -471,9 +608,19 @@ def triage(scored_path: str | Path, census_path: str | Path, out_path: str | Pat
         for rid in order:
             rec, row = recs[rid], chosen[rid]
             files = list(rec.get("files") or [])
-            ev = {str(f.get("key")): cache[_cache_key(m, rid, f, head_bytes)] for f in files
-                  if (m := _mode(f)) in ("zip", "head")
-                  and _cache_key(m, rid, f, head_bytes) in cache}
+            ev = std_ev(rid)
+            deep_ev: dict[str, dict[str, Any]] = {}
+            if wants_deep(rid, ev):
+                for f in files:
+                    kind = deep_kind(f, ev.get(str(f.get("key"))))
+                    d = cache.get(deep_key(kind, rid, f)) if kind else None
+                    if d and d.get("status") == "ok":
+                        # keep the extractor the standard verdict declared (a zip in disguise, an
+                        # AiiDA export under .aiida / .zip — fetch picks it from the NAME otherwise)
+                        _, std_ff = file_verdict(f, ev.get(str(f.get("key"))))
+                        decl = (std_ff or {}).get("archive_kind")
+                        deep_ev[str(f.get("key"))] = d
+                        ev[str(f.get("key"))] = {**d, **({"as_kind": decl} if decl else {})}
             keep, reason, fetch, nbytes = decide(str(row["tier"]), files, ev)
             gaps = [f"{k}: {v.get('mode')} {v.get('status')}" for k, v in ev.items()
                     if v.get("status") != "ok"]
@@ -487,8 +634,12 @@ def triage(scored_path: str | Path, census_path: str | Path, out_path: str | Pat
             entry = {"recid": rid, "tier": row["tier"], "selected_as": sel,
                      "resource_type": row.get("resource_type"), "title": row.get("title"),
                      "reasons": row.get("reasons"), "licence_class": row.get("licence_class"),
-                     "keep": keep, "reason": reason, "evidence": strength, **nbytes,
-                     "gaps": gaps}
+                     "keep": keep, "reason": reason, "evidence": strength,
+                     "bytes_evidence": nbytes["evidence"], "bytes_blind": nbytes["blind"],
+                     "gaps": gaps,
+                     "deep": {k: {kk: v.get(kk) for kk in ("mode", "n_members", "n_primary",
+                                                           "n_nested_peeked", "complete")}
+                              for k, v in deep_ev.items()}}
             per_record.append(entry)
             if not keep:
                 rej.reject("census_triage", rid, reason, tier=row["tier"], selected_as=sel)
@@ -541,6 +692,7 @@ def triage(scored_path: str | Path, census_path: str | Path, out_path: str | Pat
                         "bytes_evidence": stats["kept_bytes_evidence"],
                         "bytes_blind": stats["kept_bytes_blind"]},
                "licence_review_records": stats["review_records"],
+               "deep_peeks": {k: v for k, v in stats.items() if k.startswith("deep")},
                "samples": sample_stats, "positives_by_signal": dict(positives_by_reason),
                "probes": probes, "minutes": round((time.monotonic() - t0) / 60, 1)}
     report.write_text(json.dumps({"summary": summary, "records": per_record}, indent=1))

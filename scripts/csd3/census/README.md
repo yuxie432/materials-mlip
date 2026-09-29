@@ -62,35 +62,42 @@ python -m zenodo_census.cli status            # any time (read-only)
 #    -> REVIEW / send $ZENODO_CENSUS_DATA/score_report.json: tier sizes, the peek workload,
 #       the known-miss probes, the Europe PMC coverage.
 
-# 3. triage (peeks only — a few MB per archive, nothing staged), after the review. In two stages,
-#    so T1's measured yield (and the residual sample) arrives in ~3.5 h and its pipeline can start
-#    while T2 (~33k records, ~1 day of peeks) is still being triaged; the T2 run skips everything
-#    census_keep_t1.jsonl holds and shares the peek cache:
-TIERS=T1 OUT=$ZENODO_CENSUS_DATA/census_keep_t1.jsonl RESUBMIT=1 sbatch scripts/csd3/census/30_triage.sh
-#    ... later (INTERVAL 1.2 leaves Zenodo request budget for a pipeline running at the same time):
-TIERS=T2 RESIDUAL_SAMPLE=0 NEGATIVE_SAMPLE=0 INTERVAL=1.2 OUT=$ZENODO_CENSUS_DATA/census_keep_t2.jsonl \
+# 3. triage (peeks only — a few MB per archive, nothing staged), after the review. In stages:
+#    T1 first (done 2026-09-28: census_keep_t1.*). Deep peeks (default on) then take a second look
+#    at every archive the standard peeks left unresolved — for a T1 fail-safe record a proof of
+#    "no VASP" saves its whole download; what stays unresolved is still downloaded whole (no cap).
+#    Re-running T1 reuses every cached standard peek, so only the deep peeks cost requests (~3-5 h).
+#    It rewrites census_keep_t1.*, so keep the first run's files (its report holds the residual-sample
+#    result) — in a SUBDIRECTORY: any census_keep_*.jsonl beside them is read as an earlier keep-list
+#    and its records are skipped:
+mkdir -p $ZENODO_CENSUS_DATA/t1_first_run && cp -p $ZENODO_CENSUS_DATA/census_keep_t1.* $ZENODO_CENSUS_DATA/t1_first_run/
+TIERS=T1 RESIDUAL_SAMPLE=0 NEGATIVE_SAMPLE=0 OUT=$ZENODO_CENSUS_DATA/census_keep_t1.jsonl \
   RESUBMIT=1 sbatch scripts/csd3/census/30_triage.sh
-#    (one stage instead: RESUBMIT=1 sbatch scripts/csd3/census/30_triage.sh  -> census_keep.jsonl)
+#    T2 (~33k records; no fail-safe, so deep peeks are its only way into such archives; ~1.5-2 days):
+#    chain it after the T1 re-run, at INTERVAL 1.2 to leave Zenodo request budget for the pipeline
+#    that runs at the same time, and DEEP_MAX_REQUESTS 100 (it only needs to FIND VASP):
+TIERS=T2 RESIDUAL_SAMPLE=0 NEGATIVE_SAMPLE=0 INTERVAL=1.2 DEEP_MAX_REQUESTS=100 \
+  OUT=$ZENODO_CENSUS_DATA/census_keep_t2.jsonl RESUBMIT=1 \
+  sbatch --dependency=afterok:<T1 re-run job> scripts/csd3/census/30_triage.sh
 #    -> REVIEW / send <out>.report.json ("summary" + per-record table) + <out>.licence_review.jsonl
-#       (census_keep_t1.* for the staged run). Check summary.kept.bytes_blind: the T1 records kept
-#       fail-safe on archives no peek could settle are downloaded WHOLE by the pipeline.
-#       If the residual sample's STRICT rate (summary.samples.residual_sample.rate_primary — a
-#       VASP output actually seen, not just INCAR/POSCAR in a partial head) is ~1 in 2,000 or
-#       better, run the whole non-software T3 tier as a second keep-list (~2-3 days of peeks):
-#       TIERS=T3 RESIDUAL_SAMPLE=0 NEGATIVE_SAMPLE=0 OUT=$ZENODO_CENSUS_DATA/census_keep_t3.jsonl \
-#         MAX_ATTEMPTS=12 RESUBMIT=1 sbatch scripts/csd3/census/30_triage.sh
+#       (no-licence and ND records are listed there, NOT in the keep-list). summary.kept.bytes_blind
+#       = what the T1 fail-safe will download whole; summary.deep_peeks = what the deep peeks did.
+#       Residual T3: the 2026-09-28 sample found 0 in 3,000 -> no full T3 run (user decision).
 
-# 4. fetch + parse straight into the production dataset (back up the metadata first; check
-#    `quota` — the valve below leaves room for the NOMAD / MC datasets on the same 1 TB / 1M quota):
+# 4. fetch + parse straight into the production dataset (back up the metadata first; check `quota`).
+#    ONE pipeline at a time (they write the same dataset): census_keep_t1.jsonl, then
+#    census_keep_t2.jsonl. The shape below is sized for the census keep-lists: 8 icelake-himem
+#    cores (~53 GiB) -> 4 parse workers under a 42 GiB RAM budget, cap 3.8 GB per primary (the
+#    keyword harvest had 8 of 182k primaries above 2 GB), 4 fetch workers; the 800 GB / 800k
+#    staging valve (the script's defaults) fits the 1 TB / 1M quota at ~120 GB / 7k files used.
 quota
 cp $ZENODO_HARVEST_DATA/dataset/metadata.jsonl $ZENODO_HARVEST_DATA/dataset/metadata.jsonl.bak.pre_census
-IN=$ZENODO_CENSUS_DATA/census_keep.jsonl RAW_DIR=$ZENODO_HARVEST_DATA/raw_census \
-  MAX_DISK_BYTES=700000000000 MAX_DISK_FILES=700000 RESUBMIT=1 sbatch scripts/csd3/20_pipeline.sh
-python -m zenodo_harvest.cli status --keep $ZENODO_CENSUS_DATA/census_keep.jsonl \
+IN=$ZENODO_CENSUS_DATA/census_keep_t1.jsonl RAW_DIR=$ZENODO_HARVEST_DATA/raw_census \
+  RESUBMIT=1 sbatch scripts/csd3/20_pipeline.sh     # 40 batches (default): lower staging peaks
+python -m zenodo_harvest.cli status --keep $ZENODO_CENSUS_DATA/census_keep_t1.jsonl \
     --manifests-dir $ZENODO_CENSUS_DATA --raw-dir $ZENODO_HARVEST_DATA/raw_census \
     --dataset-dir $ZENODO_HARVEST_DATA/dataset      # progress (read-only; finds the part manifests)
-#    Staged triage: the same command once per keep-list (IN=.../census_keep_t1.jsonl, later
-#    census_keep_t2.jsonl) — ONE pipeline at a time, since both write the production dataset.
+#    then the same with IN=.../census_keep_t2.jsonl once the T1 pipeline has finished.
 ```
 
 ## What bounds each step
@@ -101,7 +108,7 @@ python -m zenodo_harvest.cli status --keep $ZENODO_CENSUS_DATA/census_keep.jsonl
 | links | DataCite ~47 pages (~10 min); Europe PMC ~600 full texts (~10 min) | other hosts — runs beside the census |
 | resolve | ≤ ~250 batched searches (~9 min) | Zenodo search, 30 req/min |
 | openalex | one free singleton lookup per paper DOI of a T2/T3 record (~50k?) at ≤ 8/s | OpenAlex (list calls are metered since 2026; singletons are free) |
-| triage | 1-3 Range reads per zip, 1 per tar (8 MB head). Measured selection (2026-09-26): T1 6.3k files + samples ≈ 15k requests ≈ 3.5 h; T2 ~85k files ≈ 80-95k requests ≈ 18-21 h | Zenodo 100/min + 5,000/h documented → `INTERVAL=0.8` s (4.5k/h) |
+| triage | 1-3 Range reads per zip, 1 per tar (8 MB head); deep peeks of unresolved archives ≤ 300 reads / 256 MiB each. Measured (2026-09-28): T1 + samples 14.8k files in 3 h 26 min; T2 ~85k files ≈ 80-95k requests + deep peeks ≈ 1.5-2 days at `INTERVAL=1.2` | Zenodo 100/min + 5,000/h documented → `INTERVAL=0.8` s (4.5k/h) alone, 1.2 s beside a pipeline |
 | pipeline | whatever the keep-list holds | as the original harvest (bandwidth, disk valve) |
 
 Tuning: `INTERVAL` (seconds between triage request starts — raise it if the log shows repeated

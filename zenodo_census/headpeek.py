@@ -107,17 +107,58 @@ def _tar_size(field_: bytes) -> int | None:
     return int(txt, 8) if _OCTAL.match(txt) else None
 
 
-_REGULAR = (b"0", b"\0", b"7")
+# tarfile's own rules — the shared fetch reads tars with tarfile and extracts isfile() members, so a
+# listing must see exactly what tarfile would (review 2026-09-29):
+REGULAR_TYPES = (b"0", b"\0", b"7", b"S")      # tarfile.REGULAR_TYPES: isfile(), data blocks follow
+_REGULAR = REGULAR_TYPES
+_NODATA_TYPES = (b"1", b"2", b"3", b"4", b"5", b"6")   # links, devices, dirs, fifos: NO data blocks
+META_TYPES = (b"L", b"K", b"x", b"g", b"X")     # GNU long name / link, PAX per-file / global, Solaris
+
+
+def data_span(typeflag: bytes, size: int) -> int:
+    """Bytes of data blocks tarfile skips after a header of this type: none for links, devices,
+    directories and fifos (a size field there is not data), the padded size otherwise (regular and
+    unknown types)."""
+    return 0 if typeflag in _NODATA_TYPES else (size + 511) // 512 * 512
+
+
+def pax_records(data: bytes) -> dict[str, str]:
+    """Every ``"<len> key=value\\n"`` record of a PAX extended header."""
+    out: dict[str, str] = {}
+    i = 0
+    while i < len(data):
+        sp = data.find(b" ", i)
+        if sp < 0:
+            break
+        try:
+            n = int(data[i:sp])
+        except ValueError:
+            break
+        if n <= 0:
+            break
+        k, _, v = data[sp + 1:i + n - 1].partition(b"=")
+        out[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
+        i += n
+    return out
+
+
+def pax_size(records: dict[str, str]) -> int | None:
+    """The member size a PAX ``size`` record gives (tarfile writes members >= 8 GiB with ustar size 0
+    and the real size here), or None."""
+    v = records.get("size", "").strip()
+    return int(v) if v.isdigit() else None
 
 
 def walk_tar(buf: bytes) -> tuple[list[str], bool, bool]:
     """Regular-file member names readable from the start of an (uncompressed) tar byte string:
     ``(names, end_seen, valid)`` — ``end_seen`` if the end-of-archive block was reached, ``valid``
-    False if even the first header is not a tar header. A header whose checksum or size field
-    does not verify ends the walk (the rest was not read, or is not a tar)."""
+    False if even the first header is not a tar header. Hops like tarfile (a PAX ``size`` record
+    sets the next member's size; links / directories carry no data). A header whose checksum or
+    size field does not verify, a PAX header cut by the buffer, or an old-GNU sparse member with
+    extension blocks ends the walk (the rest was not read, or is not a tar)."""
     names: list[str] = []
     pos = 0
-    pax_path: str | None = None
+    pax: dict[str, str] = {}
     long_name: str | None = None
     while pos + 512 <= len(buf):
         block = buf[pos:pos + 512]
@@ -130,44 +171,39 @@ def walk_tar(buf: bytes) -> tuple[list[str], bool, bool]:
             return names, False, pos > 0
         typeflag = block[156:157]
         data_end = pos + 512 + size
-        if typeflag in (b"L", b"K"):              # GNU long name / long link name
-            if typeflag == b"L" and data_end <= len(buf):
+        if typeflag in META_TYPES:
+            if typeflag in (b"L", b"x", b"X") and data_end > len(buf):
+                return names, False, True             # its name / size lies beyond what we have
+            if typeflag == b"L":
                 long_name = buf[pos + 512:data_end].split(b"\0", 1)[0].decode("utf-8", "replace")
-        elif typeflag in (b"x", b"g"):            # PAX extended header (per-file / global)
-            if typeflag == b"x" and data_end <= len(buf):
-                pax_path = _pax_path(buf[pos + 512:data_end]) or pax_path
-        else:
-            name = block[0:100].split(b"\0", 1)[0].decode("utf-8", "replace")
-            if block[257:262] == b"ustar":
-                prefix = block[345:500].split(b"\0", 1)[0].decode("utf-8", "replace")
-                if prefix:
-                    name = f"{prefix}/{name}"
-            if typeflag in _REGULAR:
-                names.append(pax_path or long_name or name)
-            pax_path = long_name = None
-        pos += 512 + (size + 511) // 512 * 512    # size >= 0, so pos always advances
+            elif typeflag in (b"x", b"X"):
+                pax = pax_records(buf[pos + 512:data_end])
+            pos += 512 + (size + 511) // 512 * 512
+            continue
+        if typeflag == b"S" and block[482]:
+            return names, False, True                 # extension blocks precede the data
+        real = pax_size(pax)
+        if typeflag in REGULAR_TYPES:
+            names.append(pax.get("path") or long_name or member_name(block))
+        pos += 512 + data_span(typeflag, size if real is None else real)
+        pax, long_name = {}, None
     return names, False, True
 
 
+def member_name(block: bytes) -> str:
+    """A tar header's own member name (with the ustar ``prefix``); a preceding GNU long name or
+    PAX ``path`` record overrides it."""
+    name = block[0:100].split(b"\0", 1)[0].decode("utf-8", "replace")
+    if block[257:262] == b"ustar":
+        prefix = block[345:500].split(b"\0", 1)[0].decode("utf-8", "replace")
+        if prefix:
+            name = f"{prefix}/{name}"
+    return name
+
+
 def _pax_path(data: bytes) -> str | None:
-    """The ``path`` value of a PAX extended header (records are ``"<len> key=value\\n"``)."""
-    i = 0
-    while i < len(data):
-        sp = data.find(b" ", i)
-        if sp < 0:
-            break
-        try:
-            n = int(data[i:sp])
-        except ValueError:
-            break
-        rec = data[sp + 1:i + n - 1]
-        k, _, v = rec.partition(b"=")
-        if k == b"path":
-            return v.decode("utf-8", "replace")
-        if n <= 0:
-            break
-        i += n
-    return None
+    """The ``path`` value of a PAX extended header."""
+    return pax_records(data).get("path")
 
 
 def _gzip_fname(head: bytes) -> str | None:
@@ -331,6 +367,14 @@ def head_peek(session: requests.Session, url: str, key: str = "",
         return None, f"peek_failed: {last}"
     if not body:
         return None, "peek_failed: empty body"
+    return head_evidence(body, total, key, max_decompressed)
+
+
+def head_evidence(body: bytes, total: int, key: str = "",
+                  max_decompressed: int = MAX_DECOMPRESSED) -> tuple[HeadEvidence | None, str]:
+    """What the first bytes of a (possibly compressed) tar-family stream say: the parsing half of
+    :func:`head_peek`, also used on the head of an archive NESTED inside a zip (``deeppeek``).
+    ``total`` is the stream's full size (0 = unknown, never "whole")."""
     whole = bool(total) and len(body) >= total
     kind = sniff(body)
     if kind in ("zip", "7z", "rar"):

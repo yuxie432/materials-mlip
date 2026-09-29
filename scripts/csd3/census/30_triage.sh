@@ -44,6 +44,15 @@ NEGATIVE_SAMPLE="${NEGATIVE_SAMPLE:-300}"
 INTERVAL="${INTERVAL:-0.8}"
 PEEK_WORKERS="${PEEK_WORKERS:-3}"
 OUT="${OUT:-$ZENODO_CENSUS_DATA/census_keep.jsonl}"
+# Deeper peeks (zenodo_census/deeppeek.py: uncompressed tars walked header to header, 7z end
+# headers, archives nested in zips) of records the standard peeks leave unresolved: for a T1
+# fail-safe record a proof of "no VASP" saves the whole download (anything still unresolved is
+# downloaded whole, no size cap — as in the keyword harvest); T2 has no fail-safe, so this is the
+# only way its VASP inside such archives is found. DEEP_PEEK=0 skips.
+DEEP_PEEK="${DEEP_PEEK:-1}"
+# Range reads per deep-peeked archive: 300 lets a T1 walk PROVE an archive empty; for T2 (fetched
+# only on evidence) 100 is enough to find VASP — a walk stops at the first output.
+DEEP_MAX_REQUESTS="${DEEP_MAX_REQUESTS:-300}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-6}"
 ATTEMPT="${ATTEMPT:-1}"
 
@@ -55,6 +64,8 @@ for k in "$ZENODO_CENSUS_DATA"/census_keep.jsonl "$ZENODO_CENSUS_DATA"/census_ke
     case "$k" in *.licence_review.jsonl|*.rejections.jsonl) continue ;; esac
     if [[ -f "$k" && "$k" != "$OUT" ]]; then EXCL+=("$k"); fi
 done
+DEEP_ARGS=()
+if [[ "$DEEP_PEEK" == "0" ]]; then DEEP_ARGS=(--no-deep-peek); fi
 TYPE_ARGS=()
 if [[ -n "$TYPES" ]]; then
     # shellcheck disable=SC2206
@@ -73,12 +84,15 @@ trap 'submit_successor' USR1
 
 echo "=== triage attempt $ATTEMPT/$MAX_ATTEMPTS $(date -Is): tiers=[$TIERS] out=$OUT ==="
 echo "    residual sample $RESIDUAL_SAMPLE, negative sample $NEGATIVE_SAMPLE, interval ${INTERVAL}s"
+echo "    deep peeks of unresolved records:" \
+     "$([[ "$DEEP_PEEK" == "0" ]] && echo off || echo "on (<= $DEEP_MAX_REQUESTS reads/archive)")"
 echo "    skipping records already in: ${EXCL[*]:-<none>}"
 set +e
 # shellcheck disable=SC2086
 python -m zenodo_census.cli -v triage --tiers $TIERS "${TYPE_ARGS[@]}" \
     --residual-sample "$RESIDUAL_SAMPLE" --negative-sample "$NEGATIVE_SAMPLE" \
     --interval "$INTERVAL" --peek-workers "$PEEK_WORKERS" --out "$OUT" \
+    --deep-max-requests "$DEEP_MAX_REQUESTS" "${DEEP_ARGS[@]}" \
     --exclude-keep "${EXCL[@]}" > "logs_census/zc-triage-$JOB.summary.json" &
 PID=$!
 while true; do

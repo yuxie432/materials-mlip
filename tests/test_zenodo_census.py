@@ -24,6 +24,7 @@ from typing import Any
 import pytest
 
 from zenodo_census import census as zc
+from zenodo_census import deeppeek as dp
 from zenodo_census import headpeek as hp
 from zenodo_census import links as zl
 from zenodo_census import score as zs
@@ -1490,3 +1491,378 @@ def test_remote_zip_recovers_from_a_stale_size_past_the_end():
     z = make_zip({"calc/OUTCAR": b"1"})
     ev, st = peek_archive(FakeRangeSession({"u": z}), "u", size=len(z) + (3 << 20))
     assert st == "ok" and ev is not None and len(ev.primary) == 1
+
+
+# --- deep peeks (2026-09-29): list what one head read / a central directory could not ----------
+
+def _served_bytes(sess: FakeRangeSession) -> int:
+    total = 0
+    for u, h in sess.requests:
+        rng = h.get("Range", "")
+        if rng.startswith("bytes=") and "-" in rng[6:] and not rng[6:].startswith("-"):
+            a, b = rng[6:].split("-")
+            n = len(sess.blobs[u])
+            total += min(int(b), n - 1) - int(a) + 1
+    return total
+
+
+def test_tar_walk_hops_headers_of_an_uncompressed_tar():
+    big = os.urandom(3 << 20)
+    tar = make_tar({"proj/README.md": b"hi", "proj/traj_1.nc": big, "proj/traj_2.nc": big,
+                    "proj/calc/INCAR": b"ENCUT=500", "proj/calc/vasprun.xml": b"<modeling/>",
+                    "proj/calc/OUTCAR": b"x" * 5000})
+    sess = FakeRangeSession({"u": tar})
+    ev = dp.tar_walk(sess, "u", len(tar))                      # stops at the first primary
+    assert ev["status"] == "ok" and ev["n_primary"] == 1 and not ev["complete"]
+    assert ev["requests"] <= 4 and _served_bytes(sess) < (1 << 20)   # the big members were hopped
+    full = dp.tar_walk(FakeRangeSession({"u": tar}), "u", len(tar), stop_on_primary=False)
+    names = [m.name for m in tarfile.open(fileobj=io.BytesIO(tar)).getmembers() if m.isfile()]
+    assert full["complete"] and full["n_members"] == len(names) == 6 and full["n_primary"] == 2
+    # a tar holding no VASP output at all: an exact listing, so "no VASP" is proof
+    empty = make_tar({"a.nc": big, "b.csv": b"1,2"})
+    ev = dp.tar_walk(FakeRangeSession({"u": empty}), "u", len(empty))
+    assert ev["complete"] and ev["n_primary"] == 0 and ev["n_members"] == 2
+
+
+def test_tar_walk_long_names_many_small_members_budget_and_not_a_tar():
+    long = "d/" + "x" * 150 + "/vasprun.xml"
+    for fmt in (tarfile.GNU_FORMAT, tarfile.PAX_FORMAT):
+        tar = make_tar({"a.txt": b"1", long: b"<modeling/>"}, fmt=fmt)
+        ev = dp.tar_walk(FakeRangeSession({"u": tar}), "u", len(tar), stop_on_primary=False)
+        assert ev["complete"] and ev["primary_sample"] == [long]
+    small = make_tar({f"runs/r{i:04d}/INCAR": b"ENCUT=520\n" * 20 for i in range(400)})
+    ev = dp.tar_walk(FakeRangeSession({"u": small}), "u", len(small), stop_on_primary=False)
+    assert ev["complete"] and ev["n_members"] == 400 and ev["requests"] <= 12   # chunked reads
+    part = dp.tar_walk(FakeRangeSession({"u": small}), "u", len(small), stop_on_primary=False,
+                       max_requests=1)
+    assert part["status"] == "ok" and not part["complete"] and 0 < part["n_members"] < 400
+    junk = b"not a tar at all" * 100
+    assert dp.tar_walk(FakeRangeSession({"u": junk}), "u", len(junk))["status"] == "not_tar"
+
+
+def test_sevenzip_peek_reads_only_the_end_header():
+    py7zr = pytest.importorskip("py7zr")
+    buf = io.BytesIO()
+    with py7zr.SevenZipFile(buf, "w") as z:
+        z.writestr(os.urandom(2 << 20), "calc/WAVECAR")
+        z.writestr(b"<modeling/>", "calc/vasprun.xml")
+        z.writestr(b"ENCUT=500", "calc/INCAR")
+    blob = buf.getvalue()
+    sess = FakeRangeSession({"u": blob})
+    ev = dp.sevenzip_peek(sess, "u", len(blob))
+    assert ev["status"] == "ok" and ev["complete"] and ev["n_primary"] == 1
+    assert ev["n_members"] == 3 and ev["requests"] <= 3 and _served_bytes(sess) < (600 << 10)
+    enc = io.BytesIO()
+    with py7zr.SevenZipFile(enc, "w", password="secret", header_encryption=True) as z:
+        z.writestr(b"<modeling/>", "vasprun.xml")
+    blob = enc.getvalue()
+    assert dp.sevenzip_peek(FakeRangeSession({"u": blob}), "u", len(blob))["status"] in (
+        "encrypted", "unreadable: PasswordRequired")
+
+
+class _NoSeek(io.RawIOBase):
+    """A non-seekable sink: zipfile then writes data descriptors (flag bit 3)."""
+
+    def __init__(self) -> None:
+        self.buf = io.BytesIO()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, b: Any) -> int:
+        return self.buf.write(b)
+
+
+def _zip_members(members: dict[str, tuple[bytes, int]]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, (data, method) in members.items():
+            zf.writestr(zipfile.ZipInfo(name), data, compress_type=method)
+    return buf.getvalue()
+
+
+def test_nested_zip_peek_looks_inside_archives_held_by_a_zip():
+    D, S = zipfile.ZIP_DEFLATED, zipfile.ZIP_STORED
+    tgz = compress(make_tar({"run/INCAR": b"ENCUT=1", "run/vasprun.xml": b"<modeling/>"}), "gz")
+    outer = _zip_members({"README.md": (b"hi", D), "figs.zip": (make_zip({"a.png": b"x"}), D),
+                          "results/calc_data.tar.gz": (tgz, D)})
+    sess = FakeRangeSession({"u": outer})
+    ev = dp.nested_zip_peek(sess, "u", len(outer))
+    assert ev["status"] == "ok" and ev["n_primary"] == 1 and ev["n_nested"] == 2
+    assert ev["n_nested_peeked"] == 1          # the VASP-hinting name ("calc") went first
+    assert "results/calc_data.tar.gz::run/vasprun.xml" in ev["primary_sample"]
+    # every nested archive listed exactly and none holds VASP: proof for the whole zip
+    stored_inner = make_zip({"x/data.csv": b"1"})
+    tar_inner = make_tar({"t/notes.txt": b"n"})
+    ns = _NoSeek()
+    with zipfile.ZipFile(ns, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("m/log.txt", b"log")
+    outer = _zip_members({"a.zip": (stored_inner, S), "b.tar": (tar_inner, S),
+                          "c.zip": (ns.buf.getvalue(), D), "d.tgz": (compress(tar_inner, "gz"), D)})
+    ev = dp.nested_zip_peek(FakeRangeSession({"u": outer}), "u", len(outer))
+    assert ev["status"] == "ok" and ev["n_primary"] == 0 and ev["complete"]
+    assert ev["n_nested_exact"] == 4 and ev["inner_members"] == 4
+    # a data-descriptor inner zip holding an OUTCAR is found by the local-header walk
+    ns = _NoSeek()
+    with zipfile.ZipFile(ns, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("w/POSCAR", b"p" * 3000)
+        zf.writestr("w/OUTCAR", b"o" * 3000)
+    outer = _zip_members({"inner.zip": (ns.buf.getvalue(), D)})
+    ev = dp.nested_zip_peek(FakeRangeSession({"u": outer}), "u", len(outer))
+    assert ev["n_primary"] == 1
+    # the member cap leaves the listing honest (not complete)
+    outer = _zip_members({f"part{i}.zip": (make_zip({"x.txt": b"1"}), D) for i in range(5)})
+    ev = dp.nested_zip_peek(FakeRangeSession({"u": outer}), "u", len(outer), max_members=2)
+    assert ev["n_nested_peeked"] == 2 and not ev["complete"] and ev["n_primary"] == 0
+
+
+def test_zip_local_names_stops_where_the_end_of_a_member_is_unknowable():
+    ns = _NoSeek()
+    with zipfile.ZipFile(ns, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("s/INCAR", b"ENCUT=1")
+        zf.writestr("s/OUTCAR", b"o")
+    names, done = dp.zip_local_names(ns.buf.getvalue())
+    assert names == ["s/INCAR"] and not done       # stored + data descriptor: no findable end
+    names, done = dp.zip_local_names(make_zip({"a/INCAR": b"1", "a/OUTCAR": b"2"})[:40])
+    assert names == [] or not done                 # a cut head is never "complete"
+
+
+def test_triage_deep_peeks_settle_unresolved_records(tmp_path, monkeypatch):
+    """Records the standard peeks leave unresolved get a deeper peek (tar walk, 7z end header,
+    archives nested in a zip): a T1 fail-safe record proven empty is not downloaded, one proven
+    VASP is kept on evidence, and one still unresolved stays fail-safe — downloaded whole, no size
+    cap (user decision 2026-09-29); a T2 record (no fail-safe) is kept only when VASP is found."""
+    py7zr = pytest.importorskip("py7zr")
+    big = os.urandom(3 << 20)
+    tar_vasp = make_tar({"a/traj.nc": big, "a/calc/vasprun.xml": b"<modeling/>"})
+    tar_empty = make_tar({"a/traj.nc": big, "a/notes.txt": b"n"})
+    tgz = compress(make_tar({"run/OUTCAR": b"o"}), "gz")
+    nested = _zip_members({"inner/calc_data.tar.gz": (tgz, zipfile.ZIP_DEFLATED)})
+    sz = io.BytesIO()
+    with py7zr.SevenZipFile(sz, "w") as z:
+        z.writestr(b"<modeling/>", "run/vasprun.xml")
+    blind_tgz = gzip.compress(make_tar({"big.bin": os.urandom(2 << 20), "c/OUTCAR": b"2"}))
+    T1, T2 = "Ab initio DFT calculations of perovskites", "Thin films of oxides"
+    specs = [
+        ("3001", {"calcs.tar": tar_vasp}, T1),       # T1: the walk finds the vasprun past the head
+        ("3003", {"runs.7z": sz.getvalue()}, T1),    # T1: the 7z end header lists it
+        ("3013", {"calcs.tar": tar_empty}, T1),      # T1: proven empty -> no whole download
+        ("3015", {"stuff.tar.gz": blind_tgz}, T1),   # T1: a gzip stream -> still fail-safe
+        ("3005", {"calcs.tar": tar_vasp}, T2),       # T2: found past the head
+        ("3007", {"calcs.tar": tar_empty}, T2),      # T2: proven empty
+        ("3009", {"bundle.zip": nested}, T2),        # T2: VASP inside a nested tar.gz
+        ("3011", {"runs.7z": sz.getvalue()}, T2),    # T2: 7z end header
+    ]
+    hits, blobs = [], {}
+    for rid, files, title in specs:
+        hits.append(zhit(rid, dict(files), concept=str(int(rid) - 1), title=title))
+        for k, b in files.items():
+            blobs[url(rid, k)] = b
+    census = _write_jsonl(tmp_path / "census.jsonl", [zc.slim_hit(h) for h in hits])
+    zs.score(census, tmp_path / "scored.jsonl", excl=zs.Exclusions(), seeds=sg.Seeds())
+    tiers = {r["recid"]: r["tier"] for r in read_jsonl(tmp_path / "scored.jsonl")}
+    assert tiers == {"3001": "T1", "3003": "T1", "3013": "T1", "3015": "T1", "3005": "T2",
+                     "3007": "T2", "3009": "T2", "3011": "T2"}
+
+    def run(out: Path, sess: FakeRangeSession, deep: bool = True) -> dict:
+        return zt.triage(tmp_path / "scored.jsonl", census, out, session_factory=lambda: sess,
+                         residual_sample=0, negative_sample=0, interval=0, head_bytes=64 << 10,
+                         deep_peek=deep)
+
+    sess = FakeRangeSession(blobs)
+    out = tmp_path / "deep" / "keep.jsonl"
+    rep = run(out, sess)
+    keep = {r["recid"]: r for r in read_jsonl(out)}
+    assert {r: k["census"]["triage_reason"] for r, k in keep.items()} == {
+        "3001": "vasp_evidence", "3003": "vasp_evidence", "3015": "strong_unresolved",
+        "3005": "vasp_evidence", "3009": "vasp_evidence", "3011": "vasp_evidence"}
+    assert keep["3001"]["census"]["peek"]["calcs.tar"]["mode"] == "deep_tar"
+    assert keep["3003"]["files"][0]["key"] == "runs.7z"
+    assert keep["3015"]["files"][0]["key"] == "stuff.tar.gz"             # whole download
+    d = rep["decisions"]
+    assert d["T1:proved_no_vasp"] == 1 and d["T2:proved_no_vasp"] == 1     # 3013 / 3007 dropped
+    assert rep["deep_peeks"]["deep_tar_ok"] == 4 and rep["deep_peeks"]["deep_zip_ok"] == 1
+    assert rep["deep_peeks"]["deep_7z_ok"] == 2
+    per = {r["recid"]: r for r in
+           json.loads(out.with_name("keep.report.json").read_text())["records"]}
+    assert per["3001"]["evidence"] == "primary" and per["3001"]["bytes_evidence"] == len(tar_vasp)
+    assert per["3015"]["deep"] == {} and per["3015"]["bytes_blind"] == len(blind_tgz)
+    # a re-run reuses every standard AND deep verdict from the shared cache: no request at all
+    sess2 = FakeRangeSession(blobs)
+    run(out, sess2)
+    assert sess2.requests == []
+    # --no-deep-peek: the old behaviour — every T1 archive stays fail-safe, the T2 ones are lost
+    old = tmp_path / "old" / "keep.jsonl"
+    rep = run(old, FakeRangeSession(blobs), deep=False)
+    assert {r["recid"]: r["census"]["triage_reason"] for r in read_jsonl(old)} == {
+        "3001": "strong_unresolved", "3003": "strong_unresolved", "3013": "strong_unresolved",
+        "3015": "strong_unresolved"}
+    assert rep["decisions"]["T2:unresolved_not_fetched"] == 4
+
+
+
+def _retar_checksum(hdr: bytearray) -> None:
+    hdr[148:156] = b" " * 8
+    hdr[148:156] = b"%06o\0 " % sum(hdr)
+
+
+def test_tar_walk_edge_cases_are_never_called_complete_wrongly():
+    body = make_tar({"a/x.bin": b"x" * 10_000, "a/vasprun.xml": b"<modeling/>"})
+    # truncated inside a member: its size points past EOF -> partial, never "complete"
+    cut = body[:512 + 4000]
+    ev = dp.tar_walk(FakeRangeSession({"u": cut}), "u", len(cut), stop_on_primary=False)
+    assert ev["status"] == "ok" and not ev["complete"] and ev["n_members"] == 1
+    # ends EXACTLY after the last member (no end-of-archive blocks): an exact listing
+    last_end = 512 + 10_240 + 512 + 512
+    ev = dp.tar_walk(FakeRangeSession({"u": body[:last_end]}), "u", last_end,
+                     stop_on_primary=False)
+    assert ev["complete"] and ev["n_members"] == 2
+    # a corrupt second header ends the walk (partial)
+    bad = bytearray(body)
+    bad[512 + 10_240 + 10] ^= 0xFF
+    ev = dp.tar_walk(FakeRangeSession({"u": bytes(bad)}), "u", len(bad), stop_on_primary=False)
+    assert not ev["complete"] and ev["n_members"] == 1
+    # a GNU base-256 size field (how members >= 8 GiB are written) is decoded
+    b256 = bytearray(make_tar({"a/x.bin": b"y" * 600, "a/OUTCAR": b"o"}))
+    hdr = bytearray(b256[:512])
+    hdr[124:136] = b"\x80" + (600).to_bytes(11, "big")
+    _retar_checksum(hdr)
+    b256[:512] = hdr
+    ev = dp.tar_walk(FakeRangeSession({"u": bytes(b256)}), "u", len(b256), stop_on_primary=False)
+    assert ev["complete"] and ev["n_primary"] == 1
+    # directories and symlinks are not members; a ustar prefix is joined to the name
+    buf = io.BytesIO()
+    deep_name = "p" * 60 + "/" + "q" * 60 + "/vasprun.xml"
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as tf:
+        d = tarfile.TarInfo("dir")
+        d.type = tarfile.DIRTYPE
+        tf.addfile(d)
+        ln = tarfile.TarInfo("dir/link")
+        ln.type, ln.linkname = tarfile.SYMTYPE, "x"
+        tf.addfile(ln)
+        ti = tarfile.TarInfo(deep_name)
+        ti.size = 3
+        tf.addfile(ti, io.BytesIO(b"abc"))
+    raw = buf.getvalue()
+    ev = dp.tar_walk(FakeRangeSession({"u": raw}), "u", len(raw), stop_on_primary=False)
+    assert ev["complete"] and ev["n_members"] == 1 and ev["primary_sample"] == [deep_name]
+
+
+def test_deep_peek_budgets_bound_what_is_read(monkeypatch):
+    small = make_tar({f"imgs/f{i:05d}.png": os.urandom(2000) for i in range(2000)})
+    sess = FakeRangeSession({"u": small})
+    ev = dp.tar_walk(sess, "u", len(small), stop_on_primary=False, max_bytes=300 << 10)
+    assert ev["status"] == "ok" and not ev["complete"] and 0 < ev["n_members"] < 2000
+    assert ev["bytes_read"] <= 300 << 10 and _served_bytes(sess) <= 300 << 10
+    monkeypatch.setattr(dp, "MAX_SINGLE_READ", 1000)
+    budget = dp._Budget(10)
+    f = dp.RangeFile(FakeRangeSession({"u": small}), "u", len(small), budget)
+    with pytest.raises(dp.BudgetSpent):
+        f.read()                                   # read(-1) of a big remainder is refused
+
+
+def test_deep_peek_failures_are_reported_not_raised(monkeypatch):
+    py7zr = pytest.importorskip("py7zr")
+    monkeypatch.setattr(hp.time, "sleep", lambda *_: None)
+    junk = b"7z\xbc\xaf\x27\x1c" + os.urandom(4000)
+    ev = dp.sevenzip_peek(FakeRangeSession({"u": junk}), "u", len(junk))
+    assert ev["status"].startswith("unreadable")                     # deterministic: cacheable
+    sz = io.BytesIO()
+    with py7zr.SevenZipFile(sz, "w") as z:
+        z.writestr(b"<modeling/>", "r/vasprun.xml")
+    D, S = zipfile.ZIP_DEFLATED, zipfile.ZIP_STORED
+    outer = _zip_members({"stored.7z": (sz.getvalue(), S), "deflated.7z": (sz.getvalue(), D),
+                          "x.rar": (b"Rar!\x1a\x07\x01\x00" + b"z" * 50, S)})
+    ev = dp.nested_zip_peek(FakeRangeSession({"u": outer}), "u", len(outer))
+    assert ev["status"] == "ok" and ev["n_primary"] == 1                # the stored 7z is listed
+    outer = _zip_members({"deflated.7z": (sz.getvalue(), D), "x.rar": (b"Rar!" + b"z" * 50, S)})
+    ev = dp.nested_zip_peek(FakeRangeSession({"u": outer}), "u", len(outer))
+    assert ev["n_primary"] == 0 and not ev["complete"] and ev["n_nested_peeked"] == 2
+
+    class Flaky(FakeRangeSession):          # the outer directory reads, every inner read fails
+        def get(self, u: str, headers: dict | None = None, **kw: Any) -> FakeResp:
+            rng = (headers or {}).get("Range", "")
+            if rng.startswith("bytes=0-"):
+                return FakeResp(503)
+            return super().get(u, headers, **kw)
+
+    tgz = compress(make_tar({"r/OUTCAR": b"o"}), "gz")
+    outer = _zip_members({"calc.tar.gz": (tgz, D)})
+    ev = dp.nested_zip_peek(Flaky({"u": outer}), "u", len(outer))
+    assert ev["status"].startswith("peek_failed")                     # transient: never cached
+
+
+def test_nested_zip_peek_reads_a_zip64_outer_and_zip64_descriptors(monkeypatch):
+    tgz = compress(make_tar({"r/vasprun.xml": b"<modeling/>"}), "gz")
+    outer = make_zip64({"a/calc.tar.gz": tgz, "a/readme.txt": b"r"}, monkeypatch)
+    monkeypatch.undo()
+    ev = dp.nested_zip_peek(FakeRangeSession({"u": outer}), "u", len(outer))
+    assert ev["status"] == "ok" and ev["n_primary"] == 1
+    ns = _NoSeek()
+    with zipfile.ZipFile(ns, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name in ("z/INCAR", "z/OUTCAR"):
+            with zf.open(name, "w", force_zip64=True) as fh:
+                fh.write(b"data " * 200)
+    names, done = dp.zip_local_names(ns.buf.getvalue())
+    assert names == ["z/INCAR", "z/OUTCAR"] and done                 # 20-byte ZIP64 descriptors
+
+
+def test_triage_deep_failure_retried_and_empty_archives_pruned(tmp_path, monkeypatch):
+    monkeypatch.setattr(hp.time, "sleep", lambda *_: None)
+    big = os.urandom(3 << 20)
+    tar_empty = make_tar({"a/traj.nc": big, "a/notes.txt": b"n"})
+    blind_tgz = gzip.compress(make_tar({"big.bin": os.urandom(2 << 20), "c/OUTCAR": b"2"}))
+    tgz = compress(make_tar({"run/OUTCAR": b"o"}), "gz")
+    nested = _zip_members({"inner/calc_data.tar.gz": (tgz, zipfile.ZIP_DEFLATED)})
+    hits = [zhit("4001", {"empty.tar": tar_empty, "stuff.tar.gz": blind_tgz}, concept="4000",
+                 title="Ab initio DFT calculations of perovskites"),               # T1
+            zhit("4003", {"bundle.zip": nested}, concept="4002", title="Thin films of oxides")]
+    blobs = {url(h["recid"], f["key"]): b for h, fl in zip(hits, (
+        {"empty.tar": tar_empty, "stuff.tar.gz": blind_tgz}, {"bundle.zip": nested}))
+        for f in h["files"] for k, b in fl.items() if k == f["key"]}
+    census = _write_jsonl(tmp_path / "census.jsonl", [zc.slim_hit(h) for h in hits])
+    zs.score(census, tmp_path / "scored.jsonl", excl=zs.Exclusions(), seeds=sg.Seeds())
+    out = tmp_path / "keep.jsonl"
+    nested_url = url("4003", "bundle.zip")
+
+    class InnerDown(FakeRangeSession):      # the zip's directory reads twice, then only 503s
+        def get(self, u: str, headers: dict | None = None, **kw: Any) -> FakeResp:
+            if u == nested_url and sum(1 for x, _ in self.requests if x == u) >= 2:
+                self.requests.append((u, headers or {}))
+                return FakeResp(503)
+            return super().get(u, headers, **kw)
+
+    def run(sess: FakeRangeSession) -> dict:
+        return zt.triage(tmp_path / "scored.jsonl", census, out, session_factory=lambda: sess,
+                         residual_sample=0, negative_sample=0, interval=0, head_bytes=64 << 10)
+
+    rep = run(InnerDown(blobs))
+    keep = {r["recid"]: r for r in read_jsonl(out)}
+    assert set(keep) == {"4001"}                                   # T2 not kept this time ...
+    assert rep["deep_peeks"].get("deep_zip_peek_failed") == 1
+    # ... T1: the proven-empty tar is pruned, only the unsettled gzip stream is downloaded whole
+    assert keep["4001"]["census"]["triage_reason"] == "strong_unresolved"
+    assert [f["key"] for f in keep["4001"]["files"]] == ["stuff.tar.gz"]
+    rep = run(FakeRangeSession(blobs))                             # the failure was not cached
+    keep = {r["recid"]: r["census"]["triage_reason"] for r in read_jsonl(out)}
+    assert keep == {"4001": "strong_unresolved", "4003": "vasp_evidence"}
+
+
+def test_nested_zip_peek_survives_tiny_and_corrupt_inner_zips():
+    """zipfile probes a tiny archive for a ZIP64 record by seeking before its start and expects
+    the OSError a real file raises (fuzz-found: RangeFile raised ValueError, which escaped)."""
+    S = zipfile.ZIP_STORED
+    empty_zip = make_zip({})                                     # 22 bytes: just an end record
+    assert len(empty_zip) == 22
+    outer = _zip_members({"empty.zip": (empty_zip, S), "b.zip": (make_zip({"x/y.txt": b"1"}), S)})
+    ev = dp.nested_zip_peek(FakeRangeSession({"u": outer}), "u", len(outer))
+    assert ev["status"] == "ok" and ev["complete"] and ev["n_primary"] == 0
+    outer = _zip_members({"broken.zip": (b"PK\x03\x04" + os.urandom(200), S),
+                          "calc.tar": (make_tar({"r/OUTCAR": b"o"}), S)})
+    ev = dp.nested_zip_peek(FakeRangeSession({"u": outer}), "u", len(outer))
+    assert ev["status"] == "ok" and ev["n_primary"] == 1              # the good one still counts
+    outer = _zip_members({"broken.zip": (b"PK\x03\x04" + os.urandom(200), S)})
+    ev = dp.nested_zip_peek(FakeRangeSession({"u": outer}), "u", len(outer))
+    assert ev["status"] == "ok" and not ev["complete"]                 # never a proof
+    with pytest.raises(OSError):
+        dp.RangeFile(FakeRangeSession({"u": b"abc"}), "u", 3, dp._Budget(1)).seek(-5, io.SEEK_END)

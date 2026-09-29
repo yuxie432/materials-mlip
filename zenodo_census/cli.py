@@ -27,6 +27,7 @@ from pathlib import Path
 from zenodo_harvest import config
 
 from .census import CensusClient, census_keys, run_census
+from .deeppeek import DEEP_MAX_REQUESTS, NESTED_MAX_MEMBERS
 from .headpeek import DEFAULT_HEAD_BYTES
 from .links import (
     datacite_references,
@@ -177,6 +178,14 @@ def main(argv: list[str] | None = None) -> int:
     tr.add_argument("--peek-workers", type=int, default=3)
     tr.add_argument("--head-bytes", type=int, default=DEFAULT_HEAD_BYTES)
     tr.add_argument("--max-records", type=int, default=None)
+    tr.add_argument("--no-deep-peek", dest="deep_peek", action="store_false",
+                    help="skip the deeper peeks (tar header walk, 7z end header, archives nested "
+                         "in zips) of records the standard peeks leave unresolved (T1 fail-safe: "
+                         "saves whole downloads of archives proven empty; T2: finds VASP)")
+    tr.add_argument("--deep-max-requests", type=int, default=DEEP_MAX_REQUESTS,
+                    help=f"Range reads per deep-peeked archive (default {DEEP_MAX_REQUESTS})")
+    tr.add_argument("--nested-max-members", type=int, default=NESTED_MAX_MEMBERS,
+                    help=f"nested archives peeked per zip (default {NESTED_MAX_MEMBERS})")
     tr.add_argument("--exclude-keep", nargs="*", default=[],
                     help="earlier census keep-lists whose records this run must skip")
 
@@ -240,7 +249,9 @@ def main(argv: list[str] | None = None) -> int:
                      seed=args.seed, token=os.environ.get("ZENODO_TOKEN"),
                      interval=args.interval, peek_workers=args.peek_workers,
                      head_bytes=args.head_bytes, max_records=args.max_records,
-                     exclude_keep=args.exclude_keep)
+                     exclude_keep=args.exclude_keep, deep_peek=args.deep_peek,
+                     deep_max_requests=args.deep_max_requests,
+                     nested_max_members=args.nested_max_members)
     else:  # status
         out = status(P)
     print(json.dumps(out, indent=1, default=str))

@@ -4,10 +4,11 @@ Not a new data source: a **replacement discovery front-end for Zenodo** that fin
 keyword search cannot see, and hands the ORDINARY Zenodo pipeline a standard keep-list (same fetch,
 parse, store, schema and calc_ids `zenodo:<recid>:<path>` as the existing dataset). Design,
 measurements and user decisions: `docs/ZENODO_CENSUS.md`; CSD3 runbook: `scripts/csd3/census/`.
-Status 2026-09-28: census COMPLETE on CSD3 (583,930 records incl. all 303 dataset records; the first run
+Status 2026-09-29: census COMPLETE on CSD3 (583,930 records incl. all 303 dataset records; the first run
 died on a record Zenodo's default JSON serializer cannot return, `20797668` — now routed around losslessly,
-below) and SCORED: T1 2,932 · T2 33,046 · T3 344,689 · T0 200,743, all 4 known misses T1, 363 records named
-in VASP papers never seen by keyword search (`docs/ZENODO_CENSUS.md` §11). Next: `30_triage.sh`, T1 first.
+below), SCORED (T1 2,933 · T2 33,175 · T3 344,635 · T0 200,669) and T1 TRIAGED: 252 VASP-evidence records
+(all 4 known misses), 2,091 proven VASP-free, 590 fail-safe (3.38 TB); residual T3 0/3,000 → T3 stops
+(`docs/ZENODO_CENSUS.md` §11). Next: T1 re-triage with the new deep peeks → T1 pipeline ∥ T2 triage.
 
 Why (measured live 2026-09-25): Zenodo's `q` sees metadata text only; beyond that, an `&nbsp;` glues
 words into one token (`4541602` "ab initio&nbsp;defect" matches neither), quoted phrases are not
@@ -69,6 +70,21 @@ has no computation word at all, and the keyword discover's cut-off is 2026-07-30
     the tar end block reached (then "no VASP" is proof); else leading members = evidence. Signed
     checksums accepted, strict octal sizes (a bad header stops the walk — no hang), regular files
     only, zstd bounded, anchored VASP-name / exact heavy-name rules (no `incarnation.txt`/`chgnet`).
+  - `deeppeek.py` (2026-09-29) — lists what the standard peeks cannot, without a download: `tar_walk`
+    (uncompressed tar, header to header over Range; read size doubles along small members, back to
+    64 KiB after a big one; stops at the first VASP primary), `sevenzip_peek` (py7zr on the end header
+    through `RangeFile`, a budgeted Range-backed file), `nested_zip_peek` (archives inside a zip: each
+    inner member's local header + first 2 MiB in one read, inflated, then head-peeked /
+    `zip_local_names`-walked / listed via its own directory when stored; VASP-hinting names first,
+    ≤ 40). Budgets per archive: 300 reads (`DEEP_MAX_REQUESTS`), 256 MiB, no read over 64 MiB —
+    every read goes through one `_Budget` (streamed, capped; the outer central directory is read
+    via zipfile over the `RangeFile`; inverted ranges refused). Tar hops follow tarfile exactly
+    (PAX `size`, GNU sparse = a file, links/dirs carry no data; `headpeek.walk_tar` too); py7zr runs
+    in a forkserver child killed after `SEVENZIP_TIMEOUT` (30 s), memory-capped, reading through the
+    parent; `RangeFile.name` = the file name (py7zr names nameless entries after it, as fetch does).
+    `complete` (the only proof of "no VASP") needs an end block / exact EOF / a decoded 7z header /
+    every nested archive listed exactly — anything else is partial. Failures are status strings
+    (`peek_failed: …` transient, never cached). Review regressions: `tests/test_zenodo_census_deeppeek.py`.
   - `triage.py` — selection (T1+T2, seeded T3 residual sample (not software), T0 control sample; skips
     records in earlier keep-lists), peeks under ONE `Pacer` shared by all threads (`PacedSession`:
     token only to zenodo.org; 0.8 s between request starts = 4.5k/h), zip peeks via
@@ -82,12 +98,23 @@ has no computation word at all, and the keyword discover's cut-off is 2026-07-30
     fallbacks are never cached; cache keys include the head size; earlier keep-lists excluded by
     recid AND concept. Writes `<out>` (Candidate dicts, files pruned, `census` bookkeeping),
     `<out>.report.json` (Wilson-CI residual rate — all positives AND `rate_primary`, the strict
-    go/no-go — + extrapolation, yield per signal, probes), `<out>.rejections.jsonl` (rewritten).
+    go/no-go — + extrapolation, yield per signal, probes; per record `evidence` strength,
+    `bytes_evidence`/`bytes_blind`, `deep`), `<out>.rejections.jsonl` (rewritten). **Deep peeks**
+    (`deep_peek`, default on; CLI `--no-deep-peek`/`--deep-max-requests`/`--nested-max-members`):
+    records left `strong_unresolved` (T1 fail-safe: a proof of "no VASP" saves the whole download)
+    or `unresolved_not_fetched` (T2: a find is recall gained) get `deeppeek` verdicts for their
+    unresolved files (`deep_kind`: uncompressed tar / 7z incl. in disguise / zip nesting archives),
+    cached under separate keys (`DEEP_RULES_VERSION`, budget), overlaid on the standard verdict
+    (`_deep_verdict`, `as_kind` kept). Whatever stays unresolved in a T1 record is downloaded whole,
+    NO size cap (user decision 2026-09-29, as the keyword harvest).
 - Shared-code changes (backward-compatible): `materials_cloud_harvest/remote_zip.py` —
   `read_central_directory`/`peek_archive` accept `size=` (ordinary-range tail read) and report a body
   that breaks mid-read as a failed peek instead of raising; `zenodo_harvest/client.py` —
   `ZenodoClient._get(headers=…)`, passed to the session only when given (the native-serializer
-  `Accept`); `zenodo_harvest/models.is_reusable_license` treats `other-closed` as not reusable.
+  `Accept`); `zenodo_harvest/models.is_reusable_license` treats `other-closed` as not reusable;
+  `remote_zip.ZipEvidence.primary_max_bytes` (largest primary per zip, for parse-RAM sizing);
+  `zenodo_harvest.cli` `parse`/`pipeline` take `--parse-workers/--parse-mem-budget/--parse-rss-ratio`
+  (defaults = serial, as before) and `scripts/csd3/20_pipeline.sh` sizes them from the job's RAM.
 - Offline tests: `tests/test_zenodo_census.py` (census resume/dedup/torn lines/pacing; signals incl.
   the real metadata of the three hidden Kavanagh records; exclusions/seeds/score/EPMC coverage; link
   parsers + resume; head-peeks over real tar/gz/bz2/xz/zst/GNU/PAX streams; Zenodo's broken suffix
