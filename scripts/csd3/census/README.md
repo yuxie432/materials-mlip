@@ -94,10 +94,20 @@ quota
 cp $ZENODO_HARVEST_DATA/dataset/metadata.jsonl $ZENODO_HARVEST_DATA/dataset/metadata.jsonl.bak.pre_census
 IN=$ZENODO_CENSUS_DATA/census_keep_t1.jsonl RAW_DIR=$ZENODO_HARVEST_DATA/raw_census \
   RESUBMIT=1 sbatch scripts/csd3/20_pipeline.sh     # 40 batches (default): lower staging peaks
-python -m zenodo_harvest.cli status --keep $ZENODO_CENSUS_DATA/census_keep_t1.jsonl \
-    --manifests-dir $ZENODO_CENSUS_DATA --raw-dir $ZENODO_HARVEST_DATA/raw_census \
-    --dataset-dir $ZENODO_HARVEST_DATA/dataset      # progress (read-only; finds the part manifests)
-#    then the same with IN=.../census_keep_t2.jsonl once the T1 pipeline has finished.
+#    Progress (read-only, safe beside the job): --scope-to-keep counts only this keep-list's records
+#    (calcs, frames, rejections) instead of the whole production dataset; the fetch rejections are
+#    read from beside --raw-dir ($ZENODO_HARVEST_DATA/manifests/rejections.jsonl, shared with the
+#    keyword harvest); the part manifests sit in <keep-list>.pipeline_parts/:
+python -m zenodo_harvest.cli status --keep $ZENODO_CENSUS_DATA/census_keep_t1.jsonl --scope-to-keep \
+    --manifests-dir $ZENODO_CENSUS_DATA/census_keep_t1.pipeline_parts \
+    --raw-dir $ZENODO_HARVEST_DATA/raw_census --dataset-dir $ZENODO_HARVEST_DATA/dataset \
+    --max-disk-bytes 800000000000 --max-disk-files 800000   # add --no-staging-walk if raw/ is big
+#    Live log: tail -f logs/zh-pipeline-<jobid>.err (one "parsing <calc_id>" line per calc); memory:
+#    sacct -j <jobid> --format=JobID,State,Elapsed,MaxRSS; the JSON summary ends the .out.
+#    Afterwards: any `primary_too_large` calc (e.g. 13843222's 8.15 GB AIMD vasprun) stays staged —
+#    re-run the same pipeline command on a bigger shape (`sbatch -c 20 …` -> cap ~10 GB) to parse it.
+#    Then the same with IN=.../census_keep_t2.jsonl (and census_keep_t2.pipeline_parts) once the T1
+#    pipeline has finished and the T2 report has been reviewed.
 ```
 
 ## What bounds each step

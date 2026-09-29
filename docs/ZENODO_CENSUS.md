@@ -7,12 +7,12 @@ taken. Everything under "measured" was obtained live on **2026-09-25**. CSD3 run
 `scripts/csd3/census/README.md`.
 
 > **Status (2026-09-29): census COMPLETE (583,930 records, every one of the 303 dataset records
-> among them), SCORED (T1 2,933 · T2 33,175 · T3 344,635 · T0 200,669) and T1 TRIAGED on CSD3: VASP
-> evidence in 252 T1 records (incl. all four known keyword misses), 2,091 proven VASP-free, 590 kept by
-> the fail-safe; the residual T3 sample found 0 in 3,000 → T3 stops (§11). Added after it: deeper
-> peeks of unresolved archives (§5) and a parallel, RAM-budgeted parse for the pipeline. Next: T1
-> re-triage with deep peeks → T1 pipeline ∥ T2 triage → T2 pipeline.** 79 offline census tests; two
-> review passes (§12).
+> among them), SCORED (T1 2,933 · T2 33,175 · T3 344,635 · T0 200,669) and T1 TRIAGED on CSD3, then
+> RE-TRIAGED with the deep peeks (§5): VASP evidence in 272 T1 records (incl. all four known keyword
+> misses), 2,227 proven VASP-free, 434 kept by the fail-safe → keep-list 680 records / 3.09 TB (§11);
+> the residual T3 sample found 0 in 3,000 → T3 stops. RUNNING (started 2026-09-29): the T1 pipeline
+> (into the production dataset) ∥ the T2 triage. Next: T2 pipeline; a bigger-RAM re-parse of any
+> `primary_too_large` calcs.** 96 offline census tests; three review passes (§12).
 
 ---
 
@@ -419,6 +419,48 @@ tar 0.52 TB · xz/bzip2/zstd tar 0.43 TB · 7z 0.31 TB · rar 0.06 TB — about 
 By size, the 65 records over 20 GB hold 2.52 TB for ~11 of the expected records (tomography,
 patents, phase-field and MD sets among them); they are fetched whole all the same (decision 4)
 unless a deep peek proves them VASP-free.
+
+### T1 re-triage with deep peeks — CSD3 job 36712258 (2026-09-29, 1 h 51 min)
+
+Every standard peek came from the cache (6,004 files); the deep peeks read 488 unresolved files of
+290 fail-safe records in 8,347 Range requests (~17 per file, at the paced 75/min: request-bound as
+designed; 262 zips holding archives, 136 uncompressed tars, 89 7z, 1 "zip" that was not one).
+
+| T1 outcome | first run | re-run | change |
+|---|---|---|---|
+| VASP evidence | 252 | **272** | +20 found inside archives the standard peeks could not open |
+| proven VASP-free | 2,091 | **2,227** | +136 fail-safe records no longer downloaded |
+| unresolved → fail-safe | 590 | **434** | 134 still partial after a deep peek + 300 with nothing deep-peekable |
+| kept (admitted licences) | 815 (239 + 576) | **680 (259 + 421)** | licence review 27 → 26 (excluded) |
+| whole-download ("blind") bytes | 3.38 TB | **2.45 TB** | −0.94 TB (−28%) |
+| all kept bytes | 3.96 TB | **3.09 TB** | −0.87 TB; evidenced archives 579 → 643 GB |
+
+* **What they found** (20 records, all open-licence): 11 with VASP outputs actually seen — e.g.
+  `15323838` (7z, 255 phonopy OUTCAR / vasprun / vaspout.h5), `20504471` (7z, AIMD OUTCARs),
+  `4088537` (vaspruns inside a `.tar.gz` inside a zip), `15855333` (19.9 GB, OUTCAR + vasprun in
+  nested trajectory zips), `18511449`, `19323296`, `15198620`, `15225372`, `11483708`, `21822803`,
+  `18316581` — and 9 with only VASP-named inputs / heavy files (e.g. `10302508`, 33.5 GB AIMD of
+  liquid Ga). All 20 were fail-safe records (downloaded whole anyway); 20 of the 156 fail-safes the
+  deep peeks settled hold VASP (12.8%), inside the 10.7-14.4% the per-signal hit rates predicted — so
+  the 434 still unresolved should hold ~45-60.
+* **By container** (fail-safe bytes left): uncompressed tar 0.52 → 0.04 TB (93% settled), 7z 0.31 →
+  0.04 TB (88%), zips holding archives 0.85 → 0.67 TB (21% — their inner archives are mostly
+  compressed tars larger than the 2 MiB inner head, so a listing stays partial); gzip tar 1.08 TB,
+  xz/bzip2/zstd tar 0.43 TB and rar 0.06 TB untouched (no in-place listing exists).
+* **Still partial after a deep peek**: 8 tars stopped by the 300-read or 256 MiB budget (29 GB, e.g.
+  `4590731` 20.9 GB, 590 members in 300 reads); 19 complete 7z/tar listings that contain further
+  archives (e.g. `19110103`: two 7z of one tar each, 32 GB) — all downloaded whole, as decided. Six
+  `.zip` files are not zips (11.6 GB; `21471245`, `10045070`, `6560359`): downloaded and logged
+  `extract_error`, the fail-safe's known cost.
+* **Proofs checked**: the 136 proven records are CP2K / GROMACS DFT/MM runs, GW / DFTB benchmarks,
+  NetCDF MD trajectories, FEFF inputs, "DFT inputs" releases, figure data — no title or listing
+  suggests a missed VASP output.
+* **Parse RAM**: 229 evidence records show 109,612 VASP outputs in their listings (the most in one
+  archive 12,672); only `13843222` (AIMD of doped Bi2O3, six ~1.9 GB zips of 8.1-8.4 GB vaspruns)
+  holds primaries near or over the 3.8 GB cap of the 8-core pipeline — its 8.15 GB vasprun is
+  deferred `primary_too_large` (staged, re-parsed later on a bigger job).
+* `zenodo_census.cli status` reports `keep_records: 0` for a non-default `OUT` (it reads
+  `census_keep.jsonl` only) — cosmetic; the triage `.out`/`.err` and `<out>.report.json` are the record.
 
 ---
 

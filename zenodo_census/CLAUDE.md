@@ -8,7 +8,9 @@ Status 2026-09-29: census COMPLETE on CSD3 (583,930 records incl. all 303 datase
 died on a record Zenodo's default JSON serializer cannot return, `20797668` — now routed around losslessly,
 below), SCORED (T1 2,933 · T2 33,175 · T3 344,635 · T0 200,669) and T1 TRIAGED: 252 VASP-evidence records
 (all 4 known misses), 2,091 proven VASP-free, 590 fail-safe (3.38 TB); residual T3 0/3,000 → T3 stops
-(`docs/ZENODO_CENSUS.md` §11). Next: T1 re-triage with the new deep peeks → T1 pipeline ∥ T2 triage.
+(`docs/ZENODO_CENSUS.md` §11). T1 RE-TRIAGED with the deep peeks (job 36712258, 1 h 51 min): +136
+proven VASP-free, +20 VASP found → 272 evidence / 434 fail-safe, keep-list 680 records / 3.09 TB
+(−0.87 TB). Running since 2026-09-29: T1 pipeline ∥ T2 triage; then the T2 pipeline.
 
 Why (measured live 2026-09-25): Zenodo's `q` sees metadata text only; beyond that, an `&nbsp;` glues
 words into one token (`4541602` "ab initio&nbsp;defect" matches neither), quoted phrases are not

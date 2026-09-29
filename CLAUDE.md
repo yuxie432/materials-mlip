@@ -24,9 +24,10 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
 **Part A (blind-spot discovery) is BUILT as `zenodo_census/` — a census of every archive-bearing
 Zenodo record scored offline + selectively peeked, feeding the ordinary pipeline
 (`docs/ZENODO_CENSUS.md`, `scripts/csd3/census/`). Census COMPLETE + scored on CSD3 (583,930 records;
-T1 2,933 / T2 33,175) and T1 TRIAGED (252 VASP-evidence records incl. all 4 known keyword misses,
-590 kept fail-safe); deep peeks added (`zenodo_census/deeppeek.py`); next: T1 re-triage → T1
-pipeline ∥ T2 triage → T2 pipeline.**
+T1 2,933 / T2 33,175) and T1 TRIAGED, then RE-TRIAGED with the deep peeks
+(`zenodo_census/deeppeek.py`): 272 VASP-evidence records incl. all 4 known keyword misses, 434 kept
+fail-safe → keep-list 680 records / 3.09 TB. RUNNING since 2026-09-29: T1 pipeline (into the
+production dataset) ∥ T2 triage; next: T2 pipeline (`docs/ZENODO_CENSUS.md` §11).**
 
 ## Code layout & commands
 
@@ -300,7 +301,10 @@ pipeline ∥ T2 triage → T2 pipeline.**
     walks the raw/dataset trees to report per-stage counts, fetch/parse **progress %**
     (fetched vs keep-list; parsed calcs vs fetched calc-units), staging **bytes+inodes vs
     quota**, and a **rejection-reason histogram**. No network, no lock — safe to run (or
-    `watch`) *while* a fetch/pipeline job is writing the same files.
+    `watch`) *while* a fetch/pipeline job is writing the same files. It also reads the fetch
+    rejections where `pipeline` writes them (`<raw-dir>/../manifests/rejections.jsonl`), and
+    `--scope-to-keep` counts only the keep-list's records (calcs, frames, fetched manifests,
+    rejections) — the progress of one run writing into an existing dataset (the census keep-lists).
   - `dataset_ops.py` — array-job glue (stages over dataset dirs, not the network):
     - `split` — split a manifest into `<stem>.part-NNN.jsonl` parts, one per array task.
       `--weight-by records` (default) round-robins (balances record count); `--weight-by
