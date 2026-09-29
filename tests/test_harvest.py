@@ -3099,6 +3099,69 @@ def test_status_restart_counts_dataset_as_fetched_not_untouched(tmp_path):
     assert "16848" not in format_status(r) and "%" in format_status(r)
 
 
+def test_status_scoped_to_a_keep_list_writing_into_an_existing_dataset(tmp_path, capsys):
+    # A census keep-list run writes into the PRODUCTION dataset: its part manifests sit beside its
+    # keep-list, its fetch rejections beside its raw dir (<raw>/../manifests/rejections.jsonl, the
+    # log the earlier harvest used too), and the dataset already holds the earlier records.
+    # --scope-to-keep reports the run's OWN progress; the CLI finds the fetch log from --raw-dir.
+    from zenodo_harvest import cli
+    from zenodo_harvest.status import format_status, status_report
+
+    root = tmp_path / "zenodo"
+    man, ds, zc = root / "manifests", root / "dataset", root / "census"
+    for d in (man, ds, zc):
+        d.mkdir(parents=True)
+    keep = zc / "census_keep_t1.jsonl"
+    keep.write_text("".join(f'{{"recid":"{r}"}}\n' for r in ("7", "8", "9", "10")))
+    parts = zc / "census_keep_t1.pipeline_parts"
+    parts.mkdir()
+    (parts / "census_keep_t1.part-000.fetched.jsonl").write_text(
+        '{"recid":"7","n_calc_units":2}\n{"recid":"8","n_calc_units":3}\n')
+    later = zc / "census_keep_t2.pipeline_parts"          # the next run's parts, same tree
+    later.mkdir()
+    (later / "census_keep_t2.part-000.fetched.jsonl").write_text('{"recid":"20","n_calc_units":5}\n')
+
+    def meta(rid: str, n: int) -> str:
+        return ('{"calc_id":"zenodo:%s:c%d","quality":{"n_frames":%d,"n_frames_with_forces":%d}}\n'
+                % (rid, n, n, n))
+    # records 1, 2 = the earlier harvest; 7 = this run (2 calcs)
+    (ds / "metadata.jsonl").write_text(meta("1", 100) + meta("2", 50) + meta("7", 4) + meta("7", 6))
+    (man / "rejections.jsonl").write_text(            # an earlier-harvest record + this run's 9
+        '{"stage":"fetch","id":"3","reason":"archive_no_vasp"}\n'
+        '{"stage":"fetch","id":"9","reason":"extract_error"}\n'
+        '{"stage":"fetch","id":"9:a.zip","reason":"extract_error"}\n')
+    (ds / "rejections.jsonl").write_text(
+        '{"stage":"parse","id":"zenodo:1:old/OUTCAR","reason":"outcar_parse_error"}\n'
+        '{"stage":"parse","id":"zenodo:7:new/vasprun.xml","reason":"no_frames"}\n')
+
+    kw = dict(manifests_dir=zc, raw_dir=root / "raw_census", dataset_dir=ds, keep_path=keep,
+              extra_rejection_paths=(man / "rejections.jsonl",), staging_walk=False)
+    r = status_report(**kw, scope_to_keep=True)
+    assert r["scope"] == "keep-list"
+    assert r["parse"]["calcs_parsed"] == 2 and r["parse"]["frames"] == 10   # record 7 only
+    assert r["records"]["with_frames"] == 1
+    assert r["fetch"]["fetched_records"] == 2                               # 7, 8
+    assert r["parse"]["this_run_fetched"] == 5 and r["parse"]["this_run_parsed"] == 2  # not 20's
+    assert r["records"]["fetch_rejected"] == 1 and r["records"]["untouched"] == 1      # 9 / 10
+    assert r["errors"]["rejections"] == 3 and "outcar_parse_error" not in r["errors"]["by_reason"]
+    assert "scoped to the keep-list" in format_status(r) and "(whole dataset)" in format_status(r)
+    # unscoped: the dataset's cumulative totals and every rejection, each log read once
+    u = status_report(**kw)
+    assert u["scope"] == "all" and u["parse"]["calcs_parsed"] == 4 and u["parse"]["frames"] == 160
+    assert u["parse"]["this_run_fetched"] == 10 and u["errors"]["rejections"] == 5
+    assert u["records"]["fetch_rejected"] == 1                  # record 3 is not on this keep-list
+    u2 = status_report(**{**kw, "extra_rejection_paths": (man / "rejections.jsonl",
+                                                          root / "manifests" / "." / "rejections.jsonl")})
+    assert u2["errors"]["rejections"] == 5                      # the same file named twice
+    # the CLI reads the pipeline's fetch log from --raw-dir without being told where it is
+    assert cli.main(["status", "--manifests-dir", str(zc), "--raw-dir", str(root / "raw_census"),
+                     "--dataset-dir", str(ds), "--keep", str(keep), "--scope-to-keep",
+                     "--no-staging-walk", "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["records"]["fetch_rejected"] == 1 and out["errors"]["rejections"] == 3
+    assert out["parse"]["calcs_parsed"] == 2
+
+
 def test_split_manifest_weighted_balances_calc_cost(tmp_path):
     # One calc-heavy record among many light ones: round-robin by RECORD piles the
     # parse cost onto whichever part the heavy record lands in, LPT by calc-unit count

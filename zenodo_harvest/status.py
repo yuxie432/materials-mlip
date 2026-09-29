@@ -69,6 +69,18 @@ def _dir_usage(root: Path) -> tuple[int, int, int]:
     return total, n_files, n_dirs
 
 
+def _rejection_record(rec: dict[str, Any]) -> str | None:
+    """The record a rejection-log line is about: a parse id is a calc_id
+    (``<source>:<recid>:<path>``), a fetch id is ``<recid>`` or ``<recid>:<file key>``."""
+    rid = rec.get("id")
+    if not isinstance(rid, str) or not rid:
+        return None
+    if str(rec.get("stage", "")).endswith("parse"):
+        parts = rid.split(":")
+        return parts[1] if len(parts) >= 3 and parts[1] else parts[0]
+    return rid.split(":", 1)[0]
+
+
 def _pct(num: float | None, den: float | None) -> float | None:
     return (100.0 * num / den) if (num is not None and den) else None
 
@@ -86,8 +98,19 @@ def status_report(
     keep_name: str = "keep.jsonl",
     extra_rejection_names: tuple[str, ...] = (),
     fetched_globs: list[str] | None = None,
+    extra_rejection_paths: tuple[str | Path, ...] = (),
+    scope_to_keep: bool = False,
 ) -> dict[str, Any]:
     """Build the machine-readable status snapshot (see module docstring).
+
+    ``extra_rejection_paths`` = further rejection logs by full path (a pipeline writes its fetch
+    rejections beside its RAW dir, ``<raw>/../manifests/rejections.jsonl``, which is not under
+    ``manifests_dir`` when the keep-list lives elsewhere — the census keep-lists); a path that is
+    already read is not read twice. ``scope_to_keep`` restricts every count taken from the
+    dataset or the rejection logs (calcs, frames, records in the dataset, the ERRORS histogram)
+    and the fetched manifests to the keep-list's records, so a run that writes into an existing
+    dataset reports its OWN progress instead of the dataset's cumulative totals (shards and
+    dataset bytes stay whole-dataset: a shard mixes records).
 
     ``staging_walk=False`` skips the STAGING section's walk over ``raw_dir``. That walk
     ``stat``s every inode under ``raw/``, which on Lustre with a live job is slow (minutes
@@ -131,6 +154,9 @@ def status_report(
             if rid:
                 keep_recids.add(str(rid))
                 unit_record[str(rid)] = str(rec.get("record_id") or rid)
+    # The records a scoped report counts: the keep-list's fetch units and the records they belong
+    # to (identical for Zenodo/NOMAD). ``None`` = no scope, count everything as before.
+    scope: set[str] | None = (keep_recids | set(unit_record.values())) if scope_to_keep else None
 
     # FETCH — aggregate across every fetched manifest. The pipeline writes one per part
     # (``part-NNN.fetched.jsonl``, matched by ``*.fetched.jsonl``); a standalone ``fetch``
@@ -149,6 +175,8 @@ def status_report(
     for p in fetched_files:
         for rec in read_jsonl(p):
             recid = rec.get("recid")
+            if scope is not None and str(recid) not in scope:
+                continue  # another run's fetched manifest under the same tree
             if recid and recid in seen_recids:
                 continue  # same record already counted from another fetched manifest
             if recid:
@@ -167,10 +195,6 @@ def status_report(
     parsed_recids: set[str] = set()  # distinct RECORDS that produced >=1 stored calc
     if meta.is_file():
         for rec in read_jsonl(meta):
-            n_calcs += 1
-            q = rec.get("quality") or {}
-            n_frames += int(q.get("n_frames", 0) or 0)
-            n_frames_forces += int(q.get("n_frames_with_forces", 0) or 0)
             # record id: from provenance if present, else the calc_id (zenodo:<recid>:<path>).
             rid = (rec.get("provenance") or {}).get("record_id")
             if not rid:
@@ -180,6 +204,12 @@ def status_report(
                     # the record id is the middle segment; fall back to the whole id otherwise.
                     parts = cid.split(":")
                     rid = parts[1] if len(parts) >= 3 else parts[0]
+            if scope is not None and str(rid) not in scope:
+                continue
+            n_calcs += 1
+            q = rec.get("quality") or {}
+            n_frames += int(q.get("n_frames", 0) or 0)
+            n_frames_forces += int(q.get("n_frames_with_forces", 0) or 0)
             if rid:
                 parsed_recids.add(str(rid))
 
@@ -207,9 +237,14 @@ def status_report(
     n_rej = 0
     rej_paths = [manifests_dir / "rejections.jsonl", dataset_dir / "rejections.jsonl"]
     rej_paths += [manifests_dir / n for n in extra_rejection_names]
+    rej_paths += [Path(p) for p in extra_rejection_paths]
+    read_paths: set[Path] = set()
     for rp in rej_paths:
-        if rp.is_file():
+        if rp.is_file() and rp.resolve() not in read_paths:
+            read_paths.add(rp.resolve())
             for rec in read_jsonl(rp):
+                if scope is not None and _rejection_record(rec) not in scope:
+                    continue
                 n_rej += 1
                 rej_by_reason[str(rec.get("reason", "?"))] += 1
                 rej_by_stage[str(rec.get("stage", "?"))] += 1
@@ -259,6 +294,7 @@ def status_report(
         "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "data": {"manifests": str(manifests_dir), "raw": str(raw_dir),
                  "dataset": str(dataset_dir)},
+        "scope": "keep-list" if scope is not None else "all",
         "discover": {"candidates": n_candidates,
                      "files": [p.name for p in cand_files]},
         "triage": {"keep": n_keep},
@@ -304,7 +340,9 @@ def format_status(r: dict[str, Any]) -> str:
     d, t, f = r["discover"], r["triage"], r["fetch"]
     p, s, st, e = r["parse"], r["store"], r["staging"], r["errors"]
     rc = r["records"]
-    lines = [f"harvest status @ {r['generated']}   ({r['data']['dataset']})",
+    scoped = r.get("scope") == "keep-list"
+    lines = [f"harvest status @ {r['generated']}   ({r['data']['dataset']})"
+             + ("   [scoped to the keep-list's records]" if scoped else ""),
              f"DISCOVER  candidates: {d['candidates']:,}",
              f"TRIAGE    keep-list:  {t['keep']:,}",
              f"FETCH     fetched:    {f['fetched_records']:,} / {f['to_fetch']:,}  "
@@ -315,7 +353,8 @@ def format_status(r: dict[str, Any]) -> str:
              f"PARSE     parsed:     {p['calcs_parsed']:,} calcs   frames: {p['frames']:,}   "
              f"(this run: {p['this_run_parsed']:,}/{p['this_run_fetched']:,} fetched parsed, "
              f"{_pctstr(p['pct'])})",
-             f"STORE     shards: {s['shards']:,}   dataset: {_h(s['dataset_bytes'])}"]
+             f"STORE     shards: {s['shards']:,}   dataset: {_h(s['dataset_bytes'])}"
+             + ("   (whole dataset)" if scoped else "")]
     if not st.get("walked", True):
         lines.append("STAGING   (walk skipped)  read /rds usage from: "
                      "lfs quota -u $USER <hpc-work>")

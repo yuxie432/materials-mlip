@@ -433,6 +433,11 @@ def _add_status(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--dataset-dir", default=str(config.DATASET_DIR))
     p.add_argument("--keep", default=None,
                    help="keep-list for the fetch %% denominator (default: <manifests>/keep.jsonl)")
+    p.add_argument("--scope-to-keep", action="store_true",
+                   help="count only the keep-list's records in the dataset totals (calcs, frames, "
+                        "records in the dataset), the fetched manifests and the rejection "
+                        "histogram: the progress of ONE run writing into an existing dataset "
+                        "(e.g. a census keep-list into the production dataset)")
     p.add_argument("--max-disk-bytes", type=int, default=0,
                    help="show staging bytes as %% of this budget (match the pipeline's value)")
     p.add_argument("--max-disk-files", type=int, default=0,
@@ -593,6 +598,10 @@ def main(argv: list[str] | None = None) -> int:
             max_disk_bytes=(args.max_disk_bytes or None),
             max_disk_files=(args.max_disk_files or None),
             staging_walk=not args.no_staging_walk,
+            # where `pipeline` writes its fetch rejections for this raw dir (the same file as
+            # <manifests>/rejections.jsonl in the default layout; read once)
+            extra_rejection_paths=(Path(args.raw_dir).parent / "manifests" / "rejections.jsonl",),
+            scope_to_keep=args.scope_to_keep,
         )
         print(json.dumps(report, indent=2) if args.json else format_status(report))
         return 0  # read-only: always succeeds
