@@ -6,11 +6,13 @@ every record that could hold VASP output, scored offline and peeked selectively 
 taken. Everything under "measured" was obtained live on **2026-09-25**. CSD3 runbook:
 `scripts/csd3/census/README.md`.
 
-> **Status (2026-09-28): census COMPLETE (583,930 records, every one of the 303 dataset records
-> among them) and SCORED on CSD3 — T1 2,932 · T2 33,046 · T3 344,689 · T0 200,743; all four known
-> keyword misses are T1 (§11). Next: triage (peeks), T1 first. The first census run died on a record
-> Zenodo's own JSON serializer cannot return; the census now routes around such records (§2).** 72
-> offline census tests; two review passes (§12).
+> **Status (2026-09-29): census COMPLETE (583,930 records, every one of the 303 dataset records
+> among them), SCORED (T1 2,933 · T2 33,175 · T3 344,635 · T0 200,669) and T1 TRIAGED on CSD3: VASP
+> evidence in 252 T1 records (incl. all four known keyword misses), 2,091 proven VASP-free, 590 kept by
+> the fail-safe; the residual T3 sample found 0 in 3,000 → T3 stops (§11). Added after it: deeper
+> peeks of unresolved archives (§5) and a parallel, RAM-budgeted parse for the pipeline. Next: T1
+> re-triage with deep peeks → T1 pipeline ∥ T2 triage → T2 pipeline.** 79 offline census tests; two
+> review passes (§12).
 
 ---
 
@@ -200,6 +202,26 @@ when set).
   4.5k/h); 429s honour `Retry-After`; each failed peek is retried once and never cached (nor is a
   failed zip→tar fallback); the verdict cache repairs a torn last line and keys head-peeks by head
   size.
+* **Deep peeks** (`zenodo_census/deeppeek.py`, 2026-09-29) — a second look at the files of records
+  the standard peeks leave unresolved, for the containers that CAN be listed without a download:
+  an **uncompressed tar** is walked header to header over Range (a member's size locates the next
+  header; the read size doubles along runs of small members and drops back to 64 KiB after a big
+  one); a **7z** is listed from its end header (py7zr through a Range-backed file, 2-3 reads); the
+  **archives nested in a zip** are read in place (local header + first 2 MiB in one read, inflated,
+  then head-peeked, local-header-walked, or listed through their own central directory / end header
+  when stored), VASP-hinting names first, ≤ 40 per zip. A walk stops at its first VASP output; each
+  archive gets ≤ 300 reads (`DEEP_MAX_REQUESTS`; 100 suffices for T2, fetched only on evidence) and
+  ≤ 256 MiB (`DEEP_MAX_BYTES` — a walk over thousands of small members must not become a download;
+  no single read over 64 MiB). An exact listing ("complete", the only proof of "no VASP") needs a
+  tar walked to its end block or to the exact end of the file, a 7z end header decoded, or — for a
+  zip — EVERY nested archive listed exactly with nothing nested further (a rar, an AiiDA export, a
+  deflated 7z, a member past the cap or the budget all leave it partial).
+  In T1, 49% of the unresolved records held at least one such archive and 46% nothing else; the
+  live check listed a 2 GB tar in 10 reads and a 49 GB 7z in 3 (both VASP-free). Compressed tar
+  streams (gzip / bzip2 / xz / zstd) and rar have no in-place listing. A T1 record deep peeks prove
+  empty is not downloaded; one they prove VASP is kept on evidence; one still unresolved stays
+  fail-safe (downloaded whole, **no size cap**, as in the keyword harvest); for T2 — no fail-safe —
+  deep peeks are the only way its VASP inside such archives is found.
 * **Decision** (`triage.decide`): keep on positive evidence (a peeked VASP primary; a head listing
   VASP-named files; a loose primary) — with every unresolved sibling archive — or, for T1 only, when
   an archive cannot be settled; prune proven-empty archives; divert ND / no-licence records to
@@ -218,6 +240,16 @@ when set).
 | 3 | ND / no-licence VASP records | **List for case-by-case approval** (as `10579527` was) | harvest no-licence automatically; exclude |
 | — | Licence admitted | open + NC/NC-SA (the dataset's current scope after the NC expansion) | — |
 | — | Destination | direct into the production Zenodo dataset (metadata backup first), as the NC expansion | staging + merge |
+
+**2026-09-29, after the T1 triage**
+
+| # | Decision | Chosen | Alternatives |
+|---|---|---|---|
+| 4 | T1 fail-safe records (590; 3.38 TB unresolved) | **Deep-peek their unresolved archives; download whatever stays unresolved WHOLE, no size cap** (as the keyword harvest) | whole downloads without deep peeks; a 20 GB cap with a review list |
+| 5 | Deep peeks for T2 | **Yes** — T2 has no fail-safe, so they are the only route to its VASP inside such archives | none (unresolved T2 records dropped) |
+| 6 | ND (CC BY-NC-ND) records with VASP (3, 0.07 GB) | **Exclude** (ND never admitted) | include |
+| 7 | No-licence records (24) | **Exclude** from the pipeline | case by case |
+| 8 | Residual T3 (0 VASP in a 3,000 sample) | **Stop** — no full T3 run | extend the sample; full T3 (~3 days of peeks) |
 
 ---
 
@@ -350,6 +382,44 @@ whether a few large trajectory sets are among them. Triage turns this into measu
 4.5k/h — about 3× the design estimate, because T2 is 33k (two thirds of it `paper_field`). T1 plus
 the residual (3,000) and negative (300) samples ≈ 15k requests ≈ 3.5 h.
 
+### Re-score — CSD3 job 36640142 (2026-09-28, 37 min, all links cached)
+
+With the recheck promotion (§3): T1 2,933 · T2 33,175 (128 keyword rechecks promoted from T3/T0) ·
+T3 344,635 · T0 200,669; 2 newer versions of recheck candidates re-admitted (evaluated 2,215); Europe
+PMC picked up 4 new papers (596 hits).
+
+### T1 triage — CSD3 job 36640154 (2026-09-28, 3 h 26 min)
+
+6,233 records (T1 2,933 + residual sample 3,000 + negative sample 300), 14,827 files peeked at
+~4,300/h (10,268 zip directories, 4,545 heads; 14 failures/odd containers).
+
+| T1 outcome | records | share |
+|---|---|---|
+| VASP evidence | 252 | 8.6% — 219 a VASP output seen, 11 a loose output, 22 only VASP-named inputs in a partial head; **all four known keyword misses** |
+| proven VASP-free | 2,091 | 71.3% |
+| unresolved → kept by the fail-safe | 590 | 20.1% (576 admitted + 14 licence review) |
+
+Kept (admitted licences): **815 records** — 239 on evidence (578.7 GB of evidenced archives; ~109k VASP
+primaries in their zip listings, 22 records > 1,000 each) + 576 fail-safe (3.38 TB of unresolved
+archives). Licence review: 27 (24 no licence, 3 CC BY-NC-ND) — all excluded (decisions 6-7).
+Residual T3 sample 0 / 3,000 (95% upper bound 1 in 782), negative T0 sample 0 / 300 → T3 stops.
+
+**Hit rate per T1 signal** (resolved records): VASP-named archive 65% (28/43) · "VASP" in the text
+61% (60/98) · known depositor account 32% (74/231) · Europe PMC mention 15.5% (46/297) · known ORCID
+14.5% (94/649) · linked paper cites VASP 9.6% (19/198) · DFT + materials text 9.3% (110/1,178) ·
+MLIP + materials text 7.3% (14/193) · loose VASP file 100% (13/13).
+
+**The fail-safe records** carry: DFT + materials text 288 (49%), ORCID 165 (28%), Europe PMC 68
+(12%), MLIP text 60 (10%), account 54 (9%), paper 44 (7%), "VASP" 15, VASP-named file 2 — mostly one
+signal alone (236 text only, 120 ORCID only, 55 Europe PMC only). Applying the per-signal hit rates:
+**~63-85 VASP records** expected among them (flat 10.8% rate; per-record best signal) — an upper-middle
+estimate, since an unresolved archive whose head showed only non-VASP members is less likely VASP.
+Their unresolved bytes by container: gzip tar 1.09 TB · zips nesting archives 0.85 TB · uncompressed
+tar 0.52 TB · xz/bzip2/zstd tar 0.43 TB · 7z 0.31 TB · rar 0.06 TB — about half deep-peekable (§5).
+By size, the 65 records over 20 GB hold 2.52 TB for ~11 of the expected records (tomography,
+patents, phase-field and MD sets among them); they are fetched whole all the same (decision 4)
+unless a deep peek proves them VASP-free.
+
 ---
 
 ## 12. Review (2026-09-25)
@@ -365,3 +435,18 @@ a `.zip` name fetched with the wrong extractor; transient fallback failures cach
 Europe PMC coverage miscounting versions; single ambiguous cues (the VASP protein, `DFT_*` file
 names, "phonon"+"phonons") reaching T1; and a missing-exclusions run silently re-admitting harvested
 records.
+
+**Deep peeks, 2026-09-29.** An independent review of `deeppeek.py` + its triage integration found
+11 defects, all fixed with regression tests (`tests/test_zenodo_census_deeppeek.py`) and a
+randomized check against tarfile / zipfile / py7zr ground truth (1,400 archives and truncations, no
+false proof): FALSE PROOFS from a 7z entry stored without a name (py7zr names it after the file —
+now given the file's name, and a nameless entry with no name known leaves the listing partial), a
+member >= 8 GiB whose real size sits in a PAX `size` record, GNU sparse members and sized directory
+headers (both walks now follow tarfile's own hop rules — `walk_tar` too), an AppleDouble `._` sidecar
+stopping a walk; a py7zr SPIN on a corrupt packed header (the header is now decoded in a child
+process killed after 30 s, memory-capped, fed by the parent's paced reads); a transient failure
+inside a nested walk cached as a verdict; reads outside the byte budget (the outer central
+directory — now read through it via zipfile — and failed nested walks); inverted Range requests;
+the `.aiida` extractor dropped by the overlay; a zip's own top-level VASP inputs counted as new
+evidence; and `20_pipeline.sh` accepting a job too small for its parse budget (now refused for any
+worker count; successors keep `--mem`).

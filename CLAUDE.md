@@ -24,7 +24,9 @@ mentor. All five stages (discover → triage → fetch → parse → store) now 
 **Part A (blind-spot discovery) is BUILT as `zenodo_census/` — a census of every archive-bearing
 Zenodo record scored offline + selectively peeked, feeding the ordinary pipeline
 (`docs/ZENODO_CENSUS.md`, `scripts/csd3/census/`). Census COMPLETE + scored on CSD3 (583,930 records;
-T1 2,932 / T2 33,046; all 4 known keyword misses in T1); triage next (T1 first).**
+T1 2,933 / T2 33,175) and T1 TRIAGED (252 VASP-evidence records incl. all 4 known keyword misses,
+590 kept fail-safe); deep peeks added (`zenodo_census/deeppeek.py`); next: T1 re-triage → T1
+pipeline ∥ T2 triage → T2 pipeline.**
 
 ## Code layout & commands
 
@@ -352,6 +354,11 @@ T1 2,932 / T2 33,046; all 4 known keyword misses in T1); triage next (T1 first).
   from the gzip ISIZE trailer), since RAM tracks the decompressed trajectory, not the bytes
   on disk. It only skips (logs `primary_too_large`, keeps the staged file) — the calc can
   be re-parsed later on a bigger-RAM job. Calibrate with `scripts/csd3/csd3_parse_memory.py`.
+  **Parallel parse under a RAM budget** (2026-09-29): `pipeline`/`parse` take `--parse-workers`,
+  `--parse-mem-budget`, `--parse-rss-ratio` (defaults = serial, the old behaviour); each parse
+  reserves ~ratio × its uncompressed primary FIFO, so the cap becomes a per-file bound (ratio × cap
+  ≤ budget). `scripts/csd3/20_pipeline.sh` sizes them from the job's RAM: 8 icelake-himem cores →
+  4 parse workers, 42 GiB budget, 3.8 GB cap (`sbatch -c 12` → 6.1 GB); successors keep the shape.
   Parallel parse on the cluster (array-job model): `split` the fetched manifest into N parts,
   run N array tasks each parsing its part into its OWN `--dataset-dir`, then `merge-datasets`
   the per-task dirs into one, `verify` the merged dataset, and `purge-raw` the parsed archives:
@@ -479,8 +486,10 @@ Not a source but a Zenodo discovery front-end, with its own `CLAUDE.md`:
   token), offline signals (robust local text matching — Zenodo's `q` loses words glued by `&nbsp;`
   and never stems quoted phrases —, depositor account / ORCID / community of the known-VASP records,
   linked or citing papers that cite the VASP method papers via OpenAlex, Europe PMC data-availability
-  mentions) → tiers → ZIP64-aware zip peeks + tar head-peeks under one Zenodo-rate pacer → an ORDINARY
-  Zenodo keep-list for `20_pipeline.sh` (`docs/ZENODO_CENSUS.md`). Shared changes (backward-
+  mentions) → tiers → ZIP64-aware zip peeks + tar head-peeks under one Zenodo-rate pacer, then deep
+  peeks of what they leave unresolved (uncompressed tars walked header to header, 7z end headers,
+  archives nested in zips — `deeppeek.py`) → an ORDINARY Zenodo keep-list for `20_pipeline.sh`
+  (`docs/ZENODO_CENSUS.md`). Shared changes (backward-
   compatible): `materials_cloud_harvest/remote_zip.py` takes an optional `size=` (Zenodo breaks
   suffix ranges longer than the file), retries a 416 from a stale size, and reports a mid-read
   failure as a failed peek; `zenodo_harvest/models.is_reusable_license` treats `other-closed` as not
