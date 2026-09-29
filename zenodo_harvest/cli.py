@@ -67,7 +67,7 @@ from .net_properties_recover import (
     build_net_properties_keeplist,
     compute_net_properties,
 )
-from .parse import parse
+from .parse import DEFAULT_PARSE_RSS_RATIO, parse
 from .store import DatasetLockError
 from .triage import triage
 
@@ -155,6 +155,23 @@ def _add_fetch(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--max-records", type=int, default=None)
 
 
+def _add_parse_concurrency(p: argparse.ArgumentParser) -> None:
+    """Parallel parse under a shared RAM budget (the shared ``parse``'s ``parse_workers`` /
+    ``parse_mem_budget``): defaults = serial, no budget — the behaviour before these flags."""
+    p.add_argument("--parse-workers", type=int, default=1,
+                   help="calc units parsed concurrently (default 1 = serial); each in its own "
+                        "timeout-guarded child, so use with --parse-timeout > 0")
+    p.add_argument("--parse-mem-budget", type=int, default=0,
+                   help="RAM (bytes) the concurrent parses may reserve between them (0 = off): "
+                        "each parse first reserves ~--parse-rss-ratio x its largest "
+                        "uncompressed primary, FIFO, so small calcs run --parse-workers-way while "
+                        "a multi-GB primary waits and then runs alone — size "
+                        "--max-primary-bytes to ~budget/ratio, not RAM/(workers x ratio)")
+    p.add_argument("--parse-rss-ratio", type=float, default=DEFAULT_PARSE_RSS_RATIO,
+                   help="peak parse RSS per uncompressed primary byte assumed by the budget "
+                        f"(default {DEFAULT_PARSE_RSS_RATIO}; CSD3 measured 3.7-10.5)")
+
+
 def _add_parse(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("parse", help="stage 3: parse fetched calcs -> extxyz.gz + metadata.jsonl")
     p.add_argument("--in", dest="in_path", required=True, help="fetched manifest JSONL")
@@ -185,6 +202,7 @@ def _add_parse(sub: argparse._SubParsersAction) -> None:
                         "skipping them on resume. Default: skip them (they fail identically). "
                         "Use after upgrading pymatgen/ase.")
     p.add_argument("--max-records", type=int, default=None)
+    _add_parse_concurrency(p)
 
 
 def _add_split(sub: argparse._SubParsersAction) -> None:
@@ -466,6 +484,7 @@ def _add_pipeline(sub: argparse._SubParsersAction) -> None:
                         "seconds (0 = off); a non-terminating parse is logged 'parse_timeout' "
                         "and skipped instead of freezing the whole overlapped pipeline. "
                         "Default 1200 (20 min).")
+    _add_parse_concurrency(p)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -551,6 +570,8 @@ def main(argv: list[str] | None = None) -> int:
                 max_primary_bytes=args.max_primary_bytes,
                 parse_timeout_s=args.parse_timeout,
                 retry_rejected=args.retry_rejected,
+                parse_workers=args.parse_workers, parse_mem_budget=args.parse_mem_budget,
+                parse_rss_ratio=args.parse_rss_ratio,
             )
         except DatasetLockError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
@@ -727,7 +748,8 @@ def main(argv: list[str] | None = None) -> int:
             fetched = str(_fetched_path(part))
             parse(fetched, dataset_dir=str(ds_dir), rejections_path=parse_rej,
                   raw_dir=str(raw_dir), max_primary_bytes=args.max_primary_bytes,
-                  parse_timeout_s=args.parse_timeout)
+                  parse_timeout_s=args.parse_timeout, parse_workers=args.parse_workers,
+                  parse_mem_budget=args.parse_mem_budget, parse_rss_ratio=args.parse_rss_ratio)
             purge_raw(str(raw_dir), str(ds_dir), fetched=fetched)
 
         fetch_error: str | None = None

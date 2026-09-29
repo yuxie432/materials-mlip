@@ -145,6 +145,7 @@ submit_successor() {
         # keep THIS job's shape (a `sbatch -p … -c … -t …` override must survive the chain — the
         # spooled script's own #SBATCH lines would otherwise win)
         local shape=(--partition="${SLURM_JOB_PARTITION}" --cpus-per-task="${SLURM_CPUS_PER_TASK}")
+        [[ -n "${SLURM_MEM_PER_NODE:-}" ]] && shape+=(--mem="${SLURM_MEM_PER_NODE}M")
         local tl; tl=$(squeue -h -j "${SLURM_JOB_ID}" -o %l 2>/dev/null || true)
         [[ -n "$tl" && "$tl" != "UNLIMITED" ]] && shape+=(--time="$tl")
         NEXT_JOBID=$(sbatch --parsable --dependency="afterany:${SLURM_JOB_ID}" "${shape[@]}" \

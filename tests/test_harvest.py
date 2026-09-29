@@ -16,6 +16,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import tarfile
 import threading
 import zipfile
@@ -1705,6 +1706,34 @@ def test_cli_pipeline_wiring(tmp_path, monkeypatch):
     assert calls.count("fetch") == 3 and calls.count("parse") == 3 and calls.count("purge") == 3
 
 
+def test_cli_pipeline_and_parse_pass_the_parse_concurrency_options(tmp_path, monkeypatch):
+    # --parse-workers / --parse-mem-budget / --parse-rss-ratio reach the shared parse; the
+    # defaults are the old behaviour (serial, no budget).
+    import zenodo_harvest.cli as cli_mod
+    keep = tmp_path / "keep.jsonl"
+    keep.write_text(json.dumps({"recid": "1", "files": []}) + "\n")
+    seen: list[dict] = []
+
+    def fake_fetch(in_path, out_path, raw_dir, **k):
+        Path(out_path).write_text(json.dumps({"recid": "x"}) + "\n")
+        return {"fetched": 1, "stopped_disk_budget": False}
+
+    monkeypatch.setattr(cli_mod, "fetch", fake_fetch)
+    monkeypatch.setattr(cli_mod, "parse", lambda *a, **k: seen.append(k) or {"ok": True})
+    monkeypatch.setattr(cli_mod, "purge_raw", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(cli_mod, "verify_dataset", lambda d: {"ok": True})
+    common = ["--raw-dir", str(tmp_path / "raw"), "--dataset-dir", str(tmp_path / "ds")]
+    assert cli_mod.main(["pipeline", "--in", str(keep), "--parts", "1", *common]) == 0
+    assert (seen[-1]["parse_workers"], seen[-1]["parse_mem_budget"]) == (1, 0)
+    assert cli_mod.main(["pipeline", "--in", str(keep), "--parts", "1", "--parse-workers", "4",
+                         "--parse-mem-budget", "40000000000", "--parse-rss-ratio", "11",
+                         *common]) == 0
+    assert (seen[-1]["parse_workers"], seen[-1]["parse_mem_budget"],
+            seen[-1]["parse_rss_ratio"]) == (4, 40_000_000_000, 11.0)
+    assert cli_mod.main(["parse", "--in", str(keep), "--parse-workers", "3", *common]) == 0
+    assert seen[-1]["parse_workers"] == 3 and seen[-1]["parse_mem_budget"] == 0
+
+
 def test_cli_pipeline_resumes_a_batch_stopped_by_the_disk_budget(tmp_path, monkeypatch):
     # The end-to-end version of the disk-budget property: stage-2 fetch reporting
     # stopped_disk_budget must make the CLI's fetch_fn return False, so the batch is
@@ -3298,3 +3327,39 @@ def test_fetch_record_nested_archive_availability_scoped_per_calc(tmp_path):
              for i, u in enumerate(entry["calc_units"])
              if "run2.tar.gz" in u["dir"]]
     assert charge == [True] and other == [False]              # scoped to run1's sub-archive
+
+
+# --- 20_pipeline.sh: the parse RAM budget follows the job, for every shape -------------------
+
+def _pipeline_dry_run(tmp_path: Path, **env: str) -> str:
+    (tmp_path / "logs").mkdir(exist_ok=True)
+    (tmp_path / "keep.jsonl").write_text('{"recid": "1"}\n')
+    stub = tmp_path / "python"
+    stub.write_text('#!/bin/bash\nif [[ "$1" == "-" ]]; then cat >/dev/null; exit 0; fi\n'
+                    'echo "PYTHON $*"\n')
+    stub.chmod(0o755)
+    e = {"PATH": f"{tmp_path}:{os.environ['PATH']}", "HOME": str(tmp_path), "USER": "tester",
+         "SLURM_SUBMIT_DIR": str(tmp_path), "ZENODO_HARVEST_DATA": str(tmp_path),
+         "IN": str(tmp_path / "keep.jsonl"), **env}
+    r = subprocess.run(["bash", str(Path(__file__).resolve().parents[1] / "scripts/csd3/20_pipeline.sh")], cwd=tmp_path, env=e,
+                       capture_output=True, text=True, timeout=60)
+    return r.stdout + r.stderr
+
+
+def test_pipeline_script_sizes_the_parse_budget_from_the_job(tmp_path):
+    out = _pipeline_dry_run(tmp_path, SLURM_CPUS_PER_TASK="8", SLURM_MEM_PER_CPU="6760")
+    assert "--parse-workers 4" in out and "--parse-mem-budget 45969571840" in out
+    assert "--max-primary-bytes 3786058410" in out
+    out = _pipeline_dry_run(tmp_path, SLURM_CPUS_PER_TASK="12", SLURM_MEM_PER_CPU="6760")
+    assert "--max-primary-bytes 6148849664" in out
+    for env in ({"SLURM_CPUS_PER_TASK": "2", "SLURM_MEM_PER_CPU": "3380", "PARSE_WORKERS": "1"},
+                {"SLURM_CPUS_PER_TASK": "2", "SLURM_MEM_PER_NODE": "10500"},
+                {"SLURM_CPUS_PER_TASK": "4", "SLURM_MEM_PER_CPU": "6760",
+                 "PARSE_MEM_BUDGET": "0"}):
+        out = _pipeline_dry_run(tmp_path, **env)
+        assert "ERROR" in out and "PYTHON -m zenodo_harvest.cli" not in out, env
+    out = _pipeline_dry_run(tmp_path, SLURM_CPUS_PER_TASK="4", SLURM_MEM_PER_CPU="6760",
+                            PARSE_WORKERS="1", PARSE_MEM_BUDGET="0",
+                            MAX_PRIMARY_BYTES="2000000000")
+    assert "--parse-mem-budget 0" in out and "--max-primary-bytes 2000000000" in out
+

@@ -5,7 +5,13 @@
 #SBATCH -p icelake-himem               # 6760 MiB/core: parse (pymatgen) needs the RAM
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4              # bought for RAM (~26 GiB), not compute — see MAX_PRIMARY_BYTES
+#SBATCH --cpus-per-task=8              # ~53 GiB on icelake-himem: 4 parse workers under a RAM budget
+                                       # (see PARSE_MEM_BUDGET) + 4 fetch workers (decompression is
+                                       # CPU too). Sized for the census keep-lists (2026-09-29: ~110k
+                                       # small primaries -> parse-throughput matters; the keyword
+                                       # harvest saw only 8 of 182k primaries above 2 GB). The
+                                       # budget/cap follow whatever you ask for (`sbatch -c 12 …`), and
+                                       # RESUBMIT successors keep the same shape.
 #SBATCH --time=12:00:00                # SL3 max; SL1/SL2 may use up to 36:00:00
 #SBATCH --signal=B:USR1@600            # SIGUSR1 to the batch shell 10 min before wallclock
 #SBATCH -o logs/zh-pipeline-%j.out     #   -> lets RESUBMIT=1 queue a resume job before the
@@ -44,6 +50,9 @@ export ZENODO_HARVEST_DATA="${ZENODO_HARVEST_DATA:-/rds/user/$USER/hpc-work/zeno
 # would — nor the /rds quota (the disk valve does not track $TMPDIR). Fall back to /rds scratch.
 if [[ -d /local && -w /local ]]; then export TMPDIR="/local"; else export TMPDIR="$ZENODO_HARVEST_DATA/tmp"; fi
 mkdir -p "$TMPDIR"
+# .rar archives need an unrar binary (rarfile shells out to it): the static RARLAB one in ~/bin,
+# as for the rar recovery (49_rar_recover.sh). py7zr / zstandard come from the `archives` extra.
+export PATH="$HOME/bin:$PATH"
 cd "${SLURM_SUBMIT_DIR:-.}"
 # --------------------------------------------------------------------------------
 
@@ -70,12 +79,37 @@ MAX_DISK_FILES="${MAX_DISK_FILES:-800000}"
 # vasprun.xml/OUTCAR file size (CSD3 icelake-himem: a 534 MB file peaks at ~5.6 GB). An
 # over-budget parse is a cgroup SIGKILL of the whole job (taking the in-flight fetch progress
 # with it), NOT a catchable error, so we cap the file size to cap the RAM. Memory is per core
-# on CSD3 (icelake-himem = 6760 MiB/core), so --cpus-per-task=4 above gives ~26 GiB; after
-# leaving room for the concurrent fetch (~1 GiB), the safe cap is ~0.85 x 26 GiB / 10 ~= 2 GB.
-# To parse bigger primaries, raise --cpus-per-task (more RAM) and this value together. Re-check
-# on REAL data (synthetic samples read a touch high) with `scripts/csd3/csd3_parse_memory.py`,
+# on CSD3 (icelake-himem = 6760 MiB/core). The cap now FOLLOWS the parse budget below (a bigger
+# job — `sbatch -c 12` — raises both); an over-cap primary is logged primary_too_large and kept
+# staged for a bigger-RAM re-parse. Re-check on REAL data with `scripts/csd3/csd3_parse_memory.py`,
 # then verify the peak: `sacct -j <jobid> --format=MaxRSS`.
-MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-2000000000}"
+# Parse concurrency under a shared RAM BUDGET (as the Materials Cloud pipeline): each parse first
+# reserves ~RSS_RATIO x its (uncompressed) primary, FIFO, so small calcs run PARSE_WORKERS-way while
+# a multi-GB vasprun waits and then runs alone. The cap is therefore a per-FILE bound
+# (RSS_RATIO x cap <= budget), not workers x ratio x cap <= RAM. Budget = the job's RAM (cpus x
+# SLURM_MEM_PER_CPU, so any partition/shape is safe) minus FETCH_RESERVE_GIB for the main process
+# + fetch workers (zip directories of 100k-member archives, py7zr dictionaries of solid .7z).
+# At 8 himem cpus: ~42.8 GiB budget -> ~3.8 GB cap. The budget applies to a serial parse too
+# (PARSE_WORKERS=1); only PARSE_MEM_BUDGET=0 (explicit) turns it off, and then MAX_PRIMARY_BYTES
+# must be set by hand (the old serial behaviour: PARSE_MEM_BUDGET=0 MAX_PRIMARY_BYTES=2000000000).
+RSS_RATIO="${RSS_RATIO:-12}"           # INTEGER: pymatgen peak / primary (measured 3.7-10.5x)
+PARSE_WORKERS="${PARSE_WORKERS:-4}"
+FETCH_RESERVE_GIB="${FETCH_RESERVE_GIB:-10}"
+if [[ -n "${SLURM_MEM_PER_NODE:-}" ]]; then JOB_RAM_MIB="$SLURM_MEM_PER_NODE"
+else JOB_RAM_MIB=$(( ${SLURM_CPUS_PER_TASK:-8} * ${SLURM_MEM_PER_CPU:-6760} )); fi
+PARSE_MEM_BUDGET="${PARSE_MEM_BUDGET:-$(( JOB_RAM_MIB * 1048576 - FETCH_RESERVE_GIB * 1073741824 ))}"
+if (( PARSE_MEM_BUDGET == 0 )); then
+    if [[ -z "${MAX_PRIMARY_BYTES:-}" ]]; then
+        echo "ERROR: PARSE_MEM_BUDGET=0 (no RAM budget) needs an explicit MAX_PRIMARY_BYTES" >&2
+        exit 2
+    fi
+elif (( PARSE_MEM_BUDGET < 2147483648 )); then
+    echo "ERROR: ${JOB_RAM_MIB} MiB of RAM leaves only $(( PARSE_MEM_BUDGET / 1048576 )) MiB of parse" \
+         "budget after the ${FETCH_RESERVE_GIB} GiB fetch reserve — ask for more cores / icelake-himem" >&2
+    exit 2
+else
+    MAX_PRIMARY_BYTES="${MAX_PRIMARY_BYTES:-$(( (PARSE_MEM_BUDGET - 536870912) / RSS_RATIO ))}"
+fi
 # Parse each calc unit in a child process hard-killed after this many seconds, so ONE
 # non-terminating pymatgen/ASE parse (a truncated vasprun.xml can hang for hours) is logged
 # 'parse_timeout' and skipped instead of silently freezing the whole overlapped pipeline
@@ -102,6 +136,19 @@ if [[ ! -s "$IN" ]]; then
 fi
 
 echo "=== pipeline attempt $ATTEMPT/$MAX_ATTEMPTS $(date -Is) on $(hostname) ==="
+echo "    in=$IN  parts=$PARTS fetch_workers=$WORKERS parse_workers=$PARSE_WORKERS" \
+     "mem_budget=$(( PARSE_MEM_BUDGET / 1073741824 )) GiB max_primary=$MAX_PRIMARY_BYTES B" \
+     "(ratio $RSS_RATIO) valve=${MAX_DISK_BYTES} B/${MAX_DISK_FILES} inodes timeout=${PARSE_TIMEOUT}s"
+# Archive backends: a missing one only turns those archives into logged `archive_unsupported`
+# rejections — warn loudly, do not abort the harvest.
+python - <<'PY' || true
+import importlib.util, shutil
+mods = {m: bool(importlib.util.find_spec(m)) for m in ("py7zr", "rarfile", "zstandard")}
+tool = next((t for t in ("unrar", "unar", "bsdtar", "7z") if shutil.which(t)), None)
+ok = all(mods.values()) and tool
+print(f"    archive backends: {mods}, rar tool: {tool or 'NONE'}" + ("" if ok else
+      "  <-- WARNING: install the 'archives' extra / put unrar in ~/bin, or .7z/.rar are skipped"))
+PY
 # RDS usage vs the 1 TB / 1M-file quota. NB `df -h` shows the whole shared Lustre pool (not
 # your quota) and plain `quota` misses Lustre — prefer the CSD3 `quota` wrapper / `lfs quota`.
 # The pipeline's own peak_staged_bytes/peak_staged_files (in its JSON summary) is authoritative.
@@ -141,7 +188,15 @@ submit_successor() {
     # MAX_ATTEMPTS, not this value); RESUBMIT=0 or unset disables.
     if [[ "${RESUBMIT:-0}" != "0" && -z "$NEXT_JOBID" && "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]]; then
         echo "=== queueing resume job (attempt $((ATTEMPT + 1))/$MAX_ATTEMPTS) $(date -Is) ==="
-        NEXT_JOBID=$(sbatch --parsable --dependency="afterany:${SLURM_JOB_ID}" \
+        # keep THIS job's shape (a `sbatch -p … -c … -t …` override must survive the chain — the
+        # spooled script's own #SBATCH lines would otherwise win)
+        local shape=(--partition="${SLURM_JOB_PARTITION}" --cpus-per-task="${SLURM_CPUS_PER_TASK}")
+        # the RAM the parse budget was sized from goes along too (a successor must not size its
+        # budget from an inherited SLURM_MEM_PER_NODE it was never given)
+        [[ -n "${SLURM_MEM_PER_NODE:-}" ]] && shape+=(--mem="${SLURM_MEM_PER_NODE}M")
+        local tl; tl=$(squeue -h -j "${SLURM_JOB_ID}" -o %l 2>/dev/null || true)
+        [[ -n "$tl" && "$tl" != "UNLIMITED" ]] && shape+=(--time="$tl")
+        NEXT_JOBID=$(sbatch --parsable --dependency="afterany:${SLURM_JOB_ID}" "${shape[@]}" \
             --export="ALL,ATTEMPT=$((ATTEMPT + 1)),RESUBMIT=1" "$0") || NEXT_JOBID=""
         echo "  -> successor job: ${NEXT_JOBID:-<sbatch failed; resubmit by hand>}"
     fi
@@ -164,6 +219,9 @@ python -m zenodo_harvest.cli -v pipeline \
     --max-disk-bytes "$MAX_DISK_BYTES" \
     --max-disk-files "$MAX_DISK_FILES" \
     --max-primary-bytes "$MAX_PRIMARY_BYTES" \
+    --parse-workers "$PARSE_WORKERS" \
+    --parse-mem-budget "$PARSE_MEM_BUDGET" \
+    --parse-rss-ratio "$RSS_RATIO" \
     --parse-timeout "$PARSE_TIMEOUT" \
     --raw-dir "$RAW_DIR" \
     --dataset-dir "$DATASET_DIR" \
