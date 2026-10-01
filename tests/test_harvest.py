@@ -3050,6 +3050,27 @@ def test_status_fetch_dedupes_recids_across_overlapping_manifests(tmp_path):
     assert r["fetch"]["pct"] == 100.0                                # 3/3, not 200%
 
 
+def test_status_reports_every_rejection_reason_not_just_the_top_eight(tmp_path):
+    """A rare but actionable reason (census T1: 4 primary_too_large behind 8 bigger reasons) must
+    show in the report and its text line — a top-8 cut hid it, even from --json."""
+    from zenodo_harvest.status import format_status, status_report
+    man, ds = tmp_path / "manifests", tmp_path / "dataset"
+    man.mkdir()
+    ds.mkdir()
+    lines = []
+    for i in range(9):                                   # 9 common reasons, 10 lines each ...
+        lines += [f'{{"stage":"parse","id":"zenodo:1:c{i}_{j}","reason":"common_{i}"}}'
+                  for j in range(10)]
+    lines.append('{"stage":"parse","id":"zenodo:1:big","reason":"primary_too_large"}')  # ... + 1
+    (ds / "rejections.jsonl").write_text("\n".join(lines) + "\n")
+    r = status_report(manifests_dir=man, raw_dir=tmp_path / "raw", dataset_dir=ds,
+                      staging_walk=False)
+    assert r["errors"]["by_reason"]["primary_too_large"] == 1
+    assert len(r["errors"]["by_reason"]) == 10
+    assert list(r["errors"]["by_reason"])[-1] == "primary_too_large"        # most common first
+    assert "primary_too_large 1" in format_status(r)
+
+
 def test_status_report_empty_dirs_no_crash(tmp_path):
     from zenodo_harvest.status import format_status, status_report
     r = status_report(manifests_dir=tmp_path / "m", raw_dir=tmp_path / "r",

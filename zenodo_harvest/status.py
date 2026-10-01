@@ -316,7 +316,9 @@ def status_report(
                     "pct_bytes": _pct(raw_bytes, max_disk_bytes),
                     "pct_inodes": _pct(inodes, max_disk_files)},
         "errors": {"rejections": n_rej,
-                   "by_reason": dict(rej_by_reason.most_common(8)),
+                   # EVERY reason, most common first: a top-N cut hid the small but actionable
+                   # ones (census T1: 4 primary_too_large behind 8 bigger reasons, even in --json)
+                   "by_reason": dict(rej_by_reason.most_common()),
                    "by_stage": dict(rej_by_stage)},
     }
 
