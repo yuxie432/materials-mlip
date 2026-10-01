@@ -744,6 +744,44 @@ def _outcar_scf_for(outcar_path: str | None
     return conv or None
 
 
+def _guard_numeric_algo() -> None:
+    """Make pymatgen tolerate a NUMERIC ``ALGO`` (legacy ``ALGO = 48`` / ``68``), idempotently.
+
+    ``Vasprun.__init__`` calls ``converged_electronic``, which does
+    ``self.incar.get("ALGO", "").lower()`` — so a valid vasprun.xml whose INCAR gives ALGO as a
+    number (pymatgen parses it to ``int``) raised ``AttributeError: 'int' object has no attribute
+    'lower'`` and the whole calc was rejected (``vasprun_parse_error``: NOMAD ~1,380 calcs, recovered
+    once by ``scripts/csd3/nomad/recover_int_algo.py``; census T1 record 7506565, 158 calcs). The
+    wrapper coerces a non-str ALGO to its string form before the original property runs, so the
+    result is exactly what pymatgen gives for the same file with a string ALGO; a string ALGO is
+    untouched. It writes into ``incar.data`` (the UserDict store): ``Incar.__setitem__`` re-coerces
+    ``"48"`` straight back to ``int`` (verified). Applied lazily (parse.py imports pymatgen only
+    when parsing), at every parse entry point, so it holds inside forkserver parse children too.
+    """
+    from pymatgen.io.vasp.outputs import Vasprun
+    prop = Vasprun.__dict__.get("converged_electronic")
+    fget = getattr(prop, "fget", None)
+    if fget is None or getattr(fget, "_zh_numeric_algo_guard", False):
+        return
+
+    # Same recipe as the validated NOMAD recovery (scripts/csd3/nomad/recover_int_algo.py,
+    # +1,380 calcs): coerce into ``incar.data``, defensively, then return the ORIGINAL property's
+    # value unchanged. Unlike that script it lives at the parse entry points, so it also applies in
+    # the forkserver timeout children (no need to parse in-process).
+    def converged_electronic(self: Any) -> Any:
+        algo = self.incar.get("ALGO", "")
+        if not isinstance(algo, str):
+            try:
+                self.incar.data["ALGO"] = str(algo)
+            except Exception:  # noqa: BLE001 - a miss just re-raises pymatgen's own error
+                pass
+        return fget(self)
+
+    converged_electronic._zh_numeric_algo_guard = True  # type: ignore[attr-defined]
+    setattr(Vasprun, "converged_electronic",
+            property(converged_electronic, doc=getattr(prop, "__doc__", None)))
+
+
 def _open_vasp_besteffort(ctor: Any, want_eigen: bool, label: str) -> tuple[Any, bool]:
     """Build a pymatgen ``Vasprun``/``Vaspout`` via ``ctor(parse_eigen: bool)``, retrying WITHOUT
     eigenvalues if the eigen parse raises. Returns ``(obj, eigen_parsed)``.
@@ -782,6 +820,7 @@ def parse_vasprun(vasprun_path: str, calc_id: str, outcar_path: str | None,
     kept (net moment → None), never dropped.
     """
     from pymatgen.io.vasp.outputs import Vasprun
+    _guard_numeric_algo()
     parse_eigen = False
     if outcar_path is None:
         flags = _scan_vasprun_spin_flags(vasprun_path)
@@ -811,6 +850,7 @@ def parse_vaspout(vaspout_path: str, calc_id: str, outcar_path: str | None,
     (genuinely unavailable — VASP does not write the SCF trace into the HDF5 output).
     """
     from pymatgen.io.vasp.outputs import Vaspout
+    _guard_numeric_algo()   # Vaspout inherits Vasprun.converged_electronic
     parse_eigen = outcar_path is None
     v, eigen_parsed = _open_vasp_besteffort(
         lambda pe: Vaspout(vaspout_path, parse_dos=False, parse_eigen=pe,
