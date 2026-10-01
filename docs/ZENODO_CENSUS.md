@@ -10,11 +10,11 @@ taken. Everything under "measured" was obtained live on **2026-09-25**. CSD3 run
 > among them), SCORED (T1 2,933 · T2 33,175 · T3 344,635 · T0 200,669) and T1 TRIAGED on CSD3, then
 > RE-TRIAGED with the deep peeks (§5): VASP evidence in 272 T1 records (incl. all four known keyword
 > misses), 2,227 proven VASP-free, 434 kept by the fail-safe → keep-list 680 records / 3.09 TB (§11);
-> the residual T3 sample found 0 in 3,000 → T3 stops. **T1 PIPELINE DONE** (2026-09-29 → 10-01, 4
-> rounds, `verify` OK): **+229 records / +173,009 calcs / +5,268,939 frames** → production dataset
-> 355,120 calcs / 17,357,661 frames (§11). T2 triage RUNNING. Next: the targeted T1 recovery
-> (`scripts/csd3/census/40_recover_t1.sh`: numeric-ALGO + `primary_too_large` calcs, two zips re-fetched), then the T2
-> pipeline.** 96 offline census tests; three review passes (§12).
+> the residual T3 sample found 0 in 3,000 → T3 stops. **T1 HARVEST DONE** (pipeline 2026-09-29 → 10-01
+> + targeted recovery, `verify` OK): **+230 records / +173,289 calcs / +5,669,216 frames** → the
+> production Zenodo dataset is now ~533 records / 355,400 calcs / 17,757,938 frames (§11). T2 triage
+> finishing (deep peeks). Next: review the T2 report, then the T2 pipeline.** 96 offline census tests;
+> three review passes (§12).
 
 ---
 
@@ -505,19 +505,40 @@ points). The "output seen" misses are names that only look like outputs (`outcar
 | MD `vaspout.h5` pymatgen's `Vaspout` cannot read (its energy table lacks VASP's MD labels; no σ→0 energy stored) | 26 | — | `18390757` (205,726 MD steps × 160 atoms) |
 | other `vaspout.h5` without an energies dataset | 11 | — | `12663897`, `11483708` |
 
-Recoverable: the 158 numeric-ALGO and 4 `primary_too_large` calcs, from their still-staged files,
-and two evidenced zips fetch could not extract — `3359829` (5.4 GB, `Truncated file header`: written
-without ZIP64, so its offsets are truncated to 32 bits and zipfile shifts every member by 4 GiB) and
-`14809725` (one unreadable member aborted the whole zip: 97 units kept, ~110 single points lost).
-Both fetch gaps are fixed (2026-10-01): `_extract_zip` skips an unreadable member (one
+Recoverable — and recovered by the job below: the 158 numeric-ALGO and 4 `primary_too_large`
+calcs (from their still-staged files), and two evidenced zips fetch could not extract — `3359829`
+(5.4 GB, `Truncated file header`: written without ZIP64, so its offsets are truncated to 32 bits and
+zipfile shifts every member by 4 GiB) and `14809725` (one unreadable member aborted the whole zip).
+Both fetch gaps were fixed first (2026-10-01): `_extract_zip` skips an unreadable member (one
 `extract_partial` rejection per archive) and `_open_zip_member` retries a member at its offset
 ±k·4 GiB, accepted only where zipfile finds the signature AND the exact name (CRC-32 checked on
-read) — verified on a real 4.6 GB non-ZIP64 zip. `scripts/csd3/census/40_recover_t1.sh` re-parses
-the first two groups and re-fetches the two zips (a `--retry-rejected` job on 20 cores, cap
-~10.9 GB). Not recovered: `22171731` (its only archive still answers HTTP 403); the 18390757 MD
-trajectories (pymatgen cannot read MD `vaspout.h5`; usable — F ≈ E0 for this insulator — but would
-need a custom reader). `status` listed only the top 8 rejection reasons — which hid `primary_too_large` — and now lists
+read) — verified on a real 4.6 GB non-ZIP64 zip. Not recovered: `22171731` (its only archive still
+answers HTTP 403) and the 18390757 MD trajectories (pymatgen cannot read MD `vaspout.h5`; usable —
+F ≈ E0 for this insulator — but one heavily correlated system, so left out). `status` listed only the top 8 rejection reasons — which hid `primary_too_large` — and now lists
 all. `sacct` MaxRSS ≈ the 52.8 GiB allocation in rounds 1-2 without any OOM kill: page cache.
+
+### T1 recovery — CSD3 job 37029347 (2026-10-01, 1 h 23 min, 20 icelake-himem cores)
+
+`scripts/csd3/census/40_recover_t1.sh`: a `--retry-rejected` re-parse of three records from their
+staged files plus a re-fetch of the two zips with the fixed fetch (6 min), parse 40 min (2 workers,
+budget 122 GiB, cap 10.9 GB; RAM reservation peaked at 91.6 GiB for the 8.15 GB vasprun), then
+`verify` OK and `purge-raw` (35.5 GB freed). The 1,162 calcs already stored were skipped.
+
+| record | why it was lost | recovered | still rejected |
+|---|---|---|---|
+| `13843222` AIMD of doped Bi2O3 | 3 vaspruns over the 3.79 GB cap | 3 calcs, ~400k frames | 0 |
+| `7506565` ZrO2 under pressure | numeric `ALGO = 48` (pymatgen) | 156 calcs | 23 (16 non-SCF band runs with no ionic step, 7 broken OUTCARs — genuine) |
+| `14809725` H2CO adsorption single points | one unreadable member aborted a 1.2 GB zip | 114 calcs — the whole zip (211 units = its 422 listed outputs); the bad member was an input | 0 |
+| `3359829` Fermi-arc band/SCF OUTCARs (new record) | 5.4 GB zip with 32-bit offsets | 6 calcs (all 6 listed outputs) | 0 |
+| `22084774` band/DOS vaspruns | 1 vasprun over the cap | 1 calc | 2 (non-SCF band runs) |
+| **total** | | **+280 calcs / +400,277 frames / +1 record** | |
+
+**T1 outcome (pipeline + recovery):** **+230 records / +173,289 calcs / +5,669,216 frames** — the
+production Zenodo dataset grew from 303 records / 182,111 calcs / 12,088,722 frames to **~533 records
+/ 355,400 calcs / 17,757,938 frames** (+76% records, +95% calcs, +47% frames; parser split
+pymatgen.Vasprun 11,920,652 · ase.OUTCAR 5,742,711 · pymatgen.Vaspout 94,575 frames), `verify` exact.
+What remains rejected is what was deposited (post-DFT outputs, crashed runs, non-VASP files, NEB
+parents) plus the two documented exceptions above.
 
 ---
 

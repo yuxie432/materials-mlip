@@ -105,7 +105,8 @@ python -m zenodo_harvest.cli status --keep $ZENODO_CENSUS_DATA/census_keep_t1.js
     --max-disk-bytes 800000000000 --max-disk-files 800000   # add --no-staging-walk if raw/ is big
 #    Live log: tail -f logs/zh-pipeline-<jobid>.err (one "parsing <calc_id>" line per calc); memory:
 #    sacct -j <jobid> --format=JobID,State,Elapsed,MaxRSS; the JSON summary ends the .out.
-#    Afterwards (T1 done 2026-10-01): recover what the run rejected for a FIXED or resource-only
+#    Afterwards (T1: DONE 2026-10-01, job 37029347 — +280 calcs / +400k frames, §11 of the doc):
+#    recover what the run rejected for a FIXED or resource-only
 #    reason — their files are still staged (purge-raw never deletes an unparsed unit's files). One
 #    20-core himem job re-parses them with --retry-rejected (cap ~10.9 GB; parsed calcs are skipped,
 #    so it is safe to re-run), verifies, and purges what is now parsed. Defaults: 7506565 (numeric

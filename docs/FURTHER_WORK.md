@@ -26,7 +26,7 @@ in C, never ingested.
 
 | Source | Dir | Records | Calcs | Frames | Size | Licence |
 |---|---|---|---|---|---|---|
-| Zenodo | `zenodo/dataset` | ~303 | 182,111 | 12,088,722 | ~40 GB | CC0/BY/BY-SA (+2 BY-NC recs, 1 no-licence by permission) |
+| Zenodo | `zenodo/dataset` | ~533 | 355,400 | 17,757,938 | ≥66 GiB | CC0/BY/BY-SA (+NC recs, 1 no-licence by permission) — incl. the census T1 addition (230 recs, 2026-10-01; `docs/ZENODO_CENSUS.md` §11) |
 | NOMAD | `nomad/dataset` | direct uploads | 7,073,592 | 52,459,065 | ~59 GiB, 5,328 shards | CC BY 4.0 |
 | Materials Cloud | `materials_cloud/dataset` | 102 | 75,751 | 2,545,669 | 7.3 GiB, 268 shards | BY-SA 65.6% of frames / BY / MIT / BY-NC |
 

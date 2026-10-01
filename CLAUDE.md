@@ -26,9 +26,10 @@ Zenodo record scored offline + selectively peeked, feeding the ordinary pipeline
 (`docs/ZENODO_CENSUS.md`, `scripts/csd3/census/`). Census COMPLETE + scored on CSD3 (583,930 records;
 T1 2,933 / T2 33,175) and T1 TRIAGED, then RE-TRIAGED with the deep peeks
 (`zenodo_census/deeppeek.py`): 272 VASP-evidence records incl. all 4 known keyword misses, 434 kept
-fail-safe → keep-list 680 records / 3.09 TB. T1 PIPELINE DONE 2026-10-01 (+229 records / +173,009
-calcs / +5.27M frames, verify OK); T2 triage running; next: `scripts/csd3/census/40_recover_t1.sh`
-(numeric-ALGO + primary_too_large re-parse, re-fetch of two zips), then the T2 pipeline (`docs/ZENODO_CENSUS.md` §11).**
+fail-safe → keep-list 680 records / 3.09 TB. T1 HARVEST DONE 2026-10-01 (pipeline + targeted
+recovery `scripts/csd3/census/40_recover_t1.sh`): +230 records / +173,289 calcs / +5.67M frames →
+Zenodo dataset ~533 records / 355,400 calcs / 17,757,938 frames, verify OK; T2 triage finishing; next:
+review the T2 report, then the T2 pipeline (`docs/ZENODO_CENSUS.md` §11).**
 
 ## Code layout & commands
 
