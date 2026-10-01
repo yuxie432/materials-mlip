@@ -11,6 +11,7 @@ scripts/csd3/census/10_census.sh   # stage 0' : census of every archive-bearing 
 scripts/csd3/census/20_score.sh    # stage 0'': links top-up, version resolve, OpenAlex lookups, tiers
 scripts/csd3/census/30_triage.sh   # stage 1' : zip / tar-head peeks -> census_keep.jsonl (RESUBMIT=1 chain)
 scripts/csd3/20_pipeline.sh        # stages 2-4, UNCHANGED: IN=census_keep.jsonl RAW_DIR=raw_census
+scripts/csd3/census/40_recover_t1.sh  # targeted re-parse (+ optional re-fetch) of fixable T1 rejections
 ```
 
 ## Where things live
@@ -104,10 +105,18 @@ python -m zenodo_harvest.cli status --keep $ZENODO_CENSUS_DATA/census_keep_t1.js
     --max-disk-bytes 800000000000 --max-disk-files 800000   # add --no-staging-walk if raw/ is big
 #    Live log: tail -f logs/zh-pipeline-<jobid>.err (one "parsing <calc_id>" line per calc); memory:
 #    sacct -j <jobid> --format=JobID,State,Elapsed,MaxRSS; the JSON summary ends the .out.
-#    Afterwards: any `primary_too_large` calc (e.g. 13843222's 8.15 GB AIMD vasprun) stays staged —
-#    re-run the same pipeline command on a bigger shape (`sbatch -c 20 …` -> cap ~10 GB) to parse it.
-#    Then the same with IN=.../census_keep_t2.jsonl (and census_keep_t2.pipeline_parts) once the T1
-#    pipeline has finished and the T2 report has been reviewed.
+#    Afterwards (T1 done 2026-10-01): recover what the run rejected for a FIXED or resource-only
+#    reason — their files are still staged (purge-raw never deletes an unparsed unit's files). One
+#    20-core himem job re-parses them with --retry-rejected (cap ~10.9 GB; parsed calcs are skipped,
+#    so it is safe to re-run), verifies, and purges what is now parsed. Defaults: 7506565 (numeric
+#    ALGO, fixed in parse.py), 13843222 + 22084774 (primary_too_large); and it RE-FETCHES 14809725 +
+#    3359829, two zips the fixed fetch can now extract (FETCH_RECIDS; "" = none).
+#    No other job may write the dataset meanwhile (the T2 triage may run alongside):
+git pull                     # parse.py numeric-ALGO guard + fetch zip-member recovery
+sbatch scripts/csd3/census/40_recover_t1.sh
+#    -> logs/zc-recover-<id>.{out,err}; "verify ok=True" ends the .out. Then the T2 pipeline:
+#    the same 20_pipeline.sh command with IN=.../census_keep_t2.jsonl (+ census_keep_t2.pipeline_parts
+#    for status) once the T2 report has been reviewed.
 ```
 
 ## What bounds each step

@@ -26,8 +26,9 @@ Zenodo record scored offline + selectively peeked, feeding the ordinary pipeline
 (`docs/ZENODO_CENSUS.md`, `scripts/csd3/census/`). Census COMPLETE + scored on CSD3 (583,930 records;
 T1 2,933 / T2 33,175) and T1 TRIAGED, then RE-TRIAGED with the deep peeks
 (`zenodo_census/deeppeek.py`): 272 VASP-evidence records incl. all 4 known keyword misses, 434 kept
-fail-safe → keep-list 680 records / 3.09 TB. RUNNING since 2026-09-29: T1 pipeline (into the
-production dataset) ∥ T2 triage; next: T2 pipeline (`docs/ZENODO_CENSUS.md` §11).**
+fail-safe → keep-list 680 records / 3.09 TB. T1 PIPELINE DONE 2026-10-01 (+229 records / +173,009
+calcs / +5.27M frames, verify OK); T2 triage running; next: `scripts/csd3/census/40_recover_t1.sh`
+(numeric-ALGO + primary_too_large re-parse, re-fetch of two zips), then the T2 pipeline (`docs/ZENODO_CENSUS.md` §11).**
 
 ## Code layout & commands
 
@@ -84,6 +85,13 @@ production dataset) ∥ T2 triage; next: T2 pipeline (`docs/ZENODO_CENSUS.md` §
     nested archive (the central-directory peek can't see inside it), letting the recursion
     unpack it — random access *into* a compressed sub-archive is impossible (its index sits
     in a non-seekable DEFLATE blob).
+    **A bad zip member no longer costs the archive** (2026-10-01): `_extract_zip` skips a member
+    whose bytes are unreadable (bad local header, CRC, corrupt deflate) and keeps the rest — one
+    `extract_partial` rejection per archive (`PartialExtract`; nothing readable = the old whole-
+    archive `extract_error`) — and `_open_zip_member` retries a member at its offset ±k·4 GiB, which
+    reads >4 GiB zips written WITHOUT ZIP64 (offsets truncated to 32 bits: zipfile shifts every
+    member by the 4 GiB gap); a shifted offset is used only if zipfile finds the signature AND the
+    exact name there, and the CRC-32 is checked on read.
     `.rar`/`.7z`/`.tar.zst` extract when the `archives` extra (py7zr/rarfile/zstandard + an
     `unrar`/`bsdtar` binary for rar) is installed, else a logged rejection. Emits
     `fetched.jsonl` (one calc-unit list per record). Three independent size/pacing levers:
@@ -174,6 +182,11 @@ production dataset) ∥ T2 triage; next: T2 pipeline (`docs/ZENODO_CENSUS.md` §
     ~0.26 s each single-threaded (~21 days) → N-way cuts that ~N-fold until the serial fetch
     (~4 MB/s single connection) becomes the bound. Use with `--parse-timeout>0` (real child
     processes); keep `parse_workers × per-parse RSS` under the node RAM (NOMAD vaspruns are tiny).
+    **Numeric `ALGO` is tolerated** (`_guard_numeric_algo`, 2026-10-01): pymatgen's
+    `converged_electronic` (run inside `Vasprun.__init__`) did `incar["ALGO"].lower()` and crashed on
+    a legacy numeric `ALGO = 48`, rejecting valid vaspruns; the guard (same recipe as the one-off NOMAD
+    `recover_int_algo.py`, now at every parse entry point so it holds in forkserver children) coerces
+    it to its string form — output identical to the same file with a string ALGO.
     **`parse_eigen` is best-effort** (`_open_vasp_besteffort`): enabling it for the occupancy net
     moment must never drop a calc, so a vasprun whose `<eigenvalues>` pymatgen cannot read
     (`KeyError('eigenvalues')` on some real ISPIN=2 uploads) is retried WITHOUT eigenvalues — the
@@ -302,7 +315,8 @@ production dataset) ∥ T2 triage; next: T2 pipeline (`docs/ZENODO_CENSUS.md` §
     (fetched vs keep-list; parsed calcs vs fetched calc-units), staging **bytes+inodes vs
     quota**, and a **rejection-reason histogram**. No network, no lock — safe to run (or
     `watch`) *while* a fetch/pipeline job is writing the same files. It also reads the fetch
-    rejections where `pipeline` writes them (`<raw-dir>/../manifests/rejections.jsonl`), and
+    rejections where `pipeline` writes them (`<raw-dir>/../manifests/rejections.jsonl`), lists EVERY
+    rejection reason (a top-8 cut once hid `primary_too_large`), and
     `--scope-to-keep` counts only the keep-list's records (calcs, frames, fetched manifests,
     rejections) — the progress of one run writing into an existing dataset (the census keep-lists).
   - `dataset_ops.py` — array-job glue (stages over dataset dirs, not the network):

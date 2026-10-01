@@ -6,13 +6,15 @@ every record that could hold VASP output, scored offline and peeked selectively 
 taken. Everything under "measured" was obtained live on **2026-09-25**. CSD3 runbook:
 `scripts/csd3/census/README.md`.
 
-> **Status (2026-09-29): census COMPLETE (583,930 records, every one of the 303 dataset records
+> **Status (2026-10-01): census COMPLETE (583,930 records, every one of the 303 dataset records
 > among them), SCORED (T1 2,933 · T2 33,175 · T3 344,635 · T0 200,669) and T1 TRIAGED on CSD3, then
 > RE-TRIAGED with the deep peeks (§5): VASP evidence in 272 T1 records (incl. all four known keyword
 > misses), 2,227 proven VASP-free, 434 kept by the fail-safe → keep-list 680 records / 3.09 TB (§11);
-> the residual T3 sample found 0 in 3,000 → T3 stops. RUNNING (started 2026-09-29): the T1 pipeline
-> (into the production dataset) ∥ the T2 triage. Next: T2 pipeline; a bigger-RAM re-parse of any
-> `primary_too_large` calcs.** 96 offline census tests; three review passes (§12).
+> the residual T3 sample found 0 in 3,000 → T3 stops. **T1 PIPELINE DONE** (2026-09-29 → 10-01, 4
+> rounds, `verify` OK): **+229 records / +173,009 calcs / +5,268,939 frames** → production dataset
+> 355,120 calcs / 17,357,661 frames (§11). T2 triage RUNNING. Next: the targeted T1 recovery
+> (`scripts/csd3/census/40_recover_t1.sh`: numeric-ALGO + `primary_too_large` calcs, two zips re-fetched), then the T2
+> pipeline.** 96 offline census tests; three review passes (§12).
 
 ---
 
@@ -461,6 +463,61 @@ designed; 262 zips holding archives, 136 uncompressed tars, 89 7z, 1 "zip" that 
   deferred `primary_too_large` (staged, re-parsed later on a bigger job).
 * `zenodo_census.cli status` reports `keep_records: 0` for a non-default `OUT` (it reads
   `census_keep.jsonl` only) — cosmetic; the triage `.out`/`.err` and `<out>.report.json` are the record.
+
+### T1 pipeline — CSD3 jobs 36712306 → 36792981 → 36859936 → 36932425 (2026-09-29 → 10-01)
+
+Four 12 h rounds (8 icelake-himem cores, 4 fetch + 4 parse workers, 3.79 GB primary cap), every
+round resuming cleanly (finished parts re-scanned in ~6 min; transient download failures retried);
+the last round ended 04:06 BST with `verify` OK (17,357,661 frames, metadata ↔ shards exact).
+
+| | |
+|---|---|
+| added | **229 records with calcs, 173,009 calcs, 5,268,939 frames** (dataset now 355,120 calcs / 17,357,661 frames) |
+| scoping | none of the 680 keep-list records (recid or concept) is among the 303 pre-census records — excluded at scoring; parse's own calc_id skip never fired (`skipped_existing` 0 in every first-time batch) |
+| fetch | 248 fetched, 432 rejected: 385 `no_vasp_files_fetched` (mostly fail-safe archives with no VASP inside), 47 inputs only; no record left transient |
+| parse | 213,494 calc units fetched, 40,485 rejected (81% parsed; 91% leaving out 5248078's 23k MP2 files) |
+
+**Yield by triage class** — the per-class yields match the keyword harvest's (confirmed ~98%,
+blind 2-15%); what differs is the mix (34% of this keep-list had outputs seen before download vs
+~15%), so the record yield is 33.7% here vs 21.7% for the keyword keep-list:
+
+| class | records | fetched | with calcs | calcs |
+|---|---|---|---|---|
+| a VASP output seen in a listing | 229 | 227 | 211 (92%) | 103,581 |
+| only VASP-named inputs seen | 30 | 5 | 5 (17%) | 273 |
+| fail-safe (unlistable archives, 2.43 TB downloaded whole) | 421 | 16 | 13 (3.1%) | 69,155 |
+
+The fail-safe yield is far below the 10.7-14.4% the per-signal rates predicted (they came from
+resolvable records), but by calcs it holds 40% of the run — almost all `19536185` (67,613 single
+points). The "output seen" misses are names that only look like outputs (`outcar.db`,
+`OUTCAR_read.m`, `OUTCAR_*.dat`), code-repo examples, and three fetch-side losses (below).
+
+**Parse rejections (40,485), by cause** — almost all are what was deposited, not parser faults:
+
+| cause | calcs | share | main records |
+|---|---|---|---|
+| post-DFT / non-self-consistent outputs (MP2, RPA, AFQMC, CCSD(T), BSE/GW, NSC-EXX/BEEF, non-SCF HF): no DFT forces | 30,870 | 76% | `5248078` (23,271 `ALGO=MP2` OUTCARs), `21895644`, `19482680` |
+| crashed / incomplete runs (stopped mid-SCF, VASP errors, Fortran overflows; USPEX `ERROR-OUTCAR-*`) | 6,382 | 16% | `7318435` (3,649), `19536185` (1,826) |
+| not VASP output matched by name (scripts, excerpts, extxyz, 5 KB "vaspruns" an ML-potential workflow wrote) | 2,603 | 6% | `8096932` (1,936), `13119926` (392 `outcar.sh`), `15686940` |
+| NEB parent directories / images, MLFF prediction runs | 431 | 1% | `21855564`, `6802056`, `12210642` |
+| **numeric `ALGO`** (pymatgen `'int'.lower()`) — **fixed in `parse.py` 2026-10-01** | 158 | 0.4% | `7506565` |
+| `primary_too_large` (over the 3.79 GB cap) | 4 | — | `13843222` ×3 (AIMD), `22084774` |
+| MD `vaspout.h5` pymatgen's `Vaspout` cannot read (its energy table lacks VASP's MD labels; no σ→0 energy stored) | 26 | — | `18390757` (205,726 MD steps × 160 atoms) |
+| other `vaspout.h5` without an energies dataset | 11 | — | `12663897`, `11483708` |
+
+Recoverable: the 158 numeric-ALGO and 4 `primary_too_large` calcs, from their still-staged files,
+and two evidenced zips fetch could not extract — `3359829` (5.4 GB, `Truncated file header`: written
+without ZIP64, so its offsets are truncated to 32 bits and zipfile shifts every member by 4 GiB) and
+`14809725` (one unreadable member aborted the whole zip: 97 units kept, ~110 single points lost).
+Both fetch gaps are fixed (2026-10-01): `_extract_zip` skips an unreadable member (one
+`extract_partial` rejection per archive) and `_open_zip_member` retries a member at its offset
+±k·4 GiB, accepted only where zipfile finds the signature AND the exact name (CRC-32 checked on
+read) — verified on a real 4.6 GB non-ZIP64 zip. `scripts/csd3/census/40_recover_t1.sh` re-parses
+the first two groups and re-fetches the two zips (a `--retry-rejected` job on 20 cores, cap
+~10.9 GB). Not recovered: `22171731` (its only archive still answers HTTP 403); the 18390757 MD
+trajectories (pymatgen cannot read MD `vaspout.h5`; usable — F ≈ E0 for this insulator — but would
+need a custom reader). `status` listed only the top 8 rejection reasons — which hid `primary_too_large` — and now lists
+all. `sacct` MaxRSS ≈ the 52.8 GiB allocation in rounds 1-2 without any OOM kill: page cache.
 
 ---
 
