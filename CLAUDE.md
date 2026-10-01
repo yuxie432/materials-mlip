@@ -28,8 +28,10 @@ T1 2,933 / T2 33,175) and T1 TRIAGED, then RE-TRIAGED with the deep peeks
 (`zenodo_census/deeppeek.py`): 272 VASP-evidence records incl. all 4 known keyword misses, 434 kept
 fail-safe → keep-list 680 records / 3.09 TB. T1 HARVEST DONE 2026-10-01 (pipeline + targeted
 recovery `scripts/csd3/census/40_recover_t1.sh`): +230 records / +173,289 calcs / +5.67M frames →
-Zenodo dataset ~533 records / 355,400 calcs / 17,757,938 frames, verify OK; T2 triage finishing; next:
-review the T2 report, then the T2 pipeline (`docs/ZENODO_CENSUS.md` §11).**
+Zenodo dataset ~533 records / 355,400 calcs / 17,757,938 frames, verify OK. T2 TRIAGED 2026-10-01:
+103 VASP-evidence records of 33,175 (0.31%), 6,217 unresolved (25.7 TB) left unharvested by decision;
+keep-list 103 records / 210 GB (102 after excluding `12792088`). Next: the T2 pipeline, the last step of
+part A; a seed-snowball re-score is a later option (`docs/ZENODO_CENSUS.md` §6, §11).**
 
 ## Code layout & commands
 

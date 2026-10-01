@@ -79,8 +79,12 @@ packaging) and `ervm4-pn188` ↔ `7023990` (the Zenodo side is only a code snaps
 
 ## A. Recover the VASP data Zenodo's keyword search cannot see (do first)
 
-> **Status 2026-09-25: BUILT as `zenodo_census/` — design, measurements and decisions in
-> `docs/ZENODO_CENSUS.md`, runbook `scripts/csd3/census/`; CSD3 runs pending.** The research found a
+> **Status 2026-10-02: BUILT as `zenodo_census/` and RUN on CSD3 — design, measurements, decisions and
+> results in `docs/ZENODO_CENSUS.md`, runbook `scripts/csd3/census/`. T1 harvested (+230 records /
+> +173,289 calcs / +5.67M frames → Zenodo dataset ~533 records / 355,400 calcs); T2 triaged (103
+> VASP-evidence records of 33,175; its 25.7 TB of unresolved archives skipped by decision); the T2
+> pipeline is the last step, after which part B can start. A seed-snowball re-score (the records now
+> known to hold VASP as identity seeds) is a later option.** (2026-09-25:) The research found a
 > cheaper, more complete route than the design sketched below: Zenodo's search accepts field
 > syntax, so a census of every record that HOLDS an archive (`files.entries.ext:…`, 583k records,
 > all resource types) costs ~5.8k pages ≈ 3.4 h, after which the snowball / paper-graph / text

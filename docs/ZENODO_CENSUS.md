@@ -6,15 +6,17 @@ every record that could hold VASP output, scored offline and peeked selectively 
 taken. Everything under "measured" was obtained live on **2026-09-25**. CSD3 runbook:
 `scripts/csd3/census/README.md`.
 
-> **Status (2026-10-01): census COMPLETE (583,930 records, every one of the 303 dataset records
+> **Status (2026-10-02): census COMPLETE (583,930 records, every one of the 303 dataset records
 > among them), SCORED (T1 2,933 · T2 33,175 · T3 344,635 · T0 200,669) and T1 TRIAGED on CSD3, then
 > RE-TRIAGED with the deep peeks (§5): VASP evidence in 272 T1 records (incl. all four known keyword
 > misses), 2,227 proven VASP-free, 434 kept by the fail-safe → keep-list 680 records / 3.09 TB (§11);
 > the residual T3 sample found 0 in 3,000 → T3 stops. **T1 HARVEST DONE** (pipeline 2026-09-29 → 10-01
 > + targeted recovery, `verify` OK): **+230 records / +173,289 calcs / +5,669,216 frames** → the
-> production Zenodo dataset is now ~533 records / 355,400 calcs / 17,757,938 frames (§11). T2 triage
-> finishing (deep peeks). Next: review the T2 report, then the T2 pipeline.** 96 offline census tests;
-> three review passes (§12).
+> production Zenodo dataset is now ~533 records / 355,400 calcs / 17,757,938 frames (§11). **T2 TRIAGED**
+> (2026-10-01): VASP evidence in 103 of 33,175 records (0.31%), 26,855 proven VASP-free, 6,217
+> unresolved (25.7 TB) left unharvested; keep-list 103 records / 210 GB, 102 after excluding
+> `12792088` (decisions 9-13, §6). Next: the T2 pipeline — the last step of part A (a seed-snowball
+> re-score stays an option for later).** 96 offline census tests; three review passes (§12).
 
 ---
 
@@ -253,6 +255,16 @@ when set).
 | 7 | No-licence records (24) | **Exclude** from the pipeline | case by case |
 | 8 | Residual T3 (0 VASP in a 3,000 sample) | **Stop** — no full T3 run | extend the sample; full T3 (~3 days of peeks) |
 
+**2026-10-02, after the T2 triage**
+
+| # | Decision | Chosen | Alternatives |
+|---|---|---|---|
+| 9 | `12792088` (ISSTA 2024 "Sleuth" fuzzer artifact, 13.4 GB; its only hint is one heavy-output-named file in a source tree) | **Exclude** — a `manually_excluded` line in the fetch rejection log, so the keep-list (and its round-robin parts) stays unchanged | fetch it with the rest |
+| 10 | T2 unresolved (6,217 records, 25.7 TB; T1's measured rate suggests ~5 VASP records among them) | **Skip** — not downloaded | download all / a size-capped subset; peek the rar files |
+| 11 | Content probe of proven-empty records showing VASP inputs but no outputs (331 records, 0.22 TB) | **Not needed** — 12 records spot-checked (§11) hold inputs, final structures, light outputs (`OSZICAR`/`DOSCAR`/`XDATCAR`), processed data or another code; no renamed VASP output | scan every such archive's member contents |
+| 12 | Seed snowball (re-score with the ~620 records now known to hold VASP as identity seeds) | **Later option** — not run now | run it before closing part A |
+| 13 | T3 / T0 | **Stop** — no full T3 run, no T0 run (samples 0 / 3,000 and 0 / 300; T2 itself yielded 0.31%) | full T3 (~3 days of peeks) |
+
 ---
 
 ## 7. Running it
@@ -305,14 +317,41 @@ See `scripts/csd3/census/README.md`: `10_census.sh` (census + link pulls) → `2
   brute-forced (user decision) — VASP test fixtures inside code repositories stay outside unless a
   signal flags the record.
 * **Head-peek is evidence, not proof**, for streams larger than 8 MB: a tar whose leading members are
-  not VASP files reads as unresolved (fetched only for T1). rar/7z archives are never peeked.
+  not VASP files reads as unresolved (fetched only for T1). Compressed tars have no in-place listing
+  and rar archives are never peeked (7z are, by the deep peeks). Measured in T2: 6,217 records /
+  25.7 TB stayed unresolved — gzip-tar heads 12.9 TB, nested zips 3.6 TB, xz tars 3.2 TB, tars that
+  spent the deep-peek budget 2.3 TB, rar 1.3 TB (1,220 records unresolved only by a rar). They are
+  not harvested (decision 10); at T1's measured rate (5.7% of the records that yielded VASP were
+  unresolved ones) they hide ~5 VASP records.
+* **Proofs use the pipeline's own names**: "proven VASP-free" is exact relative to the shared fetch
+  (same primary-name rule), so it never drops data fetch could have used. The rule cuts both ways:
+  name look-alikes pass it (`outcar.db`, `OUTCAR_read.m`, `outcarParser.py`, sisl's `outcar.py`) and
+  parse rejects them cheaply; VASP test fixtures inside code repositories pass it too (22 of T2's
+  103 evidence records are software).
 * **Renamed outputs**: VASP files under non-VASP names (`run1.xml`) are invisible to peeks and fetch
-  alike; a single gzipped file under a non-VASP name cannot be used by the shared fetch.
+  alike; a single gzipped file under a non-VASP name cannot be used by the shared fetch. None turned
+  up in 12 spot-checked "inputs only" records (decision 11): depositors who leave out
+  `vasprun.xml`/`OUTCAR` publish inputs, final structures and light outputs instead.
+* **Processed data is out of scope**: energies and forces already converted (extxyz, DeePMD `npy`,
+  phonopy `FORCE_SETS`, ASE databases, CSV tables) are not read — the pipeline harvests raw VASP
+  output with its full calculation parameters.
+* **Signal precision**: OpenAlex's broad fields make `paper_field` weak (22,082 T2 records, 0.09%
+  with VASP; its Astronomy subfield 0 / 5,598), as are bulk (> 300-record) seed accounts (0 / 2,883)
+  and the keyword re-checks (0 / 128). T2's best signals (workflow-named file 4.2%, MLIP text 3.8%,
+  seed name 2.8%) stay below T1's weakest (MLIP + materials text, 6.3% of records yielding calcs).
 * **Unsupported containers**: `.lzma` (legacy LZMA-alone, no magic bytes) tarballs are in the census
   but neither peekable nor extractable by the shared fetch; split archives are not reassembled.
 * **Links cover papers with DOIs and reference lists**: OpenAlex lacks references for some papers
-  (e.g. `10.1021/acsenergylett.4c01307` shows none of the VASP papers), and DataCite events miss
-  papers that name data only in the text — Europe PMC covers the open-access part of that.
+  (e.g. `10.1021/acsenergylett.4c01307` shows none of the VASP papers; 23% of the 52,241 linked DOIs
+  OpenAlex resolved have no reference list — 71% of preprints, 5% of articles — and 8 of T2's 20
+  `paper_field` positives sit behind such a paper), and DataCite events miss papers that name data
+  only in the text — Europe PMC covers the open-access part of that.
+* **Records without an archive** are outside the census unless they hold a loose VASP primary: of
+  the 631 records VASP papers name in Europe PMC, 218 were never triaged (no archive, or already
+  evaluated by the keyword harvest).
+* **Seed snowball not run** (decision 12): the depositor account was T1's best identity signal (26%
+  of its records yielded calcs), and the ~620 records now known to hold VASP could seed a re-score;
+  deferred.
 * **Point in time**: re-running `10_census.sh` + the later steps picks up new records (the census
   resumes; `--fresh` restarts it).
 
@@ -539,6 +578,63 @@ production Zenodo dataset grew from 303 records / 182,111 calcs / 12,088,722 fra
 pymatgen.Vasprun 11,920,652 · ase.OUTCAR 5,742,711 · pymatgen.Vaspout 94,575 frames), `verify` exact.
 What remains rejected is what was deposited (post-DFT outputs, crashed runs, non-VASP files, NEB
 parents) plus the two documented exceptions above.
+
+### T2 triage — CSD3 jobs 36712312 → 36792980 → 36859870 → 36932228 → 37003110 (2026-09-29 → 10-01)
+
+Five 12 h rounds beside the T1 pipeline (`INTERVAL=1.2`, ≤ 100 deep-peek reads per archive), each
+resuming from the verdict cache; the last ended 15:21 BST on 1 Oct. Standard peeks covered ~78k
+files (rar never peeked); the deep peeks read 5,423 unresolved files in ~90k requests (~30 h,
+request-bound at 50/min: the first protein-crystallography beamline tars spent 45-63 reads each
+without completing, later files 13-22).
+
+| T2 outcome | records | share |
+|---|---|---|
+| VASP evidence | 103 | 0.31% — 89 a VASP output seen, 14 only VASP-named inputs / heavy files; all open licence (licence review empty) |
+| proven VASP-free | 26,855 | 81.0% |
+| unresolved → not fetched (T2 has no fail-safe) | 6,217 | 18.7% — 25.7 TB (median 40 MB per record; the largest 100 hold 8.8 TB) |
+
+Kept: **103 records** — 169.5 GB of evidenced archives + 40.7 GB of unresolved sibling archives,
+~11k VASP outputs in their zip listings (largest 0.89 GB, well under the 8-core pipeline's 3.8 GB
+cap); `12792088` is excluded (decision 9) → **102 to fetch**. By type: dataset 61, software 22 (VASP
+test fixtures of chgnet / deepmd / LAMMPS / TDEP / BoltzTraP, name-only hits), publication 15,
+model 3, other 2.
+
+* **Where the evidence came from**: zip central directories 74, tar-family heads 21, deep peeks 8
+  (4 with VASP outputs seen only inside nested zips — `19669846`, the largest at 37.5 GB,
+  `17242504`, `22051980`, `22871174` — and 4 hints). The deep peeks also proved ~1,500 records
+  VASP-free, but at ~11k requests per record found (T1: ~420) T2 is where they stop paying.
+* **Hit rate per T2 signal** (evidence / records with the signal): workflow-named file 4.2%
+  (18/432) · MLIP text 3.8% (8/210) · seed name 2.8% (16/576) · DFT text 1.4% (33/2,331) · seed
+  community 1.1% (2/181) · sparse metadata + materials cue 0.89% (34/3,799) · formula 0.55%
+  (18/3,298) · materials text 0.48% (15/3,131) · paper field 0.09% (20/22,082) · bulk seed account
+  0/2,883 · keyword re-check 0/128. The rate rises with the number of signals (one 0.20%, two
+  0.76%, three or more 2.0%). Positives have sparse metadata (median description 99 characters vs
+  430 across T2) and are recent (74% created 2025-26).
+* **Against T1** — its per-signal REAL yields (records with calcs after the pipeline): loose primary
+  92% · VASP-named archive 58% · "VASP" in the text 46% · seed account 26% · Europe PMC 11.5% · seed
+  ORCID 10.7% · paper cites VASP 7.9% · DFT + materials text 6.5% · MLIP + materials text 6.3%.
+  T1's weakest signal beats T2's strongest: the tier split separates as intended.
+* **Unresolved, not fetched** (decision 10), by file: gzip-tar partial heads 12.9 TB, nested zips
+  3.6 TB, xz tars 3.2 TB, tars that spent the 100-read budget 2.3 TB, rar 1.3 TB (2,586 files,
+  never peeked; 1,220 records unresolved only by a rar). In T1, 13 of the 230 records that yielded
+  calcs (5.7%) were fail-safe ones, so T2's unresolved hide ~5 VASP records (~0.1% of them) — 25.7 TB
+  of downloads for about five records.
+* **False negatives**: "proven VASP-free" applies the shared fetch's own primary-name rule, so it is
+  exact for what the pipeline could harvest; what it cannot see is renamed outputs, processed
+  formats and records without archives (§10). Spot check (decision 11) of 12 proven-empty records
+  whose listings show VASP inputs but no outputs — `22230934`, `22147013`, `20010848`, `8388390`,
+  `22084010`, `17534311`, `17952154`, `12685655`, `13323474`, `19058875`, `18491981`, `18925151`:
+  inputs and final structures, light outputs (`OSZICAR`, `DOSCAR`, `XDATCAR`; `18491981` publishes
+  369 run directories with `vasprun.xml`/`OUTCAR` left out), processed data (CSV property tables,
+  phonopy `FORCE_SETS`, DeePMD `npy`, xyz trajectories) or another code (CP2K DP-GEN `18925151`,
+  GPAW `13323474`) — no renamed VASP output.
+* **Europe PMC recall** (all tiers): of the 631 records VASP papers name, 90 are now in the dataset
+  (48 before the census + 42 found by it), 273 proven VASP-free, 39 fail-safe downloads without VASP,
+  11 evidence records that yielded no calcs, 218 outside the triage (no archive, or already evaluated
+  by the keyword harvest).
+* **Expected from the T2 pipeline**: at T1's per-class yields (output seen 92%, hints 17%) ~80-85
+  records; ~10k calcs from the listed outputs, about half in `11234637` (a coupled-cluster benchmark
+  of oxide surfaces — post-DFT VASP runs among them would be rejected by parse, as in T1).
 
 ---
 

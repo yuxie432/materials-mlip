@@ -11,7 +11,7 @@ scripts/csd3/census/10_census.sh   # stage 0' : census of every archive-bearing 
 scripts/csd3/census/20_score.sh    # stage 0'': links top-up, version resolve, OpenAlex lookups, tiers
 scripts/csd3/census/30_triage.sh   # stage 1' : zip / tar-head peeks -> census_keep.jsonl (RESUBMIT=1 chain)
 scripts/csd3/20_pipeline.sh        # stages 2-4, UNCHANGED: IN=census_keep.jsonl RAW_DIR=raw_census
-scripts/csd3/census/40_recover_t1.sh  # targeted re-parse (+ optional re-fetch) of fixable T1 rejections
+scripts/csd3/census/40_recover_t1.sh  # targeted re-parse (+ optional re-fetch) of fixable rejections (T1; T2 via KEEP=)
 ```
 
 ## Where things live
@@ -115,9 +115,30 @@ python -m zenodo_harvest.cli status --keep $ZENODO_CENSUS_DATA/census_keep_t1.js
 #    No other job may write the dataset meanwhile (the T2 triage may run alongside):
 git pull                     # parse.py numeric-ALGO guard + fetch zip-member recovery
 sbatch scripts/csd3/census/40_recover_t1.sh
-#    -> logs/zc-recover-<id>.{out,err}; "verify ok=True" ends the .out. Then the T2 pipeline:
-#    the same 20_pipeline.sh command with IN=.../census_keep_t2.jsonl (+ census_keep_t2.pipeline_parts
-#    for status) once the T2 report has been reviewed.
+#    -> logs/zc-recover-<id>.{out,err}; "verify ok=True" ends the .out.
+
+# 5. T2 pipeline. T2 triaged 2026-10-01 (103 evidence records / 210 GB; no fail-safe); reviewed
+#    2026-10-02: 12792088 excluded, the 6,217 unresolved records not fetched (doc §6, decisions 9-13).
+#    Same script and staging dir. raw_census holds only the files of T1 calcs rejected for good —
+#    clear it first (housekeeping; nothing reads them again). Take a fresh metadata backup, exclude
+#    12792088 with a manually_excluded line in the FETCH rejection log (the keep-list and its
+#    round-robin parts stay as triage wrote them), and run 10 batches (103 records: fewer full
+#    metadata scans than the default 40; staging stays far below the valve):
+du -sh $ZENODO_HARVEST_DATA/raw_census; find $ZENODO_HARVEST_DATA/raw_census -type f | wc -l
+rm -rf $ZENODO_HARVEST_DATA/raw_census
+cp $ZENODO_HARVEST_DATA/dataset/metadata.jsonl $ZENODO_HARVEST_DATA/dataset/metadata.jsonl.bak.pre_census_t2
+echo '{"stage": "fetch", "id": "12792088", "reason": "manually_excluded", "transient": null, "detail": "census T2: software-engineering paper artifact (ISSTA 2024 Sleuth); its only hint is one heavy-output-named file in a source tree; 13.4 GB not worth fetching (user decision 2026-10-02)"}' \
+  >> $ZENODO_HARVEST_DATA/manifests/rejections.jsonl
+IN=$ZENODO_CENSUS_DATA/census_keep_t2.jsonl RAW_DIR=$ZENODO_HARVEST_DATA/raw_census PARTS=10 \
+  RESUBMIT=1 sbatch scripts/csd3/20_pipeline.sh
+python -m zenodo_harvest.cli status --keep $ZENODO_CENSUS_DATA/census_keep_t2.jsonl --scope-to-keep \
+    --manifests-dir $ZENODO_CENSUS_DATA/census_keep_t2.pipeline_parts \
+    --raw-dir $ZENODO_HARVEST_DATA/raw_census --dataset-dir $ZENODO_HARVEST_DATA/dataset \
+    --max-disk-bytes 800000000000 --max-disk-files 800000
+#    Afterwards, a fixable rejection (e.g. primary_too_large) is re-parsed by the recovery script
+#    pointed at T2 (FETCH_RECIDS="" = no re-fetch; RECIDS must be given — empty means the T1 defaults):
+KEEP=$ZENODO_CENSUS_DATA/census_keep_t2.jsonl WORK=$ZENODO_CENSUS_DATA/recover_t2 \
+  RECIDS="<recid> ..." FETCH_RECIDS="" sbatch scripts/csd3/census/40_recover_t1.sh
 ```
 
 ## What bounds each step

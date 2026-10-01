@@ -11,8 +11,11 @@ below), SCORED (T1 2,933 · T2 33,175 · T3 344,635 · T0 200,669) and T1 TRIAGE
 (`docs/ZENODO_CENSUS.md` §11). T1 RE-TRIAGED with the deep peeks (job 36712258, 1 h 51 min): +136
 proven VASP-free, +20 VASP found → 272 evidence / 434 fail-safe, keep-list 680 records / 3.09 TB
 (−0.87 TB). T1 HARVEST DONE 2026-10-01 (pipeline + recovery job `scripts/csd3/census/40_recover_t1.sh`: +230 records /
-+173,289 calcs / +5.67M frames → dataset ~533 records / 355,400 calcs / 17.76M frames, verify OK; §11); T2
-triage finishing; next the T2 report review, then the T2 pipeline.
++173,289 calcs / +5.67M frames → dataset ~533 records / 355,400 calcs / 17.76M frames, verify OK; §11). T2
+TRIAGED 2026-10-01 (5 rounds, 5,423 deep peeks): 103 VASP-evidence records (0.31%), 26,855 proven VASP-free,
+6,217 unresolved (25.7 TB) not fetched; keep-list 103 records / 210 GB, `12792088` excluded at fetch by a
+`manually_excluded` line. Decisions 2026-10-02 (§6, 9-13): skip the unresolved, no inputs-only content probe,
+seed snowball later, T3/T0 stop. Next: the T2 pipeline, which closes part A.
 
 Why (measured live 2026-09-25): Zenodo's `q` sees metadata text only; beyond that, an `&nbsp;` glues
 words into one token (`4541602` "ab initio&nbsp;defect" matches neither), quoted phrases are not
