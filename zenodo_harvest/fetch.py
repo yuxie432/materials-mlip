@@ -25,6 +25,7 @@ disk as one directory per calculation, ready for parsing. Design goals:
 
 from __future__ import annotations
 
+import copy
 import errno
 import logging
 import lzma
@@ -36,6 +37,7 @@ import tarfile
 import threading
 import time
 import zipfile
+import zlib
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from hashlib import md5
 from pathlib import Path
@@ -580,9 +582,71 @@ def _member_cap_for(base: str, member_cap: int) -> int:
     return (1 << 62) if _nested_archive_kind(base) is not None else member_cap
 
 
+# A zip larger than 4 GiB written WITHOUT ZIP64 records (non-compliant, but real: census T1
+# record 3359829, 5.4 GB) keeps only the low 32 bits of every offset. zipfile then reads the
+# 4 GiB gap as data prepended to the archive and shifts EVERY member by it: members below 4 GiB
+# land mid-file ("Bad magic number for file header") or past its end ("Truncated file header"),
+# so the archive was rejected whole although its central directory lists every member.
+_ZIP_OFFSET_WRAP = 1 << 32
+# Errors that mean ONE member's bytes are unreadable (bad local header, CRC mismatch, corrupt
+# deflate stream, truncation) — the member is skipped, the rest of the archive is extracted.
+# NOT OSError: a failed write (disk full) must still stop the record.
+_MEMBER_DATA_ERRORS: tuple[type[BaseException], ...] = (zipfile.BadZipFile, zlib.error, EOFError)
+
+
+class PartialExtract(Exception):
+    """An archive extracted only in part: some members were unreadable and skipped.
+
+    Carries what an extractor normally returns (``names``, ``extracted``) plus ``failures``
+    (``"<member>: <error>"``), so the caller keeps the good members and logs ONE
+    ``extract_partial`` rejection for the archive. Deliberately not a subclass of anything in
+    ``_EXTRACT_ERRORS``, so it is never mistaken for a whole-archive failure."""
+
+    def __init__(self, names: list[str], extracted: list[str], failures: list[str]):
+        super().__init__(f"{len(failures)} unreadable member(s); first: {failures[0]}")
+        self.names, self.extracted, self.failures = names, extracted, failures
+
+
+def _open_zip_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, size: int) -> Any:
+    """``zf.open(info)``, retrying at the member's offset shifted by whole multiples of 4 GiB
+    when zipfile cannot find its local header (a >4 GiB zip without ZIP64 — see
+    ``_ZIP_OFFSET_WRAP``). A shifted candidate is used only if zipfile itself accepts it: the
+    local-header signature AND the exact member name must match at that offset, and the CRC-32
+    is verified when the member is read to its end, so a wrong guess cannot yield wrong bytes."""
+    try:
+        return zf.open(info)
+    except zipfile.BadZipFile as first:
+        # shift 0 first: in a wrapped zip the overlap ("zip bomb") guard of Python >= 3.12 is
+        # computed from the other members' wrong offsets and can refuse a CORRECT offset; the
+        # per-member cap and the staging budget still bound what is written
+        shifts = [0] + [k * sgn for k in range(1, size // _ZIP_OFFSET_WRAP + 2) for sgn in (-1, 1)]
+        for shift in shifts:
+            offset = info.header_offset + shift * _ZIP_OFFSET_WRAP
+            if offset < 0 or offset + 30 > size:
+                continue
+            alt = copy.copy(info)
+            alt.header_offset = offset
+            if hasattr(alt, "_end_offset"):
+                alt._end_offset = None   # the overlap guard was computed from the wrong offsets
+            try:
+                return zf.open(alt)
+            except (zipfile.BadZipFile, UnicodeDecodeError, NotImplementedError):
+                continue                 # not this member's header (junk name / flag bits)
+        raise first
+
+
 def _extract_zip(path: Path, dest: Path, member_cap: int,
                  budget: "StagingBudget | None" = None) -> tuple[list[str], list[str]]:
+    """Extract the VASP (and nested-archive) members of a zip.
+
+    One unreadable member no longer costs the whole archive: it is skipped and the others are
+    extracted; if any were skipped, :class:`PartialExtract` carries the result and the failures
+    to the caller (which logs them). If NOTHING wanted could be read, the first error is raised
+    as a ``BadZipFile`` — the old whole-archive ``extract_error``."""
     extracted: list[str] = []
+    failures: list[str] = []
+    stopped = False
+    size = path.stat().st_size
     with zipfile.ZipFile(path) as zf:
         names = zf.namelist()
         for info in zf.infolist():
@@ -602,13 +666,24 @@ def _extract_zip(path: Path, dest: Path, member_cap: int,
             # cannot fit (a cheap early skip). The real accounting happens per chunk
             # inside _copy_capped, so a header that lies changes nothing.
             if budget is not None and not budget.check(info.file_size, 1):
+                stopped = True
                 break  # a disk/inode limit is reached — stop; the run pauses to purge
-            with zf.open(info) as src:
-                outcome = _copy_capped(src, out, cap, budget)
+            try:
+                with _open_zip_member(zf, info, size) as src:
+                    outcome = _copy_capped(src, out, cap, budget)  # a partial file is removed
+            except _MEMBER_DATA_ERRORS as exc:
+                failures.append(f"{info.filename}: {type(exc).__name__}: {exc}"[:300])
+                continue
             if outcome == _COPY_OK:
                 extracted.append(info.filename)
             elif outcome == _COPY_NO_BUDGET:
+                stopped = True
                 break
+    if failures and not stopped:
+        if not extracted:
+            raise zipfile.BadZipFile(f"no member readable ({len(failures)} failed); "
+                                     f"first: {failures[0]}"[:400])
+        raise PartialExtract(names, extracted, failures)
     return names, extracted
 
 
@@ -1293,6 +1368,10 @@ def _recurse_nested_archives(
         out_dir = arc.parent / (base + _NESTED_SUFFIX)
         try:
             names, extracted = _EXTRACTORS[kind](arc, out_dir, member_cap, budget)
+        except PartialExtract as pe:     # the readable members are out; log the rest
+            names, extracted = pe.names, pe.extracted
+            rej.reject("fetch", nid, "extract_partial", n_failed=len(pe.failures),
+                       detail="; ".join(pe.failures[:3])[:600])
         except _EXTRACT_ERRORS as exc:
             err_budget[0] -= 1
             if err_budget[0] <= 0:
@@ -1713,6 +1792,10 @@ def _stage_record_files(
             try:
                 names, extracted = _EXTRACTORS[kind](arc, extract_dir, max_member_bytes,
                                                      budget)
+            except PartialExtract as pe:    # the readable members are out; log the rest
+                names, extracted = pe.names, pe.extracted
+                rej.reject("fetch", f"{recid}:{key}", "extract_partial",
+                           n_failed=len(pe.failures), detail="; ".join(pe.failures[:3])[:600])
             except _EXTRACT_ERRORS as exc:
                 rej.reject("fetch", f"{recid}:{key}", "extract_error",
                            detail=f"{type(exc).__name__}: {exc}")
