@@ -15,7 +15,9 @@ proven VASP-free, +20 VASP found → 272 evidence / 434 fail-safe, keep-list 680
 TRIAGED 2026-10-01 (5 rounds, 5,423 deep peeks): 103 VASP-evidence records (0.31%), 26,855 proven VASP-free,
 6,217 unresolved (25.7 TB) not fetched; keep-list 103 records / 210 GB, `12792088` excluded at fetch by a
 `manually_excluded` line. Decisions 2026-10-02 (§6, 9-13): skip the unresolved, no inputs-only content probe,
-seed snowball later, T3/T0 stop. Next: the T2 pipeline, which closes part A.
+seed snowball later, T3/T0 stop. T2 HARVEST DONE 2026-10-02 (pipeline 37089987 + recovery 37127828, verify OK):
++87 records / +28,449 calcs / +455k frames. **COMPLETE: the census added +317 records / +201,738 calcs /
++6,124,397 frames → dataset ~620 records / 383,849 calcs / 18.21M frames** (doc §11 "Census outcome").
 
 Why (measured live 2026-09-25): Zenodo's `q` sees metadata text only; beyond that, an `&nbsp;` glues
 words into one token (`4541602` "ab initio&nbsp;defect" matches neither), quoted phrases are not

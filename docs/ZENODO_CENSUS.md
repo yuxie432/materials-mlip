@@ -12,11 +12,16 @@ taken. Everything under "measured" was obtained live on **2026-09-25**. CSD3 run
 > misses), 2,227 proven VASP-free, 434 kept by the fail-safe → keep-list 680 records / 3.09 TB (§11);
 > the residual T3 sample found 0 in 3,000 → T3 stops. **T1 HARVEST DONE** (pipeline 2026-09-29 → 10-01
 > + targeted recovery, `verify` OK): **+230 records / +173,289 calcs / +5,669,216 frames** → the
-> production Zenodo dataset is now ~533 records / 355,400 calcs / 17,757,938 frames (§11). **T2 TRIAGED**
+> production Zenodo dataset reached ~533 records / 355,400 calcs / 17,757,938 frames (§11). **T2 TRIAGED**
 > (2026-10-01): VASP evidence in 103 of 33,175 records (0.31%), 26,855 proven VASP-free, 6,217
 > unresolved (25.7 TB) left unharvested; keep-list 103 records / 210 GB, 102 after excluding
-> `12792088` (decisions 9-13, §6). Next: the T2 pipeline — the last step of part A (a seed-snowball
-> re-score stays an option for later).** 96 offline census tests; three review passes (§12).
+> `12792088` (decisions 9-13, §6). **T2 HARVEST DONE** (pipeline job 37089987 + recovery job 37127828,
+> `verify` OK): **+87 records / +28,449 calcs / +455,181 frames**. **PART A COMPLETE (2026-10-02): the
+> census added +317 records / +201,738 calcs / +6,124,397 frames** (+105% / +111% / +51%) to the 303
+> records / 182,111 calcs / 12,088,722 frames of the keyword harvest → production Zenodo dataset
+> **~620 records / 383,849 calcs / 18,213,119 frames** (§11, "Census outcome"). A seed-snowball
+> re-score stays an option for later (decision 12).** 96 offline census tests; three review passes
+> (§12).
 
 ---
 
@@ -30,6 +35,7 @@ taken. Everything under "measured" was obtained live on **2026-09-25**. CSD3 run
 | How archives are read | Zip central directories over HTTP Range (**ZIP64-aware** — the Zenodo triage could not read `13888307`'s 19.6 GB ZIP64 zip) and a **head-peek** of tar-family streams (first 8 MB, one request). One pacer keeps every request inside Zenodo's 100/min + 5,000/h. |
 | What is kept (user) | Positive evidence (any tier); for T1 also archives no peek can settle (fail-safe); ND / no-licence records listed for approval, not harvested. T3 is **sampled** (~3k) to measure the residual; the whole non-software T3 tier is peeked only if the rate is ≳ 1 in 2,000. |
 | Output | An ORDINARY Zenodo keep-list → `scripts/csd3/20_pipeline.sh` unchanged, straight into the production dataset (same fetch, parse, calc_ids `zenodo:<recid>:<path>`, schema). |
+| Result (2026-10-02) | **+317 records / +201,738 calcs / +6,124,397 frames** — the dataset's records and calcs more than doubled, frames +51%. 783 records kept by triage (T1 680, T2 103), 317 yielded calcs; 3 of the 4 known keyword misses are now in the dataset (the 4th has no licence). |
 
 ---
 
@@ -287,6 +293,9 @@ See `scripts/csd3/census/README.md`: `10_census.sh` (census + link pulls) → `2
   missed ~20% of VASP deposits (3 of ~13 of his). The residual sample and the Europe PMC coverage
   (`score_report.json` → `epmc_coverage`: how many VASP-paper-cited Zenodo records were already in
   the dataset) turn this into a measured recall.
+* **Measured (2026-10-02, §11 "Census outcome")**: 317 new records / 201,738 calcs / 6.12M frames —
+  inside the ~100-400 records estimated before triage (§11, scoring), at the cost of ~1 week of
+  calendar time and ~125 job-hours on CSD3, most of it request-paced triage and the T1 pipeline.
 
 ---
 
@@ -635,6 +644,102 @@ model 3, other 2.
 * **Expected from the T2 pipeline**: at T1's per-class yields (output seen 92%, hints 17%) ~80-85
   records; ~10k calcs from the listed outputs, about half in `11234637` (a coupled-cluster benchmark
   of oxide surfaces — post-DFT VASP runs among them would be rejected by parse, as in T1).
+
+### T2 pipeline — CSD3 job 37089987 (2026-10-01, 4 h 44 min, one round)
+
+`IN=census_keep_t2.jsonl PARTS=10`, 8 icelake-himem cores (4 fetch + 4 parse workers, 3.79 GB
+primary cap), `12792088` skipped by its `manually_excluded` line; `verify` OK (18,208,162 frames,
+metadata ↔ shards exact).
+
+| | |
+|---|---|
+| added | **86 records with calcs, 28,014 calcs, 450,224 frames** (dataset now 383,414 calcs / 18,208,162 frames) |
+| fetch | 92 of 103 fetched (29,090 calc units); 11 rejected: `12792088` excluded, 9 hints that held no VASP output (`no_calc_units_after_extract` ×8, `no_vasp_files_fetched` ×1), and `18706703` (transient: HTTP 429 on its 16.4 GB zip, below) |
+| parse | 28,014 of 29,090 units parsed (96.3%), 1,076 rejected |
+| staging | peak 473 GB / 43k inodes (inside the 800 GB / 800k valve): `19669846`'s 15,300 training OUTCARs (~29 MB each) unpacked from tar.gz files nested in a 37.5 GB zip |
+
+**Yield**: VASP output seen in a listing 82 / 89 records with calcs (92%, as in T1), hints 4 / 14
+(T1 17%) — 86 records against the ~80-85 expected. Calcs came out at 2.8× the estimate because
+`19669846` (spinel configurational-entropy single points, **15,273 calcs**) kept its OUTCARs in nested
+tar.gz files that a peek sees only seven of; `11234637` (metal clusters on MgO with hybrid
+functionals, not the feared post-DFT runs) added 4,975 — both mostly single points. Frames are
+concentrated elsewhere: two batches hold 74% of them, the one with `20613933` (Ti-BEA epoxidation,
+2,113 calcs) + `3585618` (171k frames) and the one with `16918762` + `4000977` + `21316138` (160k).
+
+**Parse rejections (1,076), by cause**:
+
+| cause | calcs | records |
+|---|---|---|
+| OUTCARs with a few non-UTF-8 bytes (ASE reads strictly; VASP prints an uninitialised buffer in "vdW correction parametrized for the method …" with TS/MBD + hybrids) — **parser gap, fixed 2026-10-02** | 337 | `11234637` |
+| 7 KB tutorial "vaspruns" without `<generator>` (a code's example data, not VASP output) | 300 | `159046` (PROPhet) |
+| post-DFT / non-SCF: MP2 natural orbitals, Wannier, GW / scGW / BSE, TDHF optics | 220 | `18604340`, `17138478`, `10844461` |
+| no frame with an energy (frequency / band / incomplete runs) | 96 | `3585618`, `11234637` (M06-L slabs), `19669846` |
+| VASPsol `LAMBDA_D_K=****` in `<parameters>` with no OUTCAR beside the vasprun (pymatgen raised) — **parser gap, fixed 2026-10-02** | 71 | `20403107` (70), `17254051` |
+| incomplete / crashed OUTCARs, overflowed numbers, test fixtures | 49 | `19669846` (13), … |
+| `parse_timeout` — three ~2.5 GB OUTCARs past the 20 min limit (non-terminal) | 3 | `21316138` |
+
+**Recoverable** — by one `40_recover_t1.sh` run on T2 (README step 5): the 337 + 71 calcs read by the
+two parse fixes (both mirror the numeric-`ALGO` guard: a file that parsed before is read exactly as
+before; tests in `tests/test_parse_overflow_and_encoding.py`; the real 11234637 OUTCAR checked: Ag₄,
+PBE0+TS-HI, converged), the three timeouts with `PARSE_TIMEOUT=7200`, and a re-fetch of `18706703`
+(V₂O₅ charged point defects: 25 vasprun + OUTCAR pairs, 3.7 GB of outputs). The 429 burst at 19:25
+cost that one record because the run finished in a single round: a transient failure is retried
+only by a later run. Everything else is what was deposited. All but one of them were recovered, below.
+
+### T2 recovery — CSD3 job 37127828 (2026-10-02, 2 h 10 min, 20 icelake-himem cores)
+
+`40_recover_t1.sh` with `KEEP=census_keep_t2.jsonl`: a re-fetch of `18706703` (targeted zip fetch, 25
+calc units, 8 min), a `--retry-rejected` parse of five records (1 h 25 min; 2 workers, budget 122 GiB,
+cap 10.9 GB, timeout 2 h; RAM reservation peaked at 59.9 GiB with two big OUTCARs at once; the 5,213
+calcs already stored were skipped), `verify` OK (383,849 calcs / 18,213,119 frames, exact) and
+`purge-raw` (11.2 GB freed).
+
+| record | why it was lost | recovered | frames | still rejected |
+|---|---|---|---|---|
+| `11234637` metal clusters on MgO | non-UTF-8 bytes in the OUTCAR (fixed in parse.py) | all 337 | 337 single points — PBE0 / revPBE + TS / TS-HI / MBD, B3LYP-D2 | 24 (21 M06-L slabs with no energy, 2 overflowed numbers, 1 incomplete — genuine) |
+| `20403107` MadNEB solvation surrogate | VASPsol `LAMBDA_D_K=****` in `<parameters>` (fixed) | all 70 | together with `18706703`: 4,424 (by functional PBE+U 3,046 — presumably the V₂O₅ defects —, B3LYP 1,083, PBE/GGA 295) | 0 |
+| `18706703` V₂O₅ charged point defects (new record) | HTTP 429 during the T2 pipeline | all 25 | (above) | 0 |
+| `21316138` Mn₇C₃ under pressure | three ~2.5 GB OUTCARs past the 20 min timeout | all 3 | 196 | 0 |
+| `17254051` IrO₂ structures | a `****` outside the parameters block | 0 | — | 1 (pymatgen) |
+| **total** | | **+435 calcs / +1 record** | **+4,957** | 25 |
+
+**T2 outcome (pipeline + recovery): +87 records / +28,449 calcs / +455,181 frames** — 87 of the 103
+kept records (84%; 83 of the 89 with a VASP output seen, 4 of the 14 hints); 28,449 of the 29,115
+calc units fetched were parsed (97.7%). What stays rejected is what was deposited (tutorial and
+fixture files, post-DFT and incomplete runs) plus one `17254051` vasprun.
+
+### Census outcome (T1 + T2, 2026-10-02) — part A complete
+
+| | T1 | T2 | census |
+|---|---|---|---|
+| records triaged | 2,933 | 33,175 | 36,108 (+ 3,300 sample records) |
+| kept by triage (keep-list) | 680 (259 evidence + 421 fail-safe), 3.09 TB | 103 (evidence only), 0.21 TB | 783 |
+| fetched with VASP files | 249 | 93 | 342 |
+| **records with calcs** | **230** | **87** | **317** |
+| **calcs** | **173,289** | **28,449** | **201,738** |
+| **frames** | **5,669,216** | **455,181** | **6,124,397** |
+| records with calcs / kept | 33.8% | 84.5% | 40.5% |
+| records with calcs / triaged | 7.8% | 0.26% | 0.88% |
+
+* **Growth of the production Zenodo dataset**: 303 records / 182,111 calcs / 12,088,722 frames
+  (keyword harvest) → **~620 records / 383,849 calcs / 18,213,119 frames** — records +105%, calcs
+  +111%, frames +51%. A typical census record looks like a keyword one (T1 median 49 calcs / 331
+  frames vs 54 / 408); frames grew less than calcs because the keyword harvest already held the
+  largest trajectory sets and the census's biggest finds are single-point collections.
+* **By evidence class (both tiers)**: a VASP output seen in a listing 295 / 318 records with calcs
+  (93%), only VASP-named inputs 9 / 44 (20%), T1 fail-safe 13 / 421 (3.1%, but 69k calcs — almost all
+  `19536185`). Seeing an output before download is what makes a kept record worth fetching.
+* **Concentration**: five records hold 54% of the census calcs (`19536185` 67.5k single points,
+  `19669846` 15.3k, `21895644` 9.0k, `3666992` 8.8k, `11093002` 8.8k); ten T1 records hold 61% of the
+  census frames (`13843222`'s AIMD 1.21M, `11093002` 0.67M, `21855564` 0.51M, …).
+* **Known misses**: `13888307` (1,347 calcs), `4541602` (86) and `12518256` (2) — three of the four
+  Kavanagh datasets keyword search could not see — are in the dataset; `10630244` has no licence
+  (excluded, decision 7).
+* **Not recovered, by decision**: T2's 6,217 unresolved records (25.7 TB, ~5 VASP records expected),
+  `22171731` (HTTP 403), `18390757`'s MD `vaspout.h5`, T3 / T0, and the seed snowball (later option).
+* **Cost**: about a week of calendar time from build to finish; CSD3 wall time ~4 h census + ~3 h
+  scoring + ~5 h T1 triage, then the T1 pipeline (~46 h) beside the T2 triage (~57 h, request-paced),
+  and ~10 h of T2 pipeline and recoveries. Requests stayed inside Zenodo's documented limits.
 
 ---
 

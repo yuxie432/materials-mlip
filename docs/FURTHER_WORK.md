@@ -26,7 +26,7 @@ in C, never ingested.
 
 | Source | Dir | Records | Calcs | Frames | Size | Licence |
 |---|---|---|---|---|---|---|
-| Zenodo | `zenodo/dataset` | ~533 | 355,400 | 17,757,938 | ≥66 GiB | CC0/BY/BY-SA (+NC recs, 1 no-licence by permission) — incl. the census T1 addition (230 recs, 2026-10-01; `docs/ZENODO_CENSUS.md` §11) |
+| Zenodo | `zenodo/dataset` | ~620 | 383,849 | 18,213,119 | ~72 GiB, ~1,880 shards | CC0/BY/BY-SA (+NC recs, 1 no-licence by permission) — incl. the census additions (T1 230 + T2 87 recs, 2026-10-02; `docs/ZENODO_CENSUS.md` §11) |
 | NOMAD | `nomad/dataset` | direct uploads | 7,073,592 | 52,459,065 | ~59 GiB, 5,328 shards | CC BY 4.0 |
 | Materials Cloud | `materials_cloud/dataset` | 102 | 75,751 | 2,545,669 | 7.3 GiB, 268 shards | BY-SA 65.6% of frames / BY / MIT / BY-NC |
 
@@ -79,12 +79,12 @@ packaging) and `ervm4-pn188` ↔ `7023990` (the Zenodo side is only a code snaps
 
 ## A. Recover the VASP data Zenodo's keyword search cannot see (do first)
 
-> **Status 2026-10-02: BUILT as `zenodo_census/` and RUN on CSD3 — design, measurements, decisions and
-> results in `docs/ZENODO_CENSUS.md`, runbook `scripts/csd3/census/`. T1 harvested (+230 records /
-> +173,289 calcs / +5.67M frames → Zenodo dataset ~533 records / 355,400 calcs); T2 triaged (103
-> VASP-evidence records of 33,175; its 25.7 TB of unresolved archives skipped by decision); the T2
-> pipeline is the last step, after which part B can start. A seed-snowball re-score (the records now
-> known to hold VASP as identity seeds) is a later option.** (2026-09-25:) The research found a
+> **Status 2026-10-02: COMPLETE — built as `zenodo_census/` and run on CSD3 (design, measurements,
+> decisions and results in `docs/ZENODO_CENSUS.md`, runbook `scripts/csd3/census/`). T1 + T2 harvested
+> with their recoveries: **+317 records / +201,738 calcs / +6,124,397 frames** → Zenodo dataset ~620
+> records / 383,849 calcs / 18,213,119 frames (records and calcs more than doubled, frames +51%; T2's
+> 25.7 TB of unresolved archives skipped by decision). Part B can start. A seed-snowball re-score (the
+> records now known to hold VASP as identity seeds) is a later option.** (2026-09-25:) The research found a
 > cheaper, more complete route than the design sketched below: Zenodo's search accepts field
 > syntax, so a census of every record that HOLDS an archive (`files.entries.ext:…`, 583k records,
 > all resource types) costs ~5.8k pages ≈ 3.4 h, after which the snowball / paper-graph / text
@@ -215,6 +215,10 @@ so `verify` still passes), or keep them in the B1 index. Known issues to encode:
    correction (e.g. MC's Kristoffersen AIMD, 65.6% of MC frames, reads as plain RPBE).
 7. **Non-DFT-label runs** already excluded at parse (DMFT, `ALGO=None`, GW/RPA no-energy steps). Keep
    them excluded.
+8. **Non-finite labels**: pymatgen reads a Fortran-overflowed `****` value in a vasprun's energies,
+   forces or stress as NaN (a warning only), and parse has no finiteness check, so a frame CAN carry a
+   NaN `REF_energy`/`REF_forces`/`REF_stress` (never counted). Drop frames with non-finite labels
+   (cheap; all three datasets).
 
 ### B4. Consistency buckets
 

@@ -30,8 +30,10 @@ fail-safe → keep-list 680 records / 3.09 TB. T1 HARVEST DONE 2026-10-01 (pipel
 recovery `scripts/csd3/census/40_recover_t1.sh`): +230 records / +173,289 calcs / +5.67M frames →
 Zenodo dataset ~533 records / 355,400 calcs / 17,757,938 frames, verify OK. T2 TRIAGED 2026-10-01:
 103 VASP-evidence records of 33,175 (0.31%), 6,217 unresolved (25.7 TB) left unharvested by decision;
-keep-list 103 records / 210 GB (102 after excluding `12792088`). Next: the T2 pipeline, the last step of
-part A; a seed-snowball re-score is a later option (`docs/ZENODO_CENSUS.md` §6, §11).**
+T2 HARVEST DONE 2026-10-02 (pipeline 37089987 + recovery 37127828, verify OK): +87 records / +28,449
+calcs / +455,181 frames. PART A COMPLETE: the census added +317 records / +201,738 calcs / +6,124,397
+frames → Zenodo dataset ~620 records / 383,849 calcs / 18,213,119 frames. Next: part B (combined
+corpus); a seed-snowball re-score is a later option (`docs/ZENODO_CENSUS.md` §6, §11).**
 
 ## Code layout & commands
 
@@ -190,6 +192,13 @@ part A; a seed-snowball re-score is a later option (`docs/ZENODO_CENSUS.md` §6,
     a legacy numeric `ALGO = 48`, rejecting valid vaspruns; the guard (same recipe as the one-off NOMAD
     `recover_int_algo.py`, now at every parse entry point so it holds in forkserver children) coerces
     it to its string form — output identical to the same file with a string ALGO.
+    Two more tolerances (2026-10-02, census T2), same contract — a file that parsed before is read
+    exactly as before: an OUTCAR with a few **non-UTF-8 bytes** (VASP prints an uninitialised buffer in
+    "vdW correction parametrized for the method …" with TS/MBD + hybrids; ASE reads strictly) is
+    re-read from its temp copy with those bytes replaced (`outcar_invalid_utf8_lines` recorded; a
+    replaced byte inside a number still fails the parse), and `_guard_overflowed_params` reads an
+    all-asterisk scalar in `<parameters>`/`<incar>` (VASPsol's `LAMBDA_D_K=****`) as `None`, as
+    pymatgen already does for `RANDOM_SEED` — before, such a vasprun survived only via an OUTCAR beside it.
     **`parse_eigen` is best-effort** (`_open_vasp_besteffort`): enabling it for the occupancy net
     moment must never drop a calc, so a vasprun whose `<eigenvalues>` pymatgen cannot read
     (`KeyError('eigenvalues')` on some real ISPIN=2 uploads) is retried WITHOUT eigenvalues — the

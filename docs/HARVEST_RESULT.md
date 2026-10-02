@@ -82,10 +82,12 @@ availability / electronic / per-frame convergence / REF_*), with the licence kep
   overwhelmingly non-materials — the open CC-BY set had already captured essentially all the materials
   VASP data, so licence relaxation adds little.**
 
-> **Current dataset (2026-10-01): ~533 records / 355,400 calcs / 17,757,938 frames**, `verify` exact —
-> the census T1 harvest (keyword-invisible VASP deposits found by the Zenodo census) added 230
-> records / 173,289 calcs / 5,669,216 frames on top of the state below; see `docs/ZENODO_CENSUS.md`
-> §11. The sections below describe the keyword harvest as it was closed on 2026-09-19.
+> **Current dataset (2026-10-02): ~620 records / 383,849 calcs / 18,213,119 frames**, `verify` exact —
+> the Zenodo census (keyword-invisible VASP deposits, FURTHER_WORK part A, complete) added, on top of
+> the state below, T1 230 records / 173,289 calcs / 5,669,216 frames and T2 87 records / 28,449 calcs /
+> 455,181 frames: **+317 records / +201,738 calcs / +6,124,397 frames** in all (records +105%, calcs
+> +111%, frames +51%); see `docs/ZENODO_CENSUS.md` §11. The sections below describe the keyword harvest as it was closed on
+> 2026-09-19.
 
 ### Dataset after both expansions (2026-09-19)
 **~303 records / 182,111 calcs / 12,088,722 frames**, `verify` exact (bijection 0 missing/dup/orphan).

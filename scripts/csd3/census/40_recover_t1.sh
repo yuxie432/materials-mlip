@@ -32,7 +32,7 @@
 #
 # The same script serves the T2 run (docs/ZENODO_CENSUS.md §11, 2026-10-02): 11234637 (OUTCARs with
 # non-UTF-8 bytes) + 20403107 / 17254051 (VASPsol LAMBDA_D_K=**** in <parameters>) — both read by
-# parse.py since 2026-10-02 —, 21316138 (three ~3.5 GB OUTCARs past the 20 min timeout), and a
+# parse.py since 2026-10-02 —, 21316138 (three ~2.5 GB OUTCARs past the 20 min timeout), and a
 # re-fetch of 18706703 (HTTP 429 on its 16.4 GB zip):
 #   KEEP=$ZENODO_CENSUS_DATA/census_keep_t2.jsonl WORK=$ZENODO_CENSUS_DATA/recover_t2 \
 #     RECIDS="11234637 20403107 17254051 21316138" FETCH_RECIDS="18706703" \

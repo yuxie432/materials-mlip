@@ -135,10 +135,24 @@ python -m zenodo_harvest.cli status --keep $ZENODO_CENSUS_DATA/census_keep_t2.js
     --manifests-dir $ZENODO_CENSUS_DATA/census_keep_t2.pipeline_parts \
     --raw-dir $ZENODO_HARVEST_DATA/raw_census --dataset-dir $ZENODO_HARVEST_DATA/dataset \
     --max-disk-bytes 800000000000 --max-disk-files 800000
-#    Afterwards, a fixable rejection (e.g. primary_too_large) is re-parsed by the recovery script
-#    pointed at T2 (FETCH_RECIDS="" = no re-fetch; RECIDS must be given — empty means the T1 defaults):
+#    T2: DONE 2026-10-01, job 37089987 (+86 records / +28,014 calcs / +450k frames, doc §11).
+#    Afterwards, the fixable rejections are re-parsed by the recovery script pointed at T2 (RECIDS
+#    must be given — empty means the T1 defaults; FETCH_RECIDS="" = no re-fetch). raw_census must
+#    still hold the run's leftovers (the rejected units' files), so clear it only AFTER this job.
+#    2026-10-02: 11234637 (OUTCARs with non-UTF-8 bytes) + 20403107/17254051 (VASPsol LAMBDA_D_K=****)
+#    — both read by parse.py since 2026-10-02, so `git pull` first —, 21316138 (3 OUTCARs past the
+#    20 min timeout; the script allows 2 h) and a re-fetch of 18706703 (HTTP 429):
+git pull
 KEEP=$ZENODO_CENSUS_DATA/census_keep_t2.jsonl WORK=$ZENODO_CENSUS_DATA/recover_t2 \
-  RECIDS="<recid> ..." FETCH_RECIDS="" sbatch scripts/csd3/census/40_recover_t1.sh
+  RECIDS="11234637 20403107 17254051 21316138" FETCH_RECIDS="18706703" \
+  sbatch scripts/csd3/census/40_recover_t1.sh
+#    -> logs/zc-recover-<id>.{out,err}; "verify ok=True" ends the .out. Then raw_census can go.
+#    T2 recovery: DONE 2026-10-02, job 37127828 (+435 calcs / +4,957 frames / +1 record).
+#    PART A COMPLETE: +317 records / +201,738 calcs / +6,124,397 frames (doc §11 "Census outcome").
+#
+# 6. Later (optional): a seed-snowball re-score — the ~620 records now known to hold VASP as identity
+#    seeds (depositor account / ORCID / community), then triage only the records it promotes
+#    (doc §6 decision 12). Re-running 10_census.sh later picks up records created since 2026-09-26.
 ```
 
 ## What bounds each step
