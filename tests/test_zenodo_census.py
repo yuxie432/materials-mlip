@@ -1866,3 +1866,84 @@ def test_nested_zip_peek_survives_tiny_and_corrupt_inner_zips():
     assert ev["status"] == "ok" and not ev["complete"]                 # never a proof
     with pytest.raises(OSError):
         dp.RangeFile(FakeRangeSession({"u": b"abc"}), "u", 3, dp._Budget(1)).seek(-5, io.SEEK_END)
+
+
+# --------------------------------------------------------------------------- #
+# seed snowball: re-score, then triage only the records whose tier rose        #
+# --------------------------------------------------------------------------- #
+
+def test_select_moved_keeps_rises_and_new_records(tmp_path, monkeypatch):
+    def row(rid: str, tier: str) -> dict:
+        return {"recid": rid, "conceptrecid": str(int(rid) - 1), "tier": tier, "reasons": []}
+    old = _write_jsonl(tmp_path / "old.jsonl", [
+        row("11", "T3"), row("13", "T2"), row("15", "T1"), row("17", "T0"), row("19", "T3"),
+        row("21", "X"), row("23", "T1")])
+    new = _write_jsonl(tmp_path / "new.jsonl", [
+        row("11", "T1"),            # identity promotion from T3: selected
+        row("13", "T1"),            # T2 -> T1: selected (now under the T1 rule)
+        row("15", "T1"),            # unchanged: its verdict stands
+        row("17", "T0"),            # not a triaged tier
+        row("19", "T2"),            # weak promotion: selected
+        row("21", "T2"),            # access opened since: selected
+        row("23", "T2"),            # demoted: triaged as T1 already
+        row("25", "T2"),            # newer than the earlier census: selected
+        row("27", "T3")])           # new but low-signal
+    rep = zs.select_moved(old, new, tmp_path / "moved.jsonl")
+    got = {r["recid"]: r["tier_before"] for r in read_jsonl(tmp_path / "moved.jsonl")}
+    assert got == {"11": "T3", "13": "T2", "19": "T3", "21": "X", "25": None}
+    assert rep["selected"] == 5 and rep["moves"] == {"T2->T1": 1, "T3->T1": 1, "T3->T2": 1,
+                                                     "X->T2": 1, "new->T2": 1}
+    assert zs.select_moved(old, new, tmp_path / "t1.jsonl", tiers=["T1"])["selected"] == 2
+    from zenodo_census import cli as zcli
+    monkeypatch.setenv("ZENODO_CENSUS_DATA", str(tmp_path / "zc"))
+    assert zcli.main(["select-moved", "--old", str(old), "--new", str(new),
+                      "--out", str(tmp_path / "cli.jsonl")]) == 0
+    assert len(list(read_jsonl(tmp_path / "cli.jsonl"))) == 5
+
+
+def test_snowball_rescore_triages_only_the_movers(tmp_path, monkeypatch):
+    vasp_zip = make_zip({"run/vasprun.xml": b"<modeling/>", "run/INCAR": b"x"})
+    empty_zip = make_zip({"figs/a.png": b"png"})
+    blind_tgz = gzip.compress(make_tar({"big.bin": os.urandom(2 << 20), "c/OUTCAR": b"2"}))
+    specs: list[tuple[str, dict[str, bytes], dict[str, Any]]] = [
+        ("2001", {"x.zip": vasp_zip}, {"title": "Data", "owners": ["77"]}),            # T3 -> T1
+        ("2003", {"s.tar.gz": blind_tgz}, {"title": "Thin films of oxides"}),         # T2 stays
+        ("2005", {"b.tar.gz": blind_tgz},                                              # T2 -> T1
+         {"title": "Thin films of oxides", "owners": ["77"]}),
+        ("2007", {"data.zip": vasp_zip},                                               # T1 stays
+         {"title": "Ab initio DFT calculations of perovskites"}),
+        ("2009", {"y.zip": empty_zip}, {"title": "Data"}),                             # T3 stays
+    ]
+    hits, blobs = [], {}
+    for rid, files, kw in specs:
+        hits.append(zhit(rid, dict(files), **kw))
+        for k, b in files.items():
+            blobs[url(rid, k)] = b
+    census = _write_jsonl(tmp_path / "census.jsonl", [zc.slim_hit(h) for h in hits])
+    seeds = sg.Seeds()
+    seeds.owners = {"42"}
+    zs.score(census, tmp_path / "scored_first.jsonl", excl=zs.Exclusions(), seeds=seeds)
+    sess = FakeRangeSession(blobs)
+    first = tmp_path / "census_keep_t1.jsonl"
+    zt.triage(tmp_path / "scored_first.jsonl", census, first, session_factory=lambda: sess,
+              residual_sample=0, negative_sample=0, interval=0, head_bytes=1 << 20)
+    assert {r["recid"] for r in read_jsonl(first)} == {"2007"}
+    n_first = len(sess.requests)
+    # the dataset grew: a newly harvested record's depositor account (77) is now a seed
+    seeds.owners = {"42", "77"}
+    zs.score(census, tmp_path / "scored.jsonl", excl=zs.Exclusions(), seeds=seeds)
+    rep = zs.select_moved(tmp_path / "scored_first.jsonl", tmp_path / "scored.jsonl",
+                          tmp_path / "scored_snowball.jsonl")
+    assert rep["moves"] == {"T2->T1": 1, "T3->T1": 1}
+    out = tmp_path / "census_keep_snowball.jsonl"
+    s = zt.triage(tmp_path / "scored_snowball.jsonl", census, out, session_factory=lambda: sess,
+                  residual_sample=0, negative_sample=0, interval=0, head_bytes=1 << 20,
+                  exclude_keep=[first])
+    assert s["selected"] == {"T1:tier": 2}
+    keep = {r["recid"]: r for r in read_jsonl(out)}
+    assert keep["2001"]["census"]["triage_reason"] == "vasp_evidence"
+    # triaged as T2 before (unresolved, not fetched); as a T1 mover it gets the T1 fail-safe
+    assert keep["2005"]["census"]["triage_reason"] == "strong_unresolved"
+    assert keep["2005"]["census"]["tier"] == "T1"
+    # only the never-peeked mover cost requests; 2005's head verdict came from the shared cache
+    assert {u for u, _ in sess.requests[n_first:]} == {url("2001", "x.zip")}

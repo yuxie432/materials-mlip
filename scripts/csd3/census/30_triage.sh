@@ -23,6 +23,10 @@
 #   TIERS=T3 RESIDUAL_SAMPLE=0 NEGATIVE_SAMPLE=0 OUT=$ZENODO_CENSUS_DATA/census_keep_t3.jsonl \
 #     RESUBMIT=1 sbatch scripts/csd3/census/30_triage.sh
 # (it skips everything the first keep-list already holds and reuses the shared peek cache).
+# Seed snowball (after a re-score): triage ONLY the records whose tier rose — SCORED points at the
+# `zenodo_census.cli select-moved` output (README step 6):
+#   SCORED=$ZENODO_CENSUS_DATA/scored_snowball.jsonl RESIDUAL_SAMPLE=0 NEGATIVE_SAMPLE=0 \
+#     OUT=$ZENODO_CENSUS_DATA/census_keep_snowball.jsonl RESUBMIT=1 sbatch scripts/csd3/census/30_triage.sh
 #
 # Resumable: every completed peek is cached ($ZENODO_CENSUS_DATA/peeks.jsonl); RESUBMIT=1 chains
 # follow-on jobs across wallclock kills (MAX_ATTEMPTS bounds the chain). The keep-list + report
@@ -44,6 +48,7 @@ NEGATIVE_SAMPLE="${NEGATIVE_SAMPLE:-300}"
 INTERVAL="${INTERVAL:-0.8}"
 PEEK_WORKERS="${PEEK_WORKERS:-3}"
 OUT="${OUT:-$ZENODO_CENSUS_DATA/census_keep.jsonl}"
+SCORED="${SCORED:-$ZENODO_CENSUS_DATA/scored.jsonl}"    # the tiers to select from
 # Deeper peeks (zenodo_census/deeppeek.py: uncompressed tars walked header to header, 7z end
 # headers, archives nested in zips) of records the standard peeks leave unresolved: for a T1
 # fail-safe record a proof of "no VASP" saves the whole download (anything still unresolved is
@@ -83,13 +88,14 @@ submit_successor() {
 trap 'submit_successor' USR1
 
 echo "=== triage attempt $ATTEMPT/$MAX_ATTEMPTS $(date -Is): tiers=[$TIERS] out=$OUT ==="
+echo "    scored: $SCORED"
 echo "    residual sample $RESIDUAL_SAMPLE, negative sample $NEGATIVE_SAMPLE, interval ${INTERVAL}s"
 echo "    deep peeks of unresolved records:" \
      "$([[ "$DEEP_PEEK" == "0" ]] && echo off || echo "on (<= $DEEP_MAX_REQUESTS reads/archive)")"
 echo "    skipping records already in: ${EXCL[*]:-<none>}"
 set +e
 # shellcheck disable=SC2086
-python -m zenodo_census.cli -v triage --tiers $TIERS "${TYPE_ARGS[@]}" \
+python -m zenodo_census.cli -v triage --scored "$SCORED" --tiers $TIERS "${TYPE_ARGS[@]}" \
     --residual-sample "$RESIDUAL_SAMPLE" --negative-sample "$NEGATIVE_SAMPLE" \
     --interval "$INTERVAL" --peek-workers "$PEEK_WORKERS" --out "$OUT" \
     --deep-max-requests "$DEEP_MAX_REQUESTS" "${DEEP_ARGS[@]}" \

@@ -19,9 +19,10 @@ taken. Everything under "measured" was obtained live on **2026-09-25**. CSD3 run
 > `verify` OK): **+87 records / +28,449 calcs / +455,181 frames**. **PART A COMPLETE (2026-10-02): the
 > census added +317 records / +201,738 calcs / +6,124,397 frames** (+105% / +111% / +51%) to the 303
 > records / 182,111 calcs / 12,088,722 frames of the keyword harvest → production Zenodo dataset
-> **~620 records / 383,849 calcs / 18,213,119 frames** (§11, "Census outcome"). A seed-snowball
-> re-score stays an option for later (decision 12).** 96 offline census tests; three review passes
-> (§12).
+> **~620 records / 383,849 calcs / 18,213,119 frames** (§11, "Census outcome").** **Seed snowball
+> scoped (2026-10-02, §11) and decided (14-16)**: re-score with all ~620 dataset records as seeds,
+> triage only the 541 records whose tier rose (`select-moved`), T1 rule; ~6-8 new records expected;
+> run pending. 98 offline census tests; three review passes (§12).
 
 ---
 
@@ -271,6 +272,14 @@ when set).
 | 12 | Seed snowball (re-score with the ~620 records now known to hold VASP as identity seeds) | **Later option** — not run now | run it before closing part A |
 | 13 | T3 / T0 | **Stop** — no full T3 run, no T0 run (samples 0 / 3,000 and 0 / 300; T2 itself yielded 0.31%) | full T3 (~3 days of peeks) |
 
+**2026-10-02, the seed snowball (scoping in §11)**
+
+| # | Decision | Chosen | Alternatives |
+|---|---|---|---|
+| 14 | Seed snowball (decision 12) | **Run now**: re-score with all ~620 dataset records as seeds, then triage only the records whose tier rose (`select-moved`: 541 — 148 T3 → T1, 55 T3 → T2, 338 T2 → T1) | fold into a later freshness refresh; skip |
+| 15 | Fail-safe for the movers | **T1 rule as before**: what stays unresolved in a T1 mover is downloaded whole, no cap — incl. the 28 T2 → T1 records the T2 triage left unresolved (138 GB) | evidence only (the first hop's identity-only fail-safe: 1.47 TB for 1 record); account-linked only, ≤ 10 GB |
+| 16 | Extra channels | **None** — the identity re-score only | depositors / ORCIDs of records linked to VASP papers (1,019 T3 records, ~1-5 finds); + the 24 T0 records gaining a strong link |
+
 ---
 
 ## 7. Running it
@@ -278,7 +287,8 @@ when set).
 See `scripts/csd3/census/README.md`: `10_census.sh` (census + link pulls) → `20_score.sh`
 (links top-up, `resolve`, `openalex`, `score`) → review `score_report.json` → `30_triage.sh`
 (`RESUBMIT=1`) → review `census_keep.report.json` + the licence-review list → `20_pipeline.sh` with
-`IN=…/census_keep.jsonl RAW_DIR=…/raw_census`.
+`IN=…/census_keep.jsonl RAW_DIR=…/raw_census`. A later re-score (the seed snowball) is triaged
+through `select-moved` → `30_triage.sh` with `SCORED=` (README step 6).
 
 ---
 
@@ -358,11 +368,16 @@ See `scripts/csd3/census/README.md`: `10_census.sh` (census + link pulls) → `2
 * **Records without an archive** are outside the census unless they hold a loose VASP primary: of
   the 631 records VASP papers name in Europe PMC, 218 were never triaged (no archive, or already
   evaluated by the keyword harvest).
-* **Seed snowball not run** (decision 12): the depositor account was T1's best identity signal (26%
-  of its records yielded calcs), and the ~620 records now known to hold VASP could seed a re-score;
-  deferred.
-* **Point in time**: re-running `10_census.sh` + the later steps picks up new records (the census
-  resumes; `--fresh` restarts it).
+* **Seed snowball** (decisions 12, 14-16; scoping in §11): the census finds are weaker seeds than the
+  keyword records (second-hop precision: account 5.7%, ORCID 0.5%), so the re-score promotes ~200
+  never-peeked records for ~6-8 expected finds; the paper-graph siblings are used up.
+* **Deep-peek verdicts are cached per read budget**, complete listings included: a run with another
+  `DEEP_MAX_REQUESTS` reads every deep-peeked archive again (cheap for the 541 movers; ~90k requests
+  if a whole T2 tier were re-triaged at 300).
+* **Point in time**: the census covers records created up to 2026-09-25. A plain re-run of
+  `10_census.sh` resumes inside the first run's fixed `created` range (`census.jsonl.bounds.json`), so
+  it adds nothing new; a refresh needs `--fresh` (the whole ~4 h census again; peek verdicts stay
+  cached).
 
 ---
 
@@ -736,10 +751,74 @@ fixture files, post-DFT and incomplete runs) plus one `17254051` vasprun.
   Kavanagh datasets keyword search could not see — are in the dataset; `10630244` has no licence
   (excluded, decision 7).
 * **Not recovered, by decision**: T2's 6,217 unresolved records (25.7 TB, ~5 VASP records expected),
-  `22171731` (HTTP 403), `18390757`'s MD `vaspout.h5`, T3 / T0, and the seed snowball (later option).
+  `22171731` (HTTP 403), `18390757`'s MD `vaspout.h5`, and T3 / T0. The seed snowball follows
+  (decisions 14-16, below).
 * **Cost**: about a week of calendar time from build to finish; CSD3 wall time ~4 h census + ~3 h
   scoring + ~5 h T1 triage, then the T1 pipeline (~46 h) beside the T2 triage (~57 h, request-paced),
   and ~10 h of T2 pipeline and recoveries. Requests stayed inside Zenodo's documented limits.
+
+### Seed snowball — scoping (2026-10-02; offline, plus a 56-record live pilot)
+
+Decision 12 asked whether the ~620 records now known to hold VASP find more as identity seeds.
+Measured on the rsynced CSD3 data: `score` re-run with the 303 keyword records as seeds reproduces
+the production `scored.jsonl` exactly (219 owners, 566 ORCIDs, 22 communities; the only difference
+is the 343 Materials Cloud creator names the local copy lacked — 19 T2 `seed_name` rows). With all
+620 dataset records the seeds are 424 owners, 966 ORCIDs, 1,747 names and 31 communities, and the
+tiers become T1 3,189 · T2 32,786 · T3 344,451 · T0 200,669. `triage.decide` replayed on the cached
+verdicts gives the state of every record that moved:
+
+| the new seeds move | records | state |
+|---|---|---|
+| T3 → T1 (account 41, account + ORCID 15, ORCID only 92) | 148 | 144 never peeked (244 files: 228 zips, 16 tar heads); 4 from the residual sample |
+| T3 → T2 (seed name / community) | 55 | 52 never peeked (71 files) |
+| T2 → T1 | 338 | peeked in full by the T2 triage: 310 proven VASP-free, 28 unresolved (138 GB) |
+
+None is in a keep-list. 24 T0 records gain a strong link but stay T0 (no identity overrules another
+domain), and ~2,150 more gain a weak or redundant link without changing tier.
+
+**Precision** (records ending with calcs, on records the T2 triage peeked in full):
+
+| link | first hop (303 seeds) | second hop (census finds as seeds) |
+|---|---|---|
+| depositor account | 4 / 33 (12%) | 6 / 105 (5.7%) |
+| account + ORCID | 11 / 48 (23%) | 11 / 68 (16%) |
+| ORCID only | 12 / 231 (5.2%) | 1 / 183 (0.5%) |
+
+Census finds are weaker seeds than the keyword records, their ORCIDs most of all: large
+collaborations spread them (`15055758`, CoRE MOF 2024 — 20 creators, 17 ORCIDs — alone promotes 21
+records). Hold-out: over
+200 random halves of the 317 census finds, adding one half as seeds raises the identity reach of the
+other from 35% to 48%. Of the first hop's records that identity alone lifted out of T3, 15 in 418
+yielded calcs (account 8 / 61, account + ORCID 4 / 50, ORCID 3 / 307; 13,220 calcs, 1.02 M frames)
+and their 74 fail-safe downloads (1.09 TB) none; across all 730 identity-only T1 records the
+fail-safe downloaded 1.47 TB for one record (72 calcs). Seed filters do not separate (software-only
+seeds 2.5% vs 4.0%; seeds with < 5 calcs 3.3% vs 3.6%).
+
+**Live pilot** (the 56 account-linked T3 → T1 movers, ~70 paced requests, 4.6 min): 6 list a VASP
+output — 5 real deposits, each a sibling of a census find (`16749502`, 153 OUTCARs of N₂ reduction on
+Al/Fe; `3970974`, 50 outputs of probe-molecule LOBSTER runs; `17137049` "my link", 20 outputs in
+43 GB of zips that are mostly heavy files; `15794580`, 2; `15064164`, 1) and one name look-alike
+(`21619301`, `outcar.cpython-311.pyc`) —, 43 proven VASP-free, 7 unresolved. The largest output
+listed is 0.4 GB. (These verdicts are not in the CSD3 cache; the triage reads them again.)
+
+**Expected**: ~6-8 records with calcs (account-linked 5-6, ORCID-only ~0.5-1, T3 → T2 ~0, the T2 → T1
+fail-safe ~0.2), ~200-1,000 calcs and ~5-50 k frames — +1% records, +0.1-0.3% calcs — with the first
+hop's fat tail (one of those 15 finds, `11093002`, held 8,757 calcs / 674 k frames). Cost: re-score
+~40 min (link tables cached; Europe PMC re-queried), triage ~2-3 k requests ≈ 1 h (~400 standard
+reads; deep peeks of the T3 movers; ~1.8 k deep reads for the T2 → T1 movers, whose T2 verdicts are
+keyed by the 100-read budget), one pipeline round with ~200-300 GB of fail-safe downloads.
+
+**Other channels, measured** (not run, decision 16): other records of a seed's paper DOI (5),
+co-cited with a seed by DataCite / Europe PMC papers (23) and Zenodo-to-Zenodo related identifiers
+(9) — all but one already triaged or keyword-evaluated, so the paper graph is used up; seed names
+resolved to ORCIDs 0 / 24 with evidence; co-authors' ORCIDs 0 / 1,308 with calcs; depositors and
+ORCIDs of records linked to VASP papers 1.0% (11 / 1,151) on triaged records the seeds miss → 1,019
+T3 records, perhaps 1-5 finds. NOMAD and Materials Cloud provenance hold author names only.
+
+**Freshness is the larger lever**: the dataset holds 30 / 36 / 32 VASP records created in July /
+August / September 2026 (to the 25th), among ~38 k archive-bearing records a month — each month
+after the census cut-off holds several times the snowball's yield. A refresh re-scores with the
+then-current seeds; `select-moved` also selects records the earlier scoring never saw.
 
 ---
 

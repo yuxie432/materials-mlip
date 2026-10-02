@@ -150,9 +150,28 @@ KEEP=$ZENODO_CENSUS_DATA/census_keep_t2.jsonl WORK=$ZENODO_CENSUS_DATA/recover_t
 #    T2 recovery: DONE 2026-10-02, job 37127828 (+435 calcs / +4,957 frames / +1 record).
 #    PART A COMPLETE: +317 records / +201,738 calcs / +6,124,397 frames (doc §11 "Census outcome").
 #
-# 6. Later (optional): a seed-snowball re-score — the ~620 records now known to hold VASP as identity
-#    seeds (depositor account / ORCID / community), then triage only the records it promotes
-#    (doc §6 decision 12). Re-running 10_census.sh later picks up records created since 2026-09-26.
+# 6. Seed snowball (doc §6 decisions 14-16, scoping in §11): re-score with all ~620 dataset records as
+#    identity seeds, then triage ONLY the records whose tier rose — 541 expected (148 T3->T1, 55 T3->T2,
+#    338 T2->T1; ~200 never peeked). NOT a plain 30_triage.sh re-run: deep-peek verdicts are cached
+#    per read budget, so re-triaging the T2 tier at the default 300 would deep-peek its 6,217
+#    unresolved records again (~90k requests). T1 movers get the T1 rule (fail-safe, no cap).
+#    NB re-running 10_census.sh adds no newer records (fixed created range, doc §10).
+git pull
+mkdir -p $ZENODO_CENSUS_DATA/score_pre_snowball
+cp -p $ZENODO_CENSUS_DATA/scored.jsonl $ZENODO_CENSUS_DATA/score_report.json $ZENODO_CENSUS_DATA/score_pre_snowball/
+sbatch scripts/csd3/census/20_score.sh       # ~40 min (links cached); REWRITES scored.jsonl + score_report.json
+#    after it (seconds; fine on a login node) — prints the moves, ~541 expected:
+python -m zenodo_census.cli select-moved --old $ZENODO_CENSUS_DATA/score_pre_snowball/scored.jsonl \
+    --out $ZENODO_CENSUS_DATA/scored_snowball.jsonl
+SCORED=$ZENODO_CENSUS_DATA/scored_snowball.jsonl RESIDUAL_SAMPLE=0 NEGATIVE_SAMPLE=0 \
+  OUT=$ZENODO_CENSUS_DATA/census_keep_snowball.jsonl RESUBMIT=1 sbatch scripts/csd3/census/30_triage.sh
+#    ~2-3k requests ≈ 1 h. -> REVIEW / send census_keep_snowball.report.json + .licence_review.jsonl.
+#    Then the pipeline as in step 5 (fresh metadata backup; ~200-300 GB of fail-safe downloads):
+cp $ZENODO_HARVEST_DATA/dataset/metadata.jsonl $ZENODO_HARVEST_DATA/dataset/metadata.jsonl.bak.pre_census_snowball
+IN=$ZENODO_CENSUS_DATA/census_keep_snowball.jsonl RAW_DIR=$ZENODO_HARVEST_DATA/raw_census PARTS=8 \
+  RESUBMIT=1 sbatch scripts/csd3/20_pipeline.sh
+#    status: the step-4 command with census_keep_snowball; fixable rejections: 40_recover_t1.sh with
+#    KEEP=$ZENODO_CENSUS_DATA/census_keep_snowball.jsonl WORK=$ZENODO_CENSUS_DATA/recover_snowball RECIDS="…".
 ```
 
 ## What bounds each step
@@ -167,4 +186,5 @@ KEEP=$ZENODO_CENSUS_DATA/census_keep_t2.jsonl WORK=$ZENODO_CENSUS_DATA/recover_t
 | pipeline | whatever the keep-list holds | as the original harvest (bandwidth, disk valve) |
 
 Tuning: `INTERVAL` (seconds between triage request starts — raise it if the log shows repeated
-429s), `PEEK_WORKERS`, `RESIDUAL_SAMPLE` / `NEGATIVE_SAMPLE`, `TIERS` / `TYPES`, `OUT`.
+429s), `PEEK_WORKERS`, `RESIDUAL_SAMPLE` / `NEGATIVE_SAMPLE`, `TIERS` / `TYPES`, `OUT`, `SCORED`
+(the tiers to select from; default `scored.jsonl`).

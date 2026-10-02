@@ -18,6 +18,8 @@ TRIAGED 2026-10-01 (5 rounds, 5,423 deep peeks): 103 VASP-evidence records (0.31
 seed snowball later, T3/T0 stop. T2 HARVEST DONE 2026-10-02 (pipeline 37089987 + recovery 37127828, verify OK):
 +87 records / +28,449 calcs / +455k frames. **COMPLETE: the census added +317 records / +201,738 calcs /
 +6,124,397 frames → dataset ~620 records / 383,849 calcs / 18.21M frames** (doc §11 "Census outcome").
+Seed snowball SCOPED + DECIDED 2026-10-02 (decisions 14-16, doc §11): re-score with all 620 seeds →
+`select-moved` → triage only the 541 risen records (T1 rule); ~6-8 new records expected; run pending.
 
 Why (measured live 2026-09-25): Zenodo's `q` sees metadata text only; beyond that, an `&nbsp;` glues
 words into one token (`4541602` "ab initio&nbsp;defect" matches neither), quoted phrases are not
@@ -71,7 +73,10 @@ has no computation word at all, and the keyword discover's cut-off is 2026-07-30
     exclusion inputs unless `--allow-missing-exclusions`), `build_seeds`,
     `record_signals`, `lookup_dois` (only papers of still-T2/T3 records), `score` → `scored.jsonl` +
     `score_report.json` (tier × type counts, peek workload, `PROBE_RECIDS` = the 4 Kavanagh misses,
-    `epmc_coverage` = the keyword method's recall check).
+    `epmc_coverage` = the keyword method's recall check). `select_moved` (CLI `select-moved`): the
+    rows of a re-score whose tier ROSE or that the earlier scoring never saw (`tier_before` added) →
+    a `triage --scored` file (`30_triage.sh` takes `SCORED`) — the seed snowball / a refresh triages
+    only those, since re-triaging a whole tier repeats its deep peeks when the read budget differs.
   - `headpeek.py` — first 8 MB of a tar-family stream in ONE Range read: magic-byte sniffing (a zip /
     7z / rar in disguise is reported), streaming decompression under a 128 MB cap (trailing padding
     tolerated), tar header walk (ustar prefix, GNU long names, PAX path, base-256 sizes, checksums).

@@ -33,7 +33,9 @@ Zenodo dataset ~533 records / 355,400 calcs / 17,757,938 frames, verify OK. T2 T
 T2 HARVEST DONE 2026-10-02 (pipeline 37089987 + recovery 37127828, verify OK): +87 records / +28,449
 calcs / +455,181 frames. PART A COMPLETE: the census added +317 records / +201,738 calcs / +6,124,397
 frames → Zenodo dataset ~620 records / 383,849 calcs / 18,213,119 frames. Next: part B (combined
-corpus); a seed-snowball re-score is a later option (`docs/ZENODO_CENSUS.md` §6, §11).**
+corpus). Seed snowball scoped + decided 2026-10-02 (`docs/ZENODO_CENSUS.md` §6 decisions 14-16, §11):
+re-score with all ~620 seeds → `zenodo_census.cli select-moved` → triage only the 541 risen records;
+run pending.**
 
 ## Code layout & commands
 

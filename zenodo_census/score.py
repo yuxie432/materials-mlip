@@ -416,6 +416,39 @@ def iter_scored(path: str | Path, tiers: Iterable[str] | None = None) -> Iterato
             yield row
 
 
+TIER_RANK = {"T1": 0, "T2": 1, "T3": 2, "T0": 3, "X": 4}
+
+
+def select_moved(old_path: str | Path, new_path: str | Path, out_path: str | Path,
+                 tiers: Iterable[str] = ("T1", "T2")) -> dict[str, Any]:
+    """The rows of a re-score worth triaging: records now in ``tiers`` that the earlier scoring
+    ranked lower (a new seed identity, a new paper link) or did not score at all (a record newer
+    than the earlier census). Every other record was triaged in its current tier already, so its
+    verdict stands — and re-triaging the whole tier would repeat its deep peeks whenever the read
+    budget differs (the cache key carries it). Writes the NEW rows, with ``tier_before`` added
+    (None when absent before), to ``out_path`` — a ``triage --scored`` file."""
+    want = set(tiers)
+    before = {str(r["recid"]): str(r.get("tier")) for r in read_jsonl(old_path)}
+    moves: Counter = Counter()
+    out = Path(out_path)
+    tmp = out.with_name(out.name + ".tmp")
+    with tmp.open("w") as fh:
+        for row in read_jsonl(new_path):
+            tier = str(row.get("tier"))
+            if tier not in want:
+                continue
+            old = before.get(str(row["recid"]))
+            if old is not None and TIER_RANK.get(old, 4) <= TIER_RANK.get(tier, 4):
+                continue
+            moves[f"{old or 'new'}->{tier}"] += 1
+            fh.write(json.dumps({**row, "tier_before": old}) + "\n")
+    os.replace(tmp, out)
+    summary = {"old": str(old_path), "new": str(new_path), "out": str(out),
+               "selected": sum(moves.values()), "moves": dict(sorted(moves.items()))}
+    logger.info("select-moved: %s", summary)
+    return summary
+
+
 _GITHUB_TITLE = re.compile(r"^[\w.-]+/[\w.-]+:\s")
 
 

@@ -5,6 +5,7 @@
     python -m zenodo_census.cli resolve           # cited VERSION ids -> concepts (~250 searches)
     python -m zenodo_census.cli openalex          # does each linked/citing paper cite VASP? (cached)
     python -m zenodo_census.cli score             # offline tiers -> scored.jsonl + score_report.json
+    python -m zenodo_census.cli select-moved      # rows of a re-score whose tier rose -> triage --scored
     python -m zenodo_census.cli triage            # peeks -> census_keep.jsonl (+ licence_review.jsonl)
     python -m zenodo_census.cli status            # progress of each stage (read-only)
     # then the ordinary Zenodo pipeline, straight into the production dataset:
@@ -40,7 +41,7 @@ from .links import (
     openalex_lookup,
     resolve_versions,
 )
-from .score import Exclusions, build_seeds, lookup_dois, score
+from .score import Exclusions, build_seeds, lookup_dois, score, select_moved
 from .signals import Seeds
 from .triage import (
     DEFAULT_INTERVAL,
@@ -162,6 +163,14 @@ def main(argv: list[str] | None = None) -> int:
     _common(sc)
     sc.add_argument("--out", default=str(P["scored"]))
 
+    sm = sub.add_parser("select-moved",
+                        help="the rows of a re-score whose tier rose (or that are new) -> a "
+                             "--scored file for triage")
+    sm.add_argument("--old", required=True, help="the earlier scored.jsonl (its backup)")
+    sm.add_argument("--new", default=str(P["scored"]), help="the re-score")
+    sm.add_argument("--out", required=True)
+    sm.add_argument("--tiers", nargs="+", default=["T1", "T2"])
+
     tr = sub.add_parser("triage", help="peek the selected records' archives -> keep-list")
     tr.add_argument("--scored", default=str(P["scored"]))
     tr.add_argument("--census", default=str(P["census"]))
@@ -243,6 +252,8 @@ def main(argv: list[str] | None = None) -> int:
                     citing=load_citing(P["datacite"], versions),
                     epmc=load_epmc(P["epmc"], versions),
                     openalex=load_openalex(P["openalex"]), versions=versions)
+    elif args.cmd == "select-moved":
+        out = select_moved(args.old, args.new, args.out, tiers=args.tiers)
     elif args.cmd == "triage":
         out = triage(args.scored, args.census, args.out, tiers=args.tiers, types=args.types,
                      residual_sample=args.residual_sample, negative_sample=args.negative_sample,
