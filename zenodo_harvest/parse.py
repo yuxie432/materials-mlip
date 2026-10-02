@@ -782,6 +782,38 @@ def _guard_numeric_algo() -> None:
             property(converged_electronic, doc=getattr(prop, "__doc__", None)))
 
 
+def _guard_overflowed_params() -> None:
+    """Make pymatgen read a Fortran-overflowed scalar PARAMETER (all ``*``) as ``None``, idempotently.
+
+    VASP writes a real that overflows its field as asterisks, and VASPsol's Debye length
+    ``LAMBDA_D_K`` does so in the ``<parameters>`` block of implicit-solvation vaspruns. pymatgen's
+    module-level ``_parse_parameters`` then raised ``ValueError: could not convert string to float:
+    '****************'`` inside ``Vasprun.__init__``, so the whole calc was rejected unless an OUTCAR
+    sat beside it for the fallback (census T2 20403107: 70 vaspruns without one). pymatgen already
+    maps the same overflow of ``RANDOM_SEED`` to ``None``; this extends that to any scalar parameter
+    that is nothing but asterisks. Only the ``<parameters>``/``<incar>`` scalars go through this
+    function; energies, forces, stresses and structures are read elsewhere (pymatgen's own
+    ``_vasprun_float`` already maps an overflow there to NaN). A parameter that VASP could not print
+    is ``None`` ("unknown"), never a guessed value. Installed at the parse entry points (forkserver
+    children too), like the ALGO guard.
+    """
+    from pymatgen.io.vasp import outputs
+    orig = outputs._parse_parameters
+    if getattr(orig, "_zh_overflow_guard", False):
+        return
+
+    def _parse_parameters(val_type: str, val: str) -> Any:
+        try:
+            return orig(val_type, val)
+        except ValueError:
+            if val and not val.strip().strip("*"):
+                return None
+            raise
+
+    _parse_parameters._zh_overflow_guard = True  # type: ignore[attr-defined]
+    setattr(outputs, "_parse_parameters", _parse_parameters)
+
+
 def _open_vasp_besteffort(ctor: Any, want_eigen: bool, label: str) -> tuple[Any, bool]:
     """Build a pymatgen ``Vasprun``/``Vaspout`` via ``ctor(parse_eigen: bool)``, retrying WITHOUT
     eigenvalues if the eigen parse raises. Returns ``(obj, eigen_parsed)``.
@@ -821,6 +853,7 @@ def parse_vasprun(vasprun_path: str, calc_id: str, outcar_path: str | None,
     """
     from pymatgen.io.vasp.outputs import Vasprun
     _guard_numeric_algo()
+    _guard_overflowed_params()
     parse_eigen = False
     if outcar_path is None:
         flags = _scan_vasprun_spin_flags(vasprun_path)
@@ -1251,7 +1284,18 @@ def _parse_outcar_ase(outcar_path: str, calc_id: str,
         else:
             with opener(outcar_path, "rb") as src, open(lone, "wb") as dst:
                 shutil.copyfileobj(src, dst)
-        traj = read(lone, format="vasp-out", index=":")
+        n_invalid_utf8_lines = 0
+        try:
+            traj = read(lone, format="vasp-out", index=":")
+        except UnicodeDecodeError:
+            # ASE opens the OUTCAR strictly as UTF-8, so a few stray bytes cost the whole calc.
+            # Real case (census T2, 11234637: 337 OUTCARs): VASP prints an uninitialised character
+            # buffer as the method name in "vdW correction parametrized for the method ..." (TS /
+            # MBD with a hybrid). Re-read the lone copy with those bytes replaced. A replaced byte
+            # was >= 0x80, so it can never have been part of a number: one inside a numeric field
+            # still fails the parse instead of silently changing a value.
+            n_invalid_utf8_lines = _replace_invalid_utf8(lone)
+            traj = read(lone, format="vasp-out", index=":")
     if not isinstance(traj, list):
         traj = [traj]
     # Recover the full calc parameters from the OUTCAR HEADER (functional/run_type/INCAR/
@@ -1346,7 +1390,7 @@ def _parse_outcar_ase(outcar_path: str, calc_id: str,
     ionic_converged = converged_ionic_from_params(
         cparam(calc_parameters, "NSW"), cparam(calc_parameters, "IBRION"),
         cparam(calc_parameters, "EDIFFG"), len(traj))
-    meta = {
+    meta: dict[str, Any] = {
         "calc_id": calc_id,
         "calc_parameters": calc_parameters,
         # n_ionic_steps counts all steps read; n_frames counts those actually stored (after the
@@ -1367,7 +1411,25 @@ def _parse_outcar_ase(outcar_path: str, calc_id: str,
         # ZVAL x ions per type); same values written to each frame's info. See electronic.py.
         "electronic": electronic,
     }
+    if n_invalid_utf8_lines:  # audit: read only after replacing non-UTF-8 bytes (see above)
+        meta["outcar_invalid_utf8_lines"] = n_invalid_utf8_lines
     return frames, meta
+
+
+def _replace_invalid_utf8(path: str) -> int:
+    """Rewrite ``path`` in place with every invalid UTF-8 byte replaced by U+FFFD (streamed, so a
+    multi-GB OUTCAR is never held in memory); return how many lines held one."""
+    import os
+    tmp = path + ".utf8"
+    n_lines = 0
+    with open(path, encoding="utf-8", errors="replace", newline="") as src, \
+            open(tmp, "w", encoding="utf-8", newline="") as dst:
+        for line in src:
+            if "�" in line:
+                n_lines += 1
+            dst.write(line)
+    os.replace(tmp, path)
+    return n_lines
 
 
 def _load_committed(metadata_path: Path) -> tuple[set[str], set[str]]:

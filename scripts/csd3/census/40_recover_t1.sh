@@ -29,6 +29,14 @@
 #
 #   sbatch scripts/csd3/census/40_recover_t1.sh            # the defaults above
 #   RECIDS="..." FETCH_RECIDS="..." sbatch scripts/csd3/census/40_recover_t1.sh   # others ("" = none)
+#
+# The same script serves the T2 run (docs/ZENODO_CENSUS.md §11, 2026-10-02): 11234637 (OUTCARs with
+# non-UTF-8 bytes) + 20403107 / 17254051 (VASPsol LAMBDA_D_K=**** in <parameters>) — both read by
+# parse.py since 2026-10-02 —, 21316138 (three ~3.5 GB OUTCARs past the 20 min timeout), and a
+# re-fetch of 18706703 (HTTP 429 on its 16.4 GB zip):
+#   KEEP=$ZENODO_CENSUS_DATA/census_keep_t2.jsonl WORK=$ZENODO_CENSUS_DATA/recover_t2 \
+#     RECIDS="11234637 20403107 17254051 21316138" FETCH_RECIDS="18706703" \
+#     sbatch scripts/csd3/census/40_recover_t1.sh
 set -euo pipefail
 
 export ZENODO_HARVEST_DATA="${ZENODO_HARVEST_DATA:-/rds/user/$USER/hpc-work/zenodo}"
@@ -65,7 +73,8 @@ if [[ -e "$DATASET_DIR/.parse.lock" ]]; then
 fi
 mkdir -p "$WORK"
 SUBSET="$WORK/recover.fetched.jsonl"
-echo "=== census T1 recovery $(date -Is) on $(hostname): recids [$RECIDS] refetch [${FETCH_RECIDS:-none}]"
+echo "=== census recovery ($(basename "$KEEP")) $(date -Is) on $(hostname): recids [$RECIDS]" \
+     "refetch [${FETCH_RECIDS:-none}]"
 echo "    parse_workers=$PARSE_WORKERS mem_budget=$(( PARSE_MEM_BUDGET / 1073741824 )) GiB" \
      "max_primary=$MAX_PRIMARY_BYTES B timeout=${PARSE_TIMEOUT}s"
 
