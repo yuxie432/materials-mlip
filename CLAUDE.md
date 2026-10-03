@@ -496,7 +496,12 @@ Each extra data source is a separate package that reuses the shared `zenodo_harv
 writes the same schema into its OWN data tree (calc_ids namespaced by `provenance.source`); each
 has its own `CLAUDE.md` with the details:
 
-- `nomad_harvest/` — NOMAD direct-upload VASP (7.07M calcs; `docs/NOMAD_HARVEST.md`).
+- `nomad_harvest/` — NOMAD direct-upload VASP (7.07M calcs; `docs/NOMAD_HARVEST.md`). **Caveat
+  (found 2026-10-03, `docs/DATASET_EVALUATION.md`)**: 6.20M of those calcs / 42.4M of 52.5M frames
+  are the Alexandria database's own runs (paths carry Alexandria ids `agm…`, uploaded 2024 by its
+  authors) plus the same group's 2017 perovskite set, i.e. institutional data already in
+  Alexandria / sAlex / OMat24. NOMAD's genuine long tail is ~870k calcs / 10.1M frames;
+  `dataset_stats.meta.origin_of` separates them.
 - `materials_cloud_harvest/` — Materials Cloud Archive: full census of all ~1.2k records, zip +
   AiiDA-archive peeks (sqlite_zip ones through their `db.sqlite3`), archives no peek can settle
   fetched too, the shared fetch with an anonymous session (`docs/MATERIALS_CLOUD_HARVEST.md`).
@@ -529,6 +534,16 @@ Not a source but a Zenodo discovery front-end, with its own `CLAUDE.md`:
   reusable; `zenodo_harvest/client.ZenodoClient._get` takes optional per-request `headers` (the
   census's fallback to InvenioRDM's native serializer for records Zenodo's default JSON serializer
   answers with HTTP 500 — measured on `20797668`).
+
+Not a source but the evaluation of all three, with its own `CLAUDE.md`:
+
+- `dataset_stats/` — read-only statistics of the three datasets and, with the same code, of the
+  reference MLIP sets (MPtrj, OMat24 val, sAlex val, MP / Alexandria materials): a parallel
+  byte-range `metadata.jsonl` pass (settings, calc types, XC buckets, MP/OMat24 compatibility,
+  quality, availability, provenance, Alexandria-origin flag), a resumable per-shard scan (per-frame
+  energy / force / stress / hash rows, per-calc composition, vacuum-gap dimensionality, space group),
+  and a report with side-by-side and novelty tables (`docs/DATASET_EVALUATION.md`; CSD3 runbook
+  `scripts/csd3/stats/`).
 
 ## Scope and starting point
 
