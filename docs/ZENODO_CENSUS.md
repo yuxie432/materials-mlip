@@ -19,10 +19,11 @@ taken. Everything under "measured" was obtained live on **2026-09-25**. CSD3 run
 > `verify` OK): **+87 records / +28,449 calcs / +455,181 frames**. **PART A COMPLETE (2026-10-02): the
 > census added +317 records / +201,738 calcs / +6,124,397 frames** (+105% / +111% / +51%) to the 303
 > records / 182,111 calcs / 12,088,722 frames of the keyword harvest → production Zenodo dataset
-> **~620 records / 383,849 calcs / 18,213,119 frames** (§11, "Census outcome").** **Seed snowball
-> scoped (2026-10-02, §11) and decided (14-16)**: re-score with all ~620 dataset records as seeds,
-> triage only the 541 records whose tier rose (`select-moved`), T1 rule; ~6-8 new records expected;
-> run pending. 98 offline census tests; three review passes (§12).
+> **~620 records / 383,849 calcs / 18,213,119 frames** (§11, "Census outcome").** **SEED SNOWBALL
+> DONE (2026-10-02, decisions 14-16, §11)**: re-score with all ~620 dataset records as seeds → 541
+> records whose tier rose → 51 kept → pipeline job 37197208 (`verify` OK): **+9 records / +2,576 calcs /
+> +30,571 frames** → production Zenodo dataset **629 records / 386,425 calcs / 18,243,690 frames**;
+> nothing worth a recovery run. 98 offline census tests; three review passes (§12).
 
 ---
 
@@ -369,8 +370,8 @@ through `select-moved` → `30_triage.sh` with `SCORED=` (README step 6).
   the 631 records VASP papers name in Europe PMC, 218 were never triaged (no archive, or already
   evaluated by the keyword harvest).
 * **Seed snowball** (decisions 12, 14-16; scoping in §11): the census finds are weaker seeds than the
-  keyword records (second-hop precision: account 5.7%, ORCID 0.5%), so the re-score promotes ~200
-  never-peeked records for ~6-8 expected finds; the paper-graph siblings are used up.
+  keyword records (second-hop precision: account 5.7%, ORCID 0.5%); the re-score promoted ~200
+  never-peeked records and yielded +9 records / +2,576 calcs (§11); the paper-graph siblings are used up.
 * **Deep-peek verdicts are cached per read budget**, complete listings included: a run with another
   `DEEP_MAX_REQUESTS` reads every deep-peeked archive again (cheap for the 541 movers; ~90k requests
   if a whole T2 tier were re-triaged at 300).
@@ -819,6 +820,49 @@ T3 records, perhaps 1-5 finds. NOMAD and Materials Cloud provenance hold author 
 August / September 2026 (to the 25th), among ~38 k archive-bearing records a month — each month
 after the census cut-off holds several times the snowball's yield. A refresh re-scores with the
 then-current seeds; `select-moved` also selects records the earlier scoring never saw.
+
+### Seed snowball — triage and pipeline (CSD3, 2026-10-02)
+
+**Re-score + selection**: `20_score.sh` as predicted (424 owners, 966 ORCIDs, 2,078 names with the
+Materials Cloud ones, 31 communities; T1 3,191 · T2 32,802 · T3 344,433 · T0 200,669); Europe PMC
+added 5 papers. `select-moved`: 541 records (149 T3 → T1, 339 T2 → T1, 53 T3 → T2; the two extra
+T1s are records the new papers name — both proven VASP-free).
+
+**Triage** (`SCORED=scored_snowball.jsonl`, 23 min): 316 standard peeks + 56 deep peeks (1,399
+requests; 39 proofs, no finds). Of the 56 records piloted from the local machine, CSD3 agreed on every
+evidence and empty verdict. Kept **51 records** (licence review empty, none already in the dataset or
+an earlier keep-list): 9 on evidence (55 GB of evidenced archives) and 42 by the T1 fail-safe —
+all 28 T2 → T1 records the T2 triage had left unresolved plus 14 T3 → T1 (166 GB, 32 of them linked by
+an ORCID only); 485 proven VASP-free, 5 T2 movers unresolved and not fetched.
+
+**Pipeline** — job 37197208, one round, 2 h 58 min (`PARTS=5`, 8 icelake-himem cores, staging peak
+57 GB), `verify` OK (386,425 calcs / 18,243,690 frames, metadata ↔ shards exact):
+
+| record | found by | calcs | frames | note |
+|---|---|---|---|---|
+| `3970974` probe molecules (LOBSTER) | account | 2,008 | 12,014 | the zip listed 50 outputs; 1,984 units came from its nested `.tar.gz` files |
+| `18891007` Na₂WO₄/SiO₂ catalysts | ORCID, **fail-safe** (`.rar`) | 247 | 5,440 | the one fail-safe record with VASP (1 of 42) |
+| `16749502` N₂ reduction on Al/Fe | account | 153 | 7,646 | relaxations + ZPE |
+| `17643350` Cu/Ag C–N coupling | ORCID | 125 | 4,007 | |
+| `15161709` birefringent materials | ORCID | 21 | 21 | band-structure single points |
+| `17137049` "my link" | account | 10 | 10 | 20 outputs pulled from 43 GB of zips |
+| `11181410` PACMAN | ORCID, hint | 9 | 1,430 | VASP runs inside nested `.tar.gz` |
+| `15794580`, `15064164` | account | 2 + 1 | 3 | |
+| **total** | | **2,576** | **30,571** | **+9 records** → 629 records |
+
+Rejected: 41 fail-safe records held no VASP (38 `no_vasp_files_fetched`, 3 inputs only), and
+`15654431` / `17239454` logged 201 `extract_error`s for PyTorch `.pth.tar` checkpoints (zips, not
+tars). Parse rejected 10 of 2,586 units: `21619301`'s 5 `outcar*.py[c]` files (the name look-alike
+triage flagged) and 5 runs that never started — their OUTCARs hold no SCF `Iteration` (ASE's
+"Incomplete OUTCAR") and their vaspruns end before `<generator>` / `<parameters>` (`18891007` ×3) or
+hold no ionic step (`17643350`, `3970974`). **No recovery run**: nothing transient, too large or timed
+out, and nothing a parser change could read.
+
+**Against the scoping estimate** (~6-8 records, ~200-1,000 calcs, ~5-50 k frames): 9 records — the
+ORCID-only stratum gave 3 (estimate ~0.5-1) and the fail-safe 1 (~0.2), small-number luck inside the
+measured intervals; frames inside the range; calcs 2.6× the top of the range because the estimate
+counted the outputs the peeks listed, and nested archives hide most of theirs (`3970974`: 25 listed,
+2,009 fetched — as `19669846` in T2). Listings with nested archives are lower bounds.
 
 ---
 

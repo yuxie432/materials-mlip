@@ -18,8 +18,9 @@ TRIAGED 2026-10-01 (5 rounds, 5,423 deep peeks): 103 VASP-evidence records (0.31
 seed snowball later, T3/T0 stop. T2 HARVEST DONE 2026-10-02 (pipeline 37089987 + recovery 37127828, verify OK):
 +87 records / +28,449 calcs / +455k frames. **COMPLETE: the census added +317 records / +201,738 calcs /
 +6,124,397 frames → dataset ~620 records / 383,849 calcs / 18.21M frames** (doc §11 "Census outcome").
-Seed snowball SCOPED + DECIDED 2026-10-02 (decisions 14-16, doc §11): re-score with all 620 seeds →
-`select-moved` → triage only the 541 risen records (T1 rule); ~6-8 new records expected; run pending.
+Seed snowball DONE 2026-10-02 (decisions 14-16, doc §11): re-score with all 620 seeds → `select-moved`
+→ triage of the 541 risen records (T1 rule) → 51 kept → pipeline 37197208: +9 records / +2,576 calcs /
++30,571 frames → dataset 629 records / 386,425 calcs / 18.24M frames; no recovery needed.
 
 Why (measured live 2026-09-25): Zenodo's `q` sees metadata text only; beyond that, an `&nbsp;` glues
 words into one token (`4541602` "ab initio&nbsp;defect" matches neither), quoted phrases are not

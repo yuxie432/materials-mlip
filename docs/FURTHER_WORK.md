@@ -26,7 +26,7 @@ in C, never ingested.
 
 | Source | Dir | Records | Calcs | Frames | Size | Licence |
 |---|---|---|---|---|---|---|
-| Zenodo | `zenodo/dataset` | ~620 | 383,849 | 18,213,119 | ~72 GiB, ~1,880 shards | CC0/BY/BY-SA (+NC recs, 1 no-licence by permission) — incl. the census additions (T1 230 + T2 87 recs, 2026-10-02; `docs/ZENODO_CENSUS.md` §11) |
+| Zenodo | `zenodo/dataset` | 629 | 386,425 | 18,243,690 | ~72 GiB, ~1,880 shards | CC0/BY/BY-SA (+NC recs, 1 no-licence by permission) — incl. the census additions (T1 230 + T2 87 + seed snowball 9 recs, 2026-10-02; `docs/ZENODO_CENSUS.md` §11) |
 | NOMAD | `nomad/dataset` | direct uploads | 7,073,592 | 52,459,065 | ~59 GiB, 5,328 shards | CC BY 4.0 |
 | Materials Cloud | `materials_cloud/dataset` | 102 | 75,751 | 2,545,669 | 7.3 GiB, 268 shards | BY-SA 65.6% of frames / BY / MIT / BY-NC |
 
@@ -84,8 +84,8 @@ packaging) and `ervm4-pn188` ↔ `7023990` (the Zenodo side is only a code snaps
 > with their recoveries: **+317 records / +201,738 calcs / +6,124,397 frames** → Zenodo dataset ~620
 > records / 383,849 calcs / 18,213,119 frames (records and calcs more than doubled, frames +51%; T2's
 > 25.7 TB of unresolved archives skipped by decision). Part B can start. A seed-snowball re-score (the
-> records now known to hold VASP as identity seeds) was scoped on 2026-10-02 and runs next (~6-8 records
-> expected; `docs/ZENODO_CENSUS.md` §6 decisions 14-16, §11).** (2026-09-25:) The research found a
+> records now known to hold VASP as identity seeds) ran on 2026-10-02: +9 records / +2,576 calcs /
+> +30,571 frames → 629 records / 386,425 calcs / 18,243,690 frames (`docs/ZENODO_CENSUS.md` §11).** (2026-09-25:) The research found a
 > cheaper, more complete route than the design sketched below: Zenodo's search accepts field
 > syntax, so a census of every record that HOLDS an archive (`files.entries.ext:…`, 583k records,
 > all resource types) costs ~5.8k pages ≈ 3.4 h, after which the snowball / paper-graph / text

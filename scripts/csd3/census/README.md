@@ -172,6 +172,8 @@ IN=$ZENODO_CENSUS_DATA/census_keep_snowball.jsonl RAW_DIR=$ZENODO_HARVEST_DATA/r
   RESUBMIT=1 sbatch scripts/csd3/20_pipeline.sh
 #    status: the step-4 command with census_keep_snowball; fixable rejections: 40_recover_t1.sh with
 #    KEEP=$ZENODO_CENSUS_DATA/census_keep_snowball.jsonl WORK=$ZENODO_CENSUS_DATA/recover_snowball RECIDS="…".
+#    Seed snowball: DONE 2026-10-02 (triage 23 min; pipeline job 37197208, verify OK): +9 records /
+#    +2,576 calcs / +30,571 frames; no recovery needed (doc §11). raw_census holds only rejected leftovers.
 ```
 
 ## What bounds each step
