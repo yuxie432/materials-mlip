@@ -7,9 +7,9 @@ sAlex and the MP / Alexandria material sets. Everything is **read-only** on the 
 go to `$DATASET_STATS_DATA` (default `/rds/user/$USER/hpc-work/stats`).
 
 ```
-scripts/csd3/stats/10_stats.sh    # meta + scan of each source (resumable per shard)  ~5 CPU-h
-scripts/csd3/stats/15_refs.sh     # download + scan the reference datasets              ~1-2 h
-scripts/csd3/stats/20_report.sh   # combine -> report.json + report.md                   ~0.5 h
+scripts/csd3/stats/10_stats.sh    # meta + scan of each source (resumable per shard)  5.4 CPU-h, 16 min on 32 cores
+scripts/csd3/stats/15_refs.sh     # download + scan the reference datasets              40 min on 16 cores
+scripts/csd3/stats/20_report.sh   # combine -> report.json + report.md                   17 min
 ```
 
 **Individual uploads only (default, `INDIVIDUAL_ONLY=1`).** NOMAD's direct uploads include the
@@ -69,4 +69,6 @@ stats/refs/<name>/                      the reference downloads
 stats/report/report.json, report.md     THE result — copy these two home
 ```
 
-Copy home: `rsync -av <crsid>@login.hpc.cam.ac.uk:/rds/user/<crsid>/hpc-work/stats/report/ dataset_csd3/report/`
+Copy home: `rsync -av <crsid>@login.hpc.cam.ac.uk:/rds/user/<crsid>/hpc-work/stats/report/ stats_csd3/`
+(gitignored). Measured times are from the 2026-10-03 run (jobs 37235786/7/8); the results are
+written up in `docs/DATASET_EVALUATION.md`.

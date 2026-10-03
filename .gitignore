@@ -47,6 +47,7 @@ lightning_logs/
 runs/
 logs/
 logs_stats/
+stats_csd3/
 
 # --- HPC / Slurm batch job output ------------------------------------------
 slurm-*.out

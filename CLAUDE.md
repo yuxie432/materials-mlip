@@ -543,7 +543,11 @@ Not a source but the evaluation of all three, with its own `CLAUDE.md`:
   quality, availability, provenance, Alexandria-origin flag), a resumable per-shard scan (per-frame
   energy / force / stress / hash rows, per-calc composition, vacuum-gap dimensionality, space group),
   and a report with side-by-side and novelty tables (`docs/DATASET_EVALUATION.md`; CSD3 runbook
-  `scripts/csd3/stats/`).
+  `scripts/csd3/stats/`). **Evaluation DONE 2026-10-03** (individual uploads only): long tail
+  2,707 deposits / 1.33M calcs / 30.9M frames; 2.67M frames after sAlex's ΔE > 10 meV/atom rule
+  (3.8× MPtrj under the same rule); 52% of frames slab / 2D and 12% molecule / cluster, while every
+  reference is ≥ 97.7% bulk; 49% of its chemical systems are absent from MP ∪ Alexandria; 96.2% of
+  frames pass the default filters.
 
 ## Scope and starting point
 
