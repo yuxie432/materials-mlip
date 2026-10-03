@@ -46,6 +46,7 @@ wandb/
 lightning_logs/
 runs/
 logs/
+logs_stats/
 
 # --- HPC / Slurm batch job output ------------------------------------------
 slurm-*.out
