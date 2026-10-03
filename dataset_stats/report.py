@@ -20,9 +20,10 @@ import numpy as np
 
 from . import scan as S
 from .common import FORCE_EDGES, concentration, counter_top, hist, hist_quantile, summary
-from .meta import AVAIL_KEYS, CAT_COLS, CALC_DTYPE, load_meta
+from .meta import AVAIL_KEYS, CALC_DTYPE, CAT_COLS, INDIVIDUAL_FILTER, load_meta
 from .params import LIB_BITS
 from .structure import VACUUM_GAP_A
+from .scan import read_filter
 from .tables import formula_counts, load_calc_structs, load_frames
 
 logger = logging.getLogger(__name__)
@@ -103,7 +104,7 @@ def _join(keys_sorted: np.ndarray, order: np.ndarray, keys: np.ndarray
 
 # --------------------------------------------------------------------------------------------
 def source_report(name: str, meta_dir: Path, scan_dir: Path, dataset_dir: Path | None = None,
-                  mu: dict[str, float] | None = None
+                  mu: dict[str, float] | None = None, individual_only: bool = False
                   ) -> tuple[dict, dict, dict[str, tuple[dict, dict]]]:
     """(report, internal arrays, origin subsets) for one harvested source.
 
@@ -116,11 +117,26 @@ def source_report(name: str, meta_dir: Path, scan_dir: Path, dataset_dir: Path |
     frames, fagg = load_frames(scan_dir)  # empty when the source has not been scanned yet
     logger.info("[%s] %d frames; loading per-calc structures", name, len(frames))
     structs, formulas, systems, _groups = load_calc_structs(scan_dir)
+    individual = individual_only or read_filter(scan_dir).get("name") == INDIVIDUAL_FILTER
+    excluded = int((meta["origin"] > 0).sum())
+    if individual and excluded:
+        excl_frames = int(meta["n_frames"][meta["origin"] > 0].astype(np.int64).sum())
+        meta = meta[meta["origin"] == 0]
+        keys = np.unique(meta["calc"])
+        frames = frames[np.isin(frames["calc"], keys)]
+        structs = structs[np.isin(structs["calc"], keys)]
+        logger.info("[%s] individual uploads only: %d calcs / %d frames of institutional origin "
+                    "excluded", name, excluded, excl_frames)
+    else:
+        excl_frames = 0
     rep, internal = _analyse(name, meta, tabs, frames, fagg, structs, formulas, systems,
                              deposits=deposits, magg=magg, dataset_dir=dataset_dir,
                              reference=False, mu=mu)
+    rep["filter"] = {"individual_only": individual,
+                     "calcs_excluded": excluded if individual else 0,
+                     "frames_excluded": excl_frames}
     subsets: dict[str, tuple[dict, dict]] = {}
-    if (meta["origin"] > 0).any():
+    if not individual and (meta["origin"] > 0).any():
         no_fhist = dict(fagg, force_hist=np.zeros_like(fagg["force_hist"]))
         for label, keep in (("long-tail", meta["origin"] == 0),
                             ("alexandria-group", meta["origin"] > 0)):
@@ -1036,7 +1052,8 @@ def novelty(internals: dict[str, dict], refs: dict[str, dict],
 def build_report(stats_root: str | Path, sources: list[str],
                  dataset_dirs: dict[str, Path] | None = None,
                  references: list[str] | None = None,
-                 refs_root: str | Path | None = None) -> tuple[dict, dict]:
+                 refs_root: str | Path | None = None,
+                 individual_only: bool = False) -> tuple[dict, dict]:
     """(report, internals) over ``<stats_root>/<source>/{meta,scan}`` for each harvested source
     and ``<stats_root>/ref_<name>/scan`` for each reference. MP's elemental reference energies,
     if downloaded under ``refs_root``, add the formation-energy proxy to every label section."""
@@ -1053,7 +1070,8 @@ def build_report(stats_root: str | Path, sources: list[str],
             logger.warning("no metadata pass for %s under %s — skipped", src, base)
             continue
         r, internal, subs = source_report(src, base / "meta", base / "scan",
-                                          (dataset_dirs or {}).get(src), mu=mu)
+                                          (dataset_dirs or {}).get(src), mu=mu,
+                                          individual_only=individual_only)
         reports[src] = r
         internals[src] = internal
         for sname, (sr, si) in subs.items():

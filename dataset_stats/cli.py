@@ -62,8 +62,14 @@ def cmd_meta(args: argparse.Namespace) -> int:
 def cmd_scan(args: argparse.Namespace) -> int:
     from .scan import scan_dataset
     out = Path(args.stats_root) / args.source / "scan"
+    include, finfo = None, None
+    if args.individual_only:
+        from .meta import individual_include
+        include, finfo = individual_include(Path(args.stats_root) / args.source / "meta")
+        logging.getLogger(__name__).info("individual uploads only: %s", finfo)
     res = scan_dataset(_dataset_dir(args), out, workers=args.workers, limit=args.limit,
-                       force=args.force, describe=not args.no_describe)
+                       force=args.force, describe=not args.no_describe, include=include,
+                       filter_info=finfo)
     print(json.dumps(res, indent=1))
     return 0 if not res["shards_failed"] else 1
 
@@ -99,7 +105,8 @@ def cmd_report(args: argparse.Namespace) -> int:
         k, _, v = spec.partition("=")
         dirs[k] = Path(v)
     rep, _internals = build_report(args.stats_root, srcs, dirs, references=args.refs or [],
-                                   refs_root=_refs_root(args))
+                                   refs_root=_refs_root(args),
+                                   individual_only=args.individual_only)
     out = Path(args.out) if args.out else Path(args.stats_root) / "report"
     out.mkdir(parents=True, exist_ok=True)
     with open(out / "report.json", "w") as fh:
@@ -133,6 +140,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--force", action="store_true", help="re-scan shards already done")
     s.add_argument("--no-describe", action="store_true",
                    help="skip the per-calc structure descriptors (spglib, neighbour list)")
+    s.add_argument("--individual-only", action="store_true",
+                   help="scan only individual uploads: skip calcs of institutional high-"
+                        "throughput origin (NOMAD's Alexandria-group uploads); needs `meta` first")
     s.set_defaults(func=cmd_scan)
 
     from .reference import REFERENCES
@@ -153,6 +163,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--refs-root", help="reference downloads (default <stats-root>/refs; the MP "
                                        "elemental references found there add a formation-energy "
                                        "proxy)")
+    r.add_argument("--individual-only", action="store_true",
+                   help="report individual uploads only (implied for a source scanned with "
+                        "--individual-only)")
     r.add_argument("--dataset-dir", action="append",
                    help="SOURCE=PATH, only to size the shards on disk (repeatable)")
     r.add_argument("--out", help="default <stats-root>/report")

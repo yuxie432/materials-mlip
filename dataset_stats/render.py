@@ -460,8 +460,18 @@ def render_markdown(rep: dict) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     parts = [f"# Dataset statistics\n\nGenerated {stamp} by `python -m dataset_stats.cli "
              f"report`. Weights: *calcs* count each calculation once; *frames* weight it by its "
-             f"stored ionic steps. Vacuum threshold {rep.get('vacuum_gap_threshold_A')} Å.\n",
-             "## At a glance\n", _glance(rep)]
+             f"stored ionic steps. Vacuum threshold {rep.get('vacuum_gap_threshold_A')} Å.\n"]
+    excl = {n: r["filter"] for n, r in rep["sources"].items()
+            if (r.get("filter") or {}).get("individual_only")}
+    if excl:
+        dropped = ", ".join(f"{_label(n)}: {f['calcs_excluded']:,} calcs / "
+                            f"{f['frames_excluded']:,} frames"
+                            for n, f in excl.items() if f["calcs_excluded"])
+        parts.append("**Individual uploads only.** Calcs of institutional high-throughput origin "
+                     "(the Alexandria group's runs inside NOMAD's direct uploads, identified by "
+                     "Alexandria ids / naming in their paths) are excluded"
+                     + (f" ({dropped})" if dropped else "") + ".\n")
+    parts += ["## At a glance\n", _glance(rep)]
     parts.append(_comparison_md(rep))
     parts.append(_novelty_md(rep.get("novelty_vs_references", {})))
     for r in _ordered(rep).values():

@@ -95,7 +95,17 @@ CALC_DTYPE = np.dtype([
     ("mag", "f4"), ("charge", "f4"),
     # availability bits (AVAIL_KEYS order) + provenance year + origin (ORIGIN_LABELS index)
     ("avail", "u2"), ("year", "i2"), ("origin", "i1"),
+    # first / last shard index holding the calc's frames (a calc is written contiguously), so a
+    # filtered scan can skip shards that hold none of the calcs it wants
+    ("shard_lo", "i4"), ("shard_hi", "i4"),
 ])
+_SHARD_IDX_RE = re.compile(r"(\d+)\.extxyz")
+
+
+def shard_range(rec: dict) -> tuple[int, int]:
+    idx = [int(m.group(1)) for s in rec.get("shards") or []
+           if (m := _SHARD_IDX_RE.search(str(s)))]
+    return (min(idx), max(idx)) if idx else (-1, -1)
 
 
 class Cats:
@@ -229,7 +239,7 @@ def calc_row(rec: dict, cats: Cats, agg: dict[str, Counter]) -> tuple:
         _i(q.get("n_frames_scf_unconverged"), 0), _i(q.get("n_frames_with_forces"), 0),
         _i(q.get("n_frames_with_stress"), 0), _i(q.get("n_frames_dropped_no_energy"), 0),
         _f(el.get("net_magnetization")), _f(el.get("net_charge")),
-        avail, _year(prov), origin_of(rec),
+        avail, _year(prov), origin_of(rec), *shard_range(rec),
     )
 
 
@@ -362,3 +372,32 @@ def load_meta(out_dir: str | Path) -> tuple[np.ndarray, dict[str, list[str]], di
                 agg[k] = agg.get(k, 0) + v
     rows = np.concatenate(parts) if parts else np.zeros(0, dtype=CALC_DTYPE)
     return rows, {c: list(t) for c, t in tables.items()}, deposits, agg
+
+
+INDIVIDUAL_FILTER = "individual-uploads"
+
+
+def individual_include(meta_dir: str | Path) -> tuple[dict[int, frozenset[int]] | None, dict]:
+    """Which shards (and which calcs in them) hold individual uploads, i.e. calcs with
+    ``origin == 0`` — for a scan that skips the institutional high-throughput data.
+
+    Returns ``(None, info)`` when the source has nothing to exclude (scan every shard), else
+    ``({shard index: calc keys}, info)``; shards absent from the mapping hold no wanted calc."""
+    rows, _tabs, _deps, _agg = load_meta(meta_dir)
+    if rows.dtype.names is None or "shard_lo" not in rows.dtype.names:
+        raise ValueError(f"{meta_dir} predates the shard ranges: re-run `meta` first")
+    excl = rows["origin"] > 0
+    info = {"name": INDIVIDUAL_FILTER, "excluded_origins": list(ORIGIN_LABELS[1:]),
+            "calcs_excluded": int(excl.sum()), "calcs_kept": int((~excl).sum()),
+            "frames_excluded": int(rows["n_frames"][excl].astype(np.int64).sum())}
+    if not excl.any():
+        return None, info
+    inc: dict[int, set[int]] = {}
+    keep = rows[~excl]
+    for k, lo, hi in zip(keep["calc"].tolist(), keep["shard_lo"].tolist(),
+                         keep["shard_hi"].tolist()):
+        for s_idx in range(lo, hi + 1) if lo >= 0 else ():
+            inc.setdefault(s_idx, set()).add(k)
+    info["shards_with_kept_calcs"] = len(inc)
+    return {s_idx: frozenset(v) for s_idx, v in inc.items()}, info
+

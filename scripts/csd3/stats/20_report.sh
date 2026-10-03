@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -J ds-report
-#SBATCH -p icelake-himem               # NOMAD: ~52M frame rows (~4.6 GB), its two origin subsets and sort buffers (~20-25 GB peak)
+#SBATCH -p icelake-himem               # individual uploads: ~31M frame rows (~2.7 GB) + sort buffers; all of NOMAD (INDIVIDUAL_ONLY=0): ~20-25 GB peak
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH -c 8                           # ~54 GiB (6.76 GiB/core) for RAM; the report is single-threaded
+#SBATCH -c 4                           # ~27 GiB (6.76 GiB/core) for RAM; single-threaded. INDIVIDUAL_ONLY=0: sbatch -c 8
 #SBATCH -t 03:00:00
 #SBATCH -o logs_stats/ds-report-%j.out
 #SBATCH -e logs_stats/ds-report-%j.err
@@ -22,11 +22,13 @@ export NOMAD_HARVEST_DATA="${NOMAD_HARVEST_DATA:-/rds/user/$USER/hpc-work/nomad}
 export MC_HARVEST_DATA="${MC_HARVEST_DATA:-/rds/user/$USER/hpc-work/materials_cloud}"
 export DATASET_STATS_DATA="${DATASET_STATS_DATA:-/rds/user/$USER/hpc-work/stats}"
 REFS="${REFS:-mptrj omat24_val salex_val mp_materials alexandria_pbe}"
+INDIVIDUAL_ONLY="${INDIVIDUAL_ONLY:-1}"   # also implied by a scan made with --individual-only
+FILTER=(); [[ "$INDIVIDUAL_ONLY" == 1 ]] && FILTER=(--individual-only)
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
 echo "=== ds-report START $(date -Is) on $(hostname) ==="
 # shellcheck disable=SC2086
-python -m dataset_stats.cli report --refs $REFS
+python -m dataset_stats.cli report --refs $REFS ${FILTER[@]+"${FILTER[@]}"}
 rc=$?
 echo "=== ds-report DONE exit=$rc $(date -Is) ==="
 exit "$rc"

@@ -351,3 +351,29 @@ def test_xc_tag_normalisation():
     assert params.xc_family(_cp(incar={"GGA": ".pe."})) == "PBE"
     assert params.xc_family(_cp(incar={"GGA": "MK !FOR OPTB86B-VDW FUNCTIONAL"})) == "optB86b-vdW"
     assert params.xc_family(_cp(incar={"METAGGA": "R2SCAN ! meta"})) == "R2SCAN"
+
+
+def test_individual_only_scan_and_report(synthetic: Path, tmp_path: Path):
+    from dataset_stats.meta import individual_include
+    md = synthetic / "dataset" / "metadata.jsonl"
+    recs = [json.loads(line) for line in md.read_text().splitlines()]
+    recs[2]["provenance"]["mainfile"] = "xxx_02a-00_agm000000001_spg225/GEO1_vasprun.xml"
+    md.write_text("".join(json.dumps(r) + "\n" for r in recs))
+    stats = tmp_path / "stats"
+    meta_dataset(md, stats / "zenodo" / "meta", workers=1)
+    include, info = individual_include(stats / "zenodo" / "meta")
+    # 7 frames per shard: calc 1 (10) -> shards 0-1, calc 2 (5) -> 1-2, calc 3 (10) -> 2-3
+    assert include is not None and sorted(include) == [0, 1, 2]
+    assert info["calcs_excluded"] == 1 and info["frames_excluded"] == 10
+    res = scan_dataset(synthetic / "dataset", stats / "zenodo" / "scan", include=include,
+                       filter_info=info)
+    assert res["shards_total"] == 3 and res["frames_scanned_now"] == 15
+    rows, _calcs, agg = load_scan(stats / "zenodo" / "scan" / "shard-00002.npz")
+    assert agg["frames_skipped"] == 6 and len(rows) == 1
+    with pytest.raises(ValueError):  # never mix filters in one scan dir
+        scan_dataset(synthetic / "dataset", stats / "zenodo" / "scan")
+    rep, _ = build_report(stats, ["zenodo"])
+    z = rep["sources"]["zenodo"]
+    assert z["filter"] == {"individual_only": True, "calcs_excluded": 1, "frames_excluded": 10}
+    assert z["size"]["calcs"] == 2 and z["size"]["frames_scanned"] == 15
+    assert z["size"]["frames_without_metadata"] == 0 and rep["subsets"] == {}

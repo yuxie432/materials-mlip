@@ -33,7 +33,7 @@ from typing import Any
 
 import numpy as np
 
-from zenodo_harvest.store import existing_shard_paths
+from zenodo_harvest.store import _shard_index_of, existing_shard_paths
 
 from . import structure
 from .common import EV_A3_TO_GPA, FORCE_EDGES, array_text, atomic_write_npz, calc_key, \
@@ -164,21 +164,41 @@ def _load_block(lines: list[str], usecols: tuple[int, ...]) -> np.ndarray:
     return np.loadtxt(lines, usecols=usecols, comments=None, ndmin=2, dtype=np.float64)
 
 
-def scan_shard(shard: str | Path, *, describe: bool = True, keys: KeyMap = HARVEST_KEYS
+def scan_shard(shard: str | Path, *, describe: bool = True, keys: KeyMap = HARVEST_KEYS,
+               keep_calcs: set[int] | frozenset[int] | None = None
                ) -> tuple[np.ndarray, list[dict], dict]:
     """Scan one shard -> (frames table, per-calc records, aggregates). Writes nothing."""
     shard = Path(shard)
     text, truncated = read_shard_text(shard)
-    return scan_text(text, name=shard.name, truncated=truncated, describe=describe, keys=keys)
+    return scan_text(text, name=shard.name, truncated=truncated, describe=describe, keys=keys,
+                     keep_calcs=keep_calcs)
 
 
 def scan_text(text: str, *, name: str, truncated: bool = False, describe: bool = True,
-              keys: KeyMap = HARVEST_KEYS) -> tuple[np.ndarray, list[dict], dict]:
-    """:func:`scan_shard` on already-decompressed extxyz text (shards, or zip members)."""
+              keys: KeyMap = HARVEST_KEYS, keep_calcs: set[int] | frozenset[int] | None = None
+              ) -> tuple[np.ndarray, list[dict], dict]:
+    """:func:`scan_shard` on already-decompressed extxyz text (shards, or zip members).
+
+    ``keep_calcs`` (calc keys) restricts the scan to those calcs: other frames are dropped right
+    after their comment line is read, before any numeric parsing or structure analysis."""
     t0 = time.time()
     lines = text.split("\n")
     del text
-    idx, torn = frame_index(lines)
+    idx_all, torn = frame_index(lines)
+    key_of: dict[str, int] = {}
+    parsed: list[tuple[int, int, dict[str, str], str, int, int]] = []
+    skipped = 0
+    for hdr, nat in idx_all:
+        info = parse_comment(lines[hdr + 1])
+        cid, step = _calc_and_step(info, keys)
+        k = key_of.get(cid)
+        if k is None:
+            k = key_of[cid] = calc_key(cid)
+        if keep_calcs is not None and k not in keep_calcs:
+            skipped += 1
+            continue
+        parsed.append((hdr, nat, info, cid, step, k))
+    idx = [(hdr, nat) for hdr, nat, *_rest in parsed]
     nfr = len(idx)
     fcol = {name: np.full(nfr, np.nan, dtype=FRAME_DTYPE[name]) for name in _FLOAT_COLS}
     c_calc = np.zeros(nfr, dtype="u8")
@@ -199,18 +219,12 @@ def scan_text(text: str, *, name: str, truncated: bool = False, describe: bool =
     natoms_l: list[int] = []
     cells: list[np.ndarray | None] = []
     calc_ids: list[str] = []
-    key_of: dict[str, int] = {}
     group_of: dict[str, str] = {}
-    for fi, (hdr, nat) in enumerate(idx):
-        info = parse_comment(lines[hdr + 1])
+    for fi, (hdr, nat, info, cid, step, k) in enumerate(parsed):
         keys_seen.update(info.keys())
-        cid, step = _calc_and_step(info, keys)
         if keys.group_key and cid not in group_of:
             group_of[cid] = info.get(keys.group_key, "")
         calc_ids.append(cid)
-        k = key_of.get(cid)
-        if k is None:
-            k = key_of[cid] = calc_key(cid)
         c_calc[fi] = k
         c_step[fi] = step
         c_nat[fi] = nat
@@ -354,7 +368,7 @@ def scan_text(text: str, *, name: str, truncated: bool = False, describe: bool =
         for c in calcs:
             c["g"] = group_of.get(str(c["id"]), "")
     agg: dict[str, Any] = {
-        "shard": name, "frames": nfr, "atoms": int(sum(natoms_l)),
+        "shard": name, "frames": nfr, "frames_skipped": skipped, "atoms": int(sum(natoms_l)),
         "truncated": truncated, "torn_tail": torn, "bad_frames": bad_frames,
         "fallback_runs": fallback_runs, "force_nonfinite_atoms": force_nonfinite_atoms,
         "force_hist": force_hist.tolist(), "props": dict(props_seen),
@@ -367,11 +381,11 @@ def output_path(out_dir: Path, shard: Path) -> Path:
     return out_dir / (shard.name.split(".", 1)[0] + ".npz")
 
 
-def _scan_task(args: tuple[str, str, bool]) -> dict:
-    shard_s, out_s, describe = args
+def _scan_task(args: tuple[str, str, bool, frozenset[int] | None]) -> dict:
+    shard_s, out_s, describe, keep = args
     shard, out = Path(shard_s), Path(out_s)
     try:
-        rows, calcs, agg = scan_shard(shard, describe=describe)
+        rows, calcs, agg = scan_shard(shard, describe=describe, keep_calcs=keep)
         atomic_write_npz(out, frames=rows, calcs=text_array(jsonl_text(calcs)),
                          agg=text_array(json.dumps(agg)))
     except Exception as exc:  # noqa: BLE001 - report the shard, keep the pool alive
@@ -395,13 +409,42 @@ def scan_outputs(out_dir: str | Path) -> list[Path]:
     return sorted(Path(out_dir).glob("shard-*.npz"))
 
 
+FILTER_FILE = "filter.json"
+
+
+def read_filter(out_dir: str | Path) -> dict:
+    """The calc filter a scan dir was written with (``{}`` = every calc)."""
+    p = Path(out_dir) / FILTER_FILE
+    try:
+        return json.loads(p.read_text()) if p.is_file() else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def scan_dataset(dataset_dir: str | Path, out_dir: str | Path, *, workers: int = 1,
-                 limit: int | None = None, force: bool = False, describe: bool = True) -> dict:
+                 limit: int | None = None, force: bool = False, describe: bool = True,
+                 include: dict[int, frozenset[int]] | None = None,
+                 filter_info: dict | None = None) -> dict:
     """Scan every shard of ``dataset_dir`` into ``out_dir`` (resumable; largest shards first, so
-    the long ones do not finish last on a single worker)."""
+    the long ones do not finish last on a single worker).
+
+    ``include`` (shard index -> calc keys) restricts the scan to those shards and, inside them, to
+    those calcs; ``filter_info`` describes the restriction and is recorded in ``filter.json``. A
+    scan dir never mixes two filters: re-running with a different one is refused (``force``
+    rescans everything)."""
     dataset_dir, out_dir = Path(dataset_dir), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    want = filter_info or {}
+    have = read_filter(out_dir)
+    done_any = any(out_dir.glob("shard-*.npz"))
+    if done_any and not force and have.get("name") != want.get("name"):
+        raise ValueError(f"{out_dir} holds a scan with filter {have.get('name') or 'none'!r}; "
+                         f"this run asks for {want.get('name') or 'none'!r}. Use another "
+                         f"--stats-root or --force to rescan.")
+    (out_dir / FILTER_FILE).write_text(json.dumps(want, indent=1))
     shards = existing_shard_paths(dataset_dir)
+    if include is not None:
+        shards = [s for s in shards if _shard_index_of(s) in include]
     todo = [s for s in shards if force or not output_path(out_dir, s).is_file()]
     todo.sort(key=lambda p: p.stat().st_size, reverse=True)
     if limit is not None:
@@ -411,7 +454,12 @@ def scan_dataset(dataset_dir: str | Path, out_dir: str | Path, *, workers: int =
     t0 = last_log = time.time()
     done = frames = 0
     errors: list[dict] = []
-    tasks = [(str(s), str(output_path(out_dir, s)), describe) for s in todo]
+    tasks: list[tuple[str, str, bool, frozenset[int] | None]] = []
+    for s in todo:
+        keep = None
+        if include is not None:
+            keep = include[_shard_index_of(s)]
+        tasks.append((str(s), str(output_path(out_dir, s)), describe, keep))
 
     def _record(res: dict) -> None:
         nonlocal done, frames, last_log
@@ -433,7 +481,7 @@ def scan_dataset(dataset_dir: str | Path, out_dir: str | Path, *, workers: int =
         with get_context("fork").Pool(workers, maxtasksperchild=200) as pool:
             for res in pool.imap_unordered(_scan_task, tasks, chunksize=1):
                 _record(res)
-    summary = {"dataset_dir": str(dataset_dir), "out_dir": str(out_dir),
+    summary = {"dataset_dir": str(dataset_dir), "out_dir": str(out_dir), "filter": want,
                "shards_total": len(shards), "shards_done_now": done - len(errors),
                "shards_failed": len(errors), "errors": errors[:50], "frames_scanned_now": frames,
                "complete": all(output_path(out_dir, s).is_file() for s in shards),

@@ -29,7 +29,11 @@ Three passes, each over numpy rows joined by `calc_key` (blake2b-64 of the calc_
   formula, chemsys, vacuum gaps -> bulk/slab/wire/molecule at 6 Å, shortest distance, spglib space
   group ≤ 400 atoms at symprec 0.1, density, reciprocal lengths); per shard a per-atom |F|
   histogram. One atomic `.npz` per shard, skipped on a re-run (resumable). `KeyMap` maps another
-  extxyz's keys onto the same rows (`MPTRJ_KEYS`).
+  extxyz's keys onto the same rows (`MPTRJ_KEYS`). `--individual-only` (the CSD3 default) scans
+  only calcs with `origin == 0`: `meta.individual_include` maps shard index -> wanted calc keys from
+  each calc's `shard_lo`/`shard_hi`, unwanted shards are not opened and unwanted calcs are dropped
+  after their comment line; `filter.json` records the filter and a scan dir never mixes two.
+  The report applies the same filter to the metadata rows (implied by the scan's `filter.json`).
 - `reference.py` — download (Range resume, md5 where published) and scan of the references:
   Matbench Discovery's MPtrj extxyz zip (one member per material), OMat24/sAlex `.aselmdb`
   (needs `ase-db-backends`; trajectory = `sid` minus its step, group = Alexandria `parent_id`), MP /
