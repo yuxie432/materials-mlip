@@ -83,11 +83,14 @@ def as_floats(v: Any) -> list[float]:
 
 
 def potcar_symbols(cp: dict) -> list[str]:
-    """POTCAR symbols in species order (``PAW_PBE Fe_pv 06Sep2000`` -> ``Fe_pv``)."""
+    """POTCAR symbols in species order (``PAW_PBE Fe_pv 06Sep2000`` -> ``Fe_pv``; a hand-edited
+    titel without the library prefix, ``Nb_pv 08Apr2002``, -> ``Nb_pv``, not the date)."""
     out = []
     for t in cp.get("potcar_symbols") or []:
         parts = str(t).split()
-        out.append(parts[1] if len(parts) > 1 else parts[0] if parts else "")
+        prefixed = len(parts) > 1 and (parts[0].upper().startswith("PAW")
+                                       or parts[0].upper() in ("US", "NC"))
+        out.append(parts[1] if prefixed else parts[0] if parts else "")
     return out
 
 

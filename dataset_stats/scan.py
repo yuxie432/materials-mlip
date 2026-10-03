@@ -97,6 +97,13 @@ def _hash8(*parts: bytes) -> int:
     return int.from_bytes(h.digest(), "little")
 
 
+def structure_hash(species: list[str], cell: np.ndarray | None, positions: np.ndarray) -> int:
+    """Hash of species + cell + positions rounded to 1e-4 A (identical structures collide)."""
+    cell_b = np.rint(cell * 1e4).astype(np.int64).tobytes() if cell is not None else b"-"
+    pos_b = np.rint(np.nan_to_num(positions) * 1e4).astype(np.int64).tobytes()
+    return _hash8(",".join(species).encode(), cell_b, pos_b)
+
+
 @dataclass(frozen=True)
 class KeyMap:
     """Which extxyz keys hold what. The defaults are the harvest's own shards; a reference
@@ -340,9 +347,7 @@ def scan_text(text: str, *, name: str, truncated: bool = False, describe: bool =
                     fcol["fnet"][fi] = np.linalg.norm(fvec[ok].sum(axis=0))
                     force_hist += np.histogram(fin, FORCE_EDGES)[0]
             cell = cells[fi]
-            cell_b = np.rint(cell * 1e4).astype(np.int64).tobytes() if cell is not None else b"-"
-            pos_b = np.rint(np.nan_to_num(pos) * 1e4).astype(np.int64).tobytes()
-            sh = _hash8(sp[1], cell_b, pos_b)
+            sh = structure_hash(sp[0], cell, pos)
             c_shash[fi] = sh
             e = float(fcol["energy"][fi])
             e_b = struct.pack("<q", int(round(e * 1e6))) if math.isfinite(e) else b"nan"

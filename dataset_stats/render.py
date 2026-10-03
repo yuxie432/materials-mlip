@@ -33,18 +33,23 @@ def _pct(v: Any) -> str:
     return "—" if v is None else f"{100 * float(v):.1f}%"
 
 
+def _cell(text: str) -> str:
+    """Markdown table cell text: a literal ``|`` (as in ``max|F|``) would split the cell."""
+    return text.replace("|", "\\|")
+
+
 def _table(rows: list[dict], cols: list[tuple[str, str]], limit: int = 25) -> str:
     if not rows:
         return "_(none)_\n"
-    head = "| " + " | ".join(h for _, h in cols) + " |"
+    head = "| " + " | ".join(_cell(h) for _, h in cols) + " |"
     sep = "|" + "|".join("---" for _ in cols) + "|"
     body = []
     for r in rows[:limit]:
         cells = []
         for key, _h in cols:
             v = r.get(key)
-            cells.append(_pct(v) if key.endswith("_share") else str(v) if key == "year"
-                         else _n(v))
+            cells.append(_cell(_pct(v) if key.endswith("_share") else str(v) if key == "year"
+                               else _n(v)))
         body.append("| " + " | ".join(cells) + " |")
     return "\n".join([head, sep, *body]) + "\n"
 
@@ -136,7 +141,7 @@ def _glance(rep: dict) -> str:
             tot: Any = sum(base_vals)
         else:
             tot = union.get(label)
-        lines.append(f"| {label} | " + " | ".join(_n(v) for v in vals) + f" | {_n(tot)} |")
+        lines.append(f"| {_cell(label)} | " + " | ".join(_n(v) for v in vals) + f" | {_n(tot)} |")
     return "\n".join(lines) + "\n"
 
 
@@ -412,7 +417,7 @@ def _comparison_md(rep: dict) -> str:
         for _name, r in cols:
             v = fn(r)
             vals.append(_pct(v) if label.startswith("%") and v is not None else _n(v))
-        lines.append(f"| {label} | " + " | ".join(vals) + " |")
+        lines.append(f"| {_cell(label)} | " + " | ".join(vals) + " |")
     return ("## Side by side with the reference datasets\n\nSame code and definitions for every "
             "column (reference columns from their own files; OMat24/sAlex are their published "
             "validation splits, i.e. random samples; MP/Alexandria materials are relaxed "
@@ -428,8 +433,10 @@ def _novelty_md(nov: dict) -> str:
            "chemical system, reduced formula, or bulk prototype (formula × space group, "
            "non-P1 bulk cells only).\n"]
     for rname, block in nov.items():
-        out.append(f"### vs {SOURCE_NAMES.get(rname, rname)} "
-                   f"(reference: {block['reference_sizes']})\n")
+        rs = block["reference_sizes"]
+        out.append(f"### vs {SOURCE_NAMES.get(rname, rname)} (reference: {rs['elements']} "
+                   f"elements, {rs['systems']:,} chemical systems, {rs['formulas']:,} formulas, "
+                   f"{rs['prototypes']:,} non-P1 prototypes)\n")
         rows = []
         for sname, row in list(block["per_source"].items()) + [("all", block["all_sources"])]:
             for level in ("element", "chemical_system", "formula", "prototype"):

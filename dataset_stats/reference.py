@@ -49,6 +49,7 @@ from .scan import (
     MPTRJ_KEYS,
     _hash8,
     scan_text,
+    structure_hash,
 )
 
 logger = logging.getLogger(__name__)
@@ -233,9 +234,7 @@ def _row_from_atoms(numbers: np.ndarray, positions: np.ndarray, cell: np.ndarray
     vol = math.nan if geo is None else geo[0]
     if geo is None:
         flags |= F_NO_CELL
-    sp = ",".join(symbols).encode()
-    sh = _hash8(sp, np.rint(cell * 1e4).astype(np.int64).tobytes(),
-                np.rint(np.nan_to_num(positions) * 1e4).astype(np.int64).tobytes())
+    sh = structure_hash(symbols, cell, positions)
     e_b = (int(round(energy * 1e6)).to_bytes(8, "little", signed=True)
            if math.isfinite(energy) else b"nan")
     fh = _hash8(sh.to_bytes(8, "little"), e_b)
@@ -264,12 +263,14 @@ def _describe_records(per_calc: dict[str, list[tuple[int, Any]]], groups: dict[s
         s0, (c0, p0, y0) = items[0]
         d0 = structure.describe(c0, p0, y0, dmin=dmin)
         d0["step"] = s0
+        d0["shash"] = str(structure_hash(y0, c0, p0))
         rec: dict[str, Any] = {"k": str(calc_key(cid)), "id": cid, "n": len(items),
                                "first": d0, "last": None, "g": groups.get(cid, "")}
         if len(items) > 1:
             s1, (c1, p1, y1) = items[-1]
             d1 = structure.describe(c1, p1, y1, dmin=dmin)
             d1["step"] = s1
+            d1["shash"] = str(structure_hash(y1, c1, p1))
             rec["last"] = d1
         out.append(rec)
     return out

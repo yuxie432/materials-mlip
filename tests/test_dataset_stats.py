@@ -123,6 +123,12 @@ def test_xc_family_and_labels():
     assert params.vdw_method(_cp(parameters={"IVDW": 0})) == "none"
 
 
+def test_potcar_symbols_with_and_without_library_prefix():
+    cp = _cp(potcar_symbols=["PAW_PBE Fe_pv 06Sep2000", "Nb_pv 08Apr2002", "US Si", "PAW O"])
+    assert params.potcar_symbols(cp) == ["Fe_pv", "Nb_pv", "Si", "O"]
+    assert params.potcar_elements(cp) == ["Fe", "Nb", "Si", "O"]
+
+
 @pytest.mark.parametrize("par,incar,want", [
     ({"IBRION": 0, "NSW": 500}, {}, "md"),
     ({"IBRION": 2, "NSW": 50, "ISIF": 2}, {}, "relax"),
@@ -377,3 +383,15 @@ def test_individual_only_scan_and_report(synthetic: Path, tmp_path: Path):
     assert z["filter"] == {"individual_only": True, "calcs_excluded": 1, "frames_excluded": 10}
     assert z["size"]["calcs"] == 2 and z["size"]["frames_scanned"] == 15
     assert z["size"]["frames_without_metadata"] == 0 and rep["subsets"] == {}
+
+
+def test_structure_hash_shared_by_scan_and_references(synthetic: Path):
+    from dataset_stats.reference import _describe_records
+    from dataset_stats.scan import structure_hash
+    rows, calcs, _agg = scan_shard(synthetic / "dataset" / "shard-00000.extxyz.gz")
+    nacl = bulk("NaCl", "rocksalt", a=5.64)
+    h = structure_hash(nacl.get_chemical_symbols(), np.array(nacl.cell), nacl.positions)
+    assert int(rows["shash"][0]) == h and calcs[0]["first"]["shash"] == str(h)
+    recs = _describe_records({"x": [(0, (np.array(nacl.cell), nacl.positions,
+                                         nacl.get_chemical_symbols()))]}, {"x": "g"})
+    assert recs[0]["first"]["shash"] == str(h)  # references group initial structures too
